@@ -79,7 +79,7 @@ if a.stress:  # judge-style: capture once, refresh inputs in place, replay, chec
         del g, data, out
 if a.no_time: sys.exit(1 if bad else 0)
 
-flush = torch.empty(int(1.5 * 2**30) // 4, dtype=torch.float32, device="cuda")
+flush = torch.ones(int(0.5 * 2**30) // 4, dtype=torch.float32, device="cuda"); sink = torch.empty((), device="cuda")  # read-only L2 flush
 def graph(m, s, data):
     st_ = torch.cuda.Stream(); st_.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(st_):
@@ -90,7 +90,7 @@ def graph(m, s, data):
     return g
 def tm(g):
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
-    flush.add_(1.0); e0.record(); g.replay(); e1.record(); torch.cuda.synchronize(); return e0.elapsed_time(e1) * 1e3
+    sink.copy_(flush.sum()); e0.record(); g.replay(); e1.record(); torch.cuda.synchronize(); return e0.elapsed_time(e1) * 1e3
 NB = load(D / "_bytes.py", "nb") if (D / "_bytes.py").exists() else None
 empty = torch.cuda.CUDAGraph()
 with torch.cuda.graph(empty): pass
