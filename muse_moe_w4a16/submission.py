@@ -328,7 +328,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
 #endif
       const int na = __popc(m), W = gridDim.x * WPC * KSW;
       int ks = 1;
-      if (mx <= 8) ks = 4; else if (mx <= 16) ks = 2;
+      const int kmax = mx <= 8 ? 4 : (mx <= 16 ? 2 : 1);  // split only as far as needed for >= 4 items per warp
+      while (ks < kmax && na * 768 * ks < 4 * W) ks <<= 1;
       sm->na = na; sm->ks = ks; sm->maxc = mx;
     }
   }
