@@ -7,7 +7,7 @@ import torch
 ap = argparse.ArgumentParser()
 ap.add_argument("dir"); ap.add_argument("-s", "--sub", default="submission.py"); ap.add_argument("-b", "--base", default=None)
 ap.add_argument("--seeds", type=int, default=3); ap.add_argument("--no-time", action="store_true"); ap.add_argument("--no-check", action="store_true")
-ap.add_argument("--only", default=None); ap.add_argument("--experts", type=int, default=0); ap.add_argument("--reps", type=int, default=50)
+ap.add_argument("--only", default=None); ap.add_argument("--experts", type=int, default=0); ap.add_argument("--reps", type=int, default=50); ap.add_argument("--stress", type=int, default=0)
 a = ap.parse_args()
 D = Path(a.dir).resolve(); sys.path.insert(0, str(D))
 
@@ -15,7 +15,9 @@ def load(p, name):
     p = Path(p); p = p if p.is_absolute() else (D / p if (D / p).exists() else Path.cwd() / p)
     spec = importlib.util.spec_from_file_location(name, p); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
-ref = load(D / "reference.py", "reference"); sub = load(a.sub, "sub_mod"); base = load(a.base, "base_mod") if a.base else None
+ref = load(D / "reference.py", "reference"); sub = load(a.sub, "sub_mod")
+import os
+if os.environ.get("OKB_DBG"): sub._DBG = os.environ["OKB_DBG"].split(); base = load(a.base, "base_mod") if a.base else None
 meta = json.load(open(D.parent / "notes" / f"{D.name}.json"))
 def parse(line):
     d = {}
@@ -54,6 +56,26 @@ if not a.no_check:
             if not ok or i == 0: print(f"{'OK ' if ok else 'BAD'} {kind:5} {c.get('load','')[:10]:10} {json.dumps(args_of(c))[:90]} s{kw['seed']}: {msg}")
             del data, out
     print(f"correctness: {'PASS' if not bad else f'{bad} FAIL'}")
+def fill(dst, src):
+    if isinstance(dst, torch.Tensor): dst.copy_(src)
+    elif isinstance(dst, dict):
+        for k in dst: fill(dst[k], src[k])
+if a.stress:  # judge-style: capture once, refresh inputs in place, replay, check every repetition
+    for c in benches:
+        data = ref.generate_input(**args_of(c)); fails = 0
+        st_ = torch.cuda.Stream(); st_.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st_):
+            for _ in range(2): sub.kernel_fn(data, S)
+        torch.cuda.current_stream().wait_stream(st_); torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g): out = sub.kernel_fn(data, S)
+        for r in range(a.stress):
+            kw = args_of(c); kw["seed"] = 100000 + 7919 * r; fresh = ref.generate_input(**kw); fill(data, fresh)
+            g.replay(); torch.cuda.synchronize()
+            ok, msg = check(data, out.clone())
+            if not ok: fails += 1; print(f"  STRESS FAIL {c['load']} rep {r}: {msg}")
+        bad += fails; print(f"stress {c['load']:10} {a.stress - fails}/{a.stress} ok")
+        del g, data, out
 if a.no_time: sys.exit(1 if bad else 0)
 
 flush = torch.empty(int(1.5 * 2**30) // 4, dtype=torch.float32, device="cuda")

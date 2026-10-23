@@ -290,14 +290,29 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
 #pragma unroll
     for (int o = 16; o; o >>= 1) mx = max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
     if (lane == 0) {
-      const int na = __popc(m), W = gridDim.x * WPC;
+#ifndef KSW
+#define KSW 1
+#endif
+      const int na = __popc(m), W = gridDim.x * WPC * KSW;
       int ks = 1;
       if (mx <= 8 * NTM) { if (na * 768 * 2 <= 3 * W) ks = 4; else if (na * 768 <= 2 * W) ks = 2; }
       sm->na = na; sm->ks = ks; sm->maxc = mx;
     }
   }
   __syncthreads();
-  for (int i = tid; i < R; i += blockDim.x) { unsigned e = p.ids[i] - p.lo; if (e < NLOC) list[atomicAdd(&sm->fill[e], 1)] = i; }
+  if (wid == 0) {  // deterministic route order (split-K partials from different CTAs must line up)
+    for (int b = 0; b < R; b += 32) {
+      const int i = b + lane;
+      const unsigned e = i < R ? (unsigned)(p.ids[i] - p.lo) : 0xffffffffu;
+      const bool loc = e < NLOC;
+      const unsigned peers = __match_any_sync(0xffffffffu, loc ? e : 64u + lane);
+      const int rank = __popc(peers & ((1u << lane) - 1));
+      if (loc) list[sm->fill[e] + rank] = i;
+      __syncwarp();
+      if (loc && rank == 0) sm->fill[e] += __popc(peers);
+      __syncwarp();
+    }
+  }
   __syncthreads();
 
   Ctx<S> C;
@@ -385,6 +400,7 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 """
 
 _mod = None
+_DBG = []
 # pair p of each 32-bit word: (eem rotation, sign rotation); bf16 targets m->6, e0->7, e1->8, s->15 (+16 for the high value)
 _ROT = ((0, 0), (3, 1), (6, 6), (11, 5))
 
@@ -394,11 +410,17 @@ def _ext():
     if _mod is None:
         big = torch.cuda.get_device_properties(0).shared_memory_per_block_optin >= 180000
         wpc, stg = (16, 2) if big else (8, 2)
-        _mod = load_inline("moe_w4a16_v2_%d_%d" % (wpc, stg),
+        _mod = load_inline("moe_w4a16_v2_%d_%d%s" % (wpc, stg, "".join(_DBG).replace("-", "_").replace("=", "")),
                            cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["moe"],
-                           extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg], verbose=False)
+                           extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + _DBG, verbose=False)
     return _mod
+
+
+def _ws_tiles():  # split-K only runs when tiles <= 2 * resident warps
+    big = torch.cuda.get_device_properties(0).shared_memory_per_block_optin >= 180000
+    ksw = int(next((d.split("=")[1] for d in _DBG if d.startswith("-DKSW=")), 1))
+    return 2 * torch.cuda.get_device_properties(0).multi_processor_count * (16 if big else 8) * ksw
 
 
 def _place(word, code, pair, hi):
@@ -451,7 +473,7 @@ def prepare(weights):
     return {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
             "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(64, dtype=torch.int32, device=dev),
             "tcnt": torch.zeros(32 * 768, dtype=torch.int32, device=dev),
-            "ws": torch.empty((4096 * 4 * 4 * 32 * 4,), dtype=torch.float32, device=dev)}
+            "ws": torch.empty((_ws_tiles() * 4 * 4 * 32 * 4,), dtype=torch.float32, device=dev)}
 
 
 def kernel_fn(data, state):
