@@ -20,3 +20,11 @@
 - v1 0.84 | v2 CTA smem 0.78 | v3 0.66 | v4 TMA 6x2KB 0.86 | TWOK 0.86 | v5 4KB stages + red + PDL fin 0.94
 - sweep m1 (graph-empty): cublas qkv 15.5 poo 21.7 o 7.4 unp 8.4; ours RSN2/CUN2 qkv 14.6 poo 21.5 o 9.2 unp 7.4
 - router hi/lo: 1.3-3.25x at m<=32; m=128/256 router path still slower than SGLang split2
+
+# attention (H200 checks)
+- SGLang/shape: sliding 20.6-34.6us, full b1 31, b16 201, b32 384 (FA3 ~1.7TB/s)
+- random-gather bench: 64B rows 2.1-2.4TB/s, 128B 2.9-3.1, 256B 3.2-3.4
+- v1 0.39 | v2 ring 0.49 | v3 both-heads full-row decode 0.58 (full decode 1.48/1.68) | v4 CTA verify + comb2 0.69
+- v5 0.68 | ex2.approx 0.72 | verify one-wave grid 0.81 | SB=4 steps 0.82
+- verify bottleneck: F2FP e4m3->f16 4x redundant per CTA (~376us at b32) > HMMA (~145us); plan: FP8 mma (Q,P e4m3) or convert once
+- sliding shapes need a single fused launch (prep+attn+combine+gate) to approach leader (2.37x)
