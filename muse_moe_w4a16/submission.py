@@ -194,20 +194,17 @@ __device__ __forceinline__ void run(Ctx& C, int e, int mt, int pass) {
 
 template <int G2, int S>
 __device__ __forceinline__ void dispatch(Ctx& C, int nt, int e, int mt, int pass) {
-  switch (nt) {
-    case 1: run<1, G2, S>(C, e, mt, pass); break;
-    case 2: run<2, G2, S>(C, e, mt, pass); break;
-    case 3: run<3, G2, S>(C, e, mt, pass); break;
-    case 4: run<4, G2, S>(C, e, mt, pass); break;
-    case 5: run<5, G2, S>(C, e, mt, pass); break;
-    case 6: run<6, G2, S>(C, e, mt, pass); break;
-    case 7: run<7, G2, S>(C, e, mt, pass); break;
-    default: run<8, G2, S>(C, e, mt, pass); break;
-  }
+  if (nt <= 1) run<1, G2, S>(C, e, mt, pass);
+  else if (nt <= 2) run<2, G2, S>(C, e, mt, pass);
+  else if (nt <= 4) run<4, G2, S>(C, e, mt, pass);
+  else run<8, G2, S>(C, e, mt, pass);
 }
 
-template <int S>
+#ifndef NSTG
+#define NSTG 4
+#endif
 __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
+  constexpr int S = NSTG;
   extern __shared__ __align__(16) uint8_t smem[];
   Sm* sm = (Sm*)(smem + WPC * S * STG + WPC * SCR);
   int* list = (int*)(sm + 1);
@@ -288,26 +285,24 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   }
 }
 
-static int g_S = 0, g_grid = 0;
-template <int S> static size_t smem_bytes(int M) { return (size_t)WPC * S * STG + WPC * SCR + sizeof(Sm) + (size_t)M * 8 * 4; }
+static int g_grid = 0;
+static size_t smem_bytes(int M) { return (size_t)WPC * NSTG * STG + WPC * SCR + sizeof(Sm) + (size_t)M * 8 * 4; }
 
 void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1, torch::Tensor w2, torch::Tensor g1,
          torch::Tensor g2, torch::Tensor nw, torch::Tensor inter, torch::Tensor y, torch::Tensor ss, torch::Tensor ctr,
          torch::Tensor out, int64_t lo) {
   int M = x.size(0);
-  if (!g_S) {
+  if (!g_grid) {
     int dev; cudaGetDevice(&dev); int mx; cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    g_S = mx >= 180000 ? 4 : 2; cudaDeviceGetAttribute(&g_grid, cudaDevAttrMultiProcessorCount, dev);
-    if (g_S == 4) cudaFuncSetAttribute(moe_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
-    else cudaFuncSetAttribute(moe_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
+    cudaDeviceGetAttribute(&g_grid, cudaDevAttrMultiProcessorCount, dev);
+    cudaFuncSetAttribute(moe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
   }
   P p{w1.data_ptr<uint8_t>(), w2.data_ptr<uint8_t>(), g1.data_ptr<float>(), g2.data_ptr<float>(),
       (const __nv_bfloat16*)x.data_ptr(), ids.data_ptr<int>(), tw.data_ptr<float>(), nw.data_ptr<float>(),
       (__nv_bfloat16*)inter.data_ptr(), (__nv_bfloat16*)y.data_ptr(), ss.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
       ctr.data_ptr<int>(), M, (int)lo};
   auto st = at::cuda::getCurrentCUDAStream();
-  if (g_S == 4) moe_kernel<4><<<g_grid, WPC * 32, smem_bytes<4>(M), st>>>(p);
-  else moe_kernel<2><<<g_grid, WPC * 32, smem_bytes<2>(M), st>>>(p);
+  moe_kernel<<<g_grid, WPC * 32, smem_bytes(M), st>>>(p);
 }
 """
 
@@ -317,8 +312,9 @@ _mod = None
 def _ext():
     global _mod
     if _mod is None:
-        _mod = load_inline("moe_w4a16_v1", cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
-                           cuda_sources=CUDA, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
+        mx = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        _mod = load_inline("moe_w4a16_v1s%d" % (4 if mx >= 180000 else 2), cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
+                           cuda_sources=CUDA, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DNSTG=%d" % (4 if mx >= 180000 else 2)], verbose=False)
     return _mod
 
 

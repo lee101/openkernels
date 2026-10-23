@@ -68,6 +68,7 @@ def graph(m, s, data):
 def tm(g):
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     flush.add_(1.0); e0.record(); g.replay(); e1.record(); torch.cuda.synchronize(); return e0.elapsed_time(e1) * 1e3
+NB = load(D / "_bytes.py", "nb") if (D / "_bytes.py").exists() else None
 empty = torch.cuda.CUDAGraph()
 with torch.cuda.graph(empty): pass
 loads = {}
@@ -79,7 +80,8 @@ for c in benches:
     for i in range(a.reps):
         x = tm(gs); y = tm(gb) if gb else None
         ts.append(x); y is not None and (tb.append(y), r.append(y / x))
-    ms = st.median(ts); line = f"{c['load']:10} {json.dumps({k: v for k, v in args_of(c).items() if k != 'seed'})[:70]:70} {ms:9.1f}us"
+    ms = st.median(ts); line = f"{c['load']:10} {json.dumps({k: v for k, v in args_of(c).items() if k != 'seed'})[:50]:50} {ms:9.1f}us"
+    if NB: line += f" {NB.nbytes(data) / ms / 1e3:7.1f}GB/s"
     if gb: line += f"  base {st.median(tb):9.1f}us  x{st.median(r):.3f}"
     print(line)
     L = loads.setdefault(c["load"], [0.0, 0.0]); L[0] += ms * c["weight"]; L[1] += (st.median(tb) if gb else 0) * c["weight"]
