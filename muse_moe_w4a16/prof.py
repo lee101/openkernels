@@ -20,7 +20,7 @@ for bs in bss:
     flush.add_(1); torch.cuda.synchronize()
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     e0.record(); S.kernel_fn(d, stt); e1.record(); torch.cuda.synchronize()
-    P = stt["prof"].view(-1, 16).cpu()
+    P = stt["prof"].view(-1, 32).cpu()
     nw = torch.cuda.get_device_properties(0).multi_processor_count * int(next((d[6:].split("x")[0] for d in S._DBG if d.startswith("-DCFG=")), 16 if S._big() else 8))
     P = P[:nw]
     t0 = int(P[:, 0].min())
@@ -33,6 +33,6 @@ for bs in bss:
     print(f"  sm clock MHz p10 {pct(mhz, .1):.0f} p50 {pct(mhz, .5):.0f}")
     print(f"  start  p50 {pct(us(0), .5):.1f} p99 {pct(us(0), .99):.1f} | routed p50 {pct(us(1), .5):.1f} max {max(us(1)):.1f}")
     print(f"  items done p10 {pct(us(5), .1):.1f} p50 {pct(us(5), .5):.1f} max {max(us(5)):.1f} | comb wait end max {max(us(6)):.1f} | end max {max(us(7)):.1f}")
-    for nm, col in (("g1 busy", 2), ("g2 busy", 3), ("g2 dep-wait", 4), ("tma wait", 9), ("epilogue", 15)):
+    for nm, col in (("g1 busy", 2), ("g2 busy", 3), ("g2 dep-wait", 4), ("tma wait", 9), ("epilogue", 15), ("barrier", 16), ("b-prologue", 17), ("done-fence", 18)):
         v = [cyc(col)[i] for i in act]
         print(f"  {nm:12} per-warp us p10 {pct(v, .1):6.2f} p50 {pct(v, .5):6.2f} p90 {pct(v, .9):6.2f} max {max(v):6.2f}")
