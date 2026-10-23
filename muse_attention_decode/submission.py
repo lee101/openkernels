@@ -391,7 +391,7 @@ __global__ void __launch_bounds__(256) attn2(A a) {
 // The CTA gathers each 16-key block's full K/V rows once into a shared swizzled ring; warp w computes kv head w >> 2 for
 // tokens 2(w & 3), 2(w & 3) + 1 (16 rows: 8 query heads x 2 tokens).
 #ifndef RB3
-#define RB3 8
+#define RB3 20
 #endif
 __global__ void __launch_bounds__(256, 2) attn3(A a) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
@@ -505,21 +505,22 @@ __global__ void __launch_bounds__(256, 2) attn3(A a) {
 }
 
 // ---------------------------------------------------------------- combine v2: one CTA (256 threads) per (token, q head)
-__global__ void __launch_bounds__(256) comb2(A a, const __nv_bfloat16* qkv, __nv_bfloat16* out, float vscale) {
+__global__ void __launch_bounds__(1024) comb2(A a, const __nv_bfloat16* qkv, __nv_bfloat16* out, float vscale) {
   const int tid = threadIdx.x, wi = blockIdx.x;
   const int hd = wi % a.hq, tl = wi / a.hq, l = tl % a.L, b = tl / a.L;
   const int grp = a.hq / a.hkv, h = hd / grp, r = l * grp + hd % grp;
   const size_t base = ((size_t)b * a.hkv + h) * a.nsplit;
-  __shared__ float red[256];
-  __shared__ float4 vec[16][16];
+  __shared__ float red[1024];
+  __shared__ float4 vec[64][16];
   float M = -INFINITY;
-  for (int s = tid; s < a.nsplit; s += 256) M = fmaxf(M, a.wml[((base + s) * a.rows + r) * 2]);
+  for (int s = tid; s < a.nsplit; s += 1024) M = fmaxf(M, a.wml[((base + s) * a.rows + r) * 2]);
   red[tid] = M; __syncthreads();
-  for (int x = 128; x; x >>= 1) { if (tid < x) red[tid] = fmaxf(red[tid], red[tid + x]); __syncthreads(); }
+  for (int x = 512; x; x >>= 1) { if (tid < x) red[tid] = fmaxf(red[tid], red[tid + x]); __syncthreads(); }
   M = red[0]; __syncthreads();
-  const int sg = tid >> 4, dv = tid & 15;  // 16 split groups x 16 float4 of the 64 dims
+  const int sg = tid >> 4, dv = tid & 15;  // 64 split groups x 16 float4 of the 64 dims
   float4 acc = make_float4(0.f, 0.f, 0.f, 0.f); float Ls = 0.f;
-  for (int s = sg; s < a.nsplit; s += 16) {
+#pragma unroll 4
+  for (int s = sg; s < a.nsplit; s += 64) {
     const float* ml = a.wml + ((base + s) * a.rows + r) * 2;
     const float m = ml[0];
     if (m == -INFINITY) continue;
@@ -533,10 +534,10 @@ __global__ void __launch_bounds__(256) comb2(A a, const __nv_bfloat16* qkv, __nv
   __syncthreads();
   if (tid < 16) {
     float4 v = vec[0][tid];
-    for (int k = 1; k < 16; k++) { const float4 u = vec[k][tid]; v.x += u.x; v.y += u.y; v.z += u.z; v.w += u.w; }
+    for (int k = 1; k < 64; k++) { const float4 u = vec[k][tid]; v.x += u.x; v.y += u.y; v.z += u.z; v.w += u.w; }
     vec[0][tid] = v;
   }
-  if (tid == 0) { float L2 = 0.f; for (int k = 0; k < 16; k++) L2 += red[k * 16]; red[0] = L2; }
+  if (tid == 0) { float L2 = 0.f; for (int k = 0; k < 64; k++) L2 += red[k * 16]; red[0] = L2; }
   __syncthreads();
   if (tid < 32) {
     const float* vf = (const float*)vec[0];
@@ -633,11 +634,13 @@ void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor 
     attn2<<<(B * nsplit + 7) / 8, 256, sm2, st>>>(a);
   } else if (L == 8 && hkv == 2 && hq == 16) {
     const int sm3 = RB3 * 4096;
+    static bool o3 = false;
+    if (!o3) { cudaFuncSetAttribute(attn3, cudaFuncAttributeMaxDynamicSharedMemorySize, sm3); o3 = true; }
     attn3<<<B * nsplit, 256, sm3, st>>>(a);
   } else if (mt <= 1) attn<1><<<blocks, 256, sm, st>>>(a);
   else if (mt <= 2) attn<2><<<blocks, 256, sm, st>>>(a);
   else attn<4><<<blocks, 256, sm, st>>>(a);
-  if (nsplit > 32) comb2<<<B * L * hq, 256, 0, st>>>(a, (const __nv_bfloat16*)qkv.data_ptr(), (__nv_bfloat16*)out.data_ptr(), (float)kv_scale);
+  if (nsplit > 32) comb2<<<B * L * hq, 1024, 0, st>>>(a, (const __nv_bfloat16*)qkv.data_ptr(), (__nv_bfloat16*)out.data_ptr(), (float)kv_scale);
   else comb<<<(B * L * hq + 7) / 8, 256, 0, st>>>(a, (const __nv_bfloat16*)qkv.data_ptr(), (__nv_bfloat16*)out.data_ptr(), (float)kv_scale);
 }
 """
@@ -656,10 +659,10 @@ def _big():
 def _ext():
     global _mod
     if _mod is None:
-        rb, rb2 = (8, 6) if _big() else (4, 3)
-        _mod = load_inline("attn_v4_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        rb, rb2, rb3 = (8, 6, 20) if _big() else (4, 3, 8)
+        _mod = load_inline("attn_v5_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t);",
-                           cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2] + _DBG, verbose=False)
+                           cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3] + _DBG, verbose=False)
     return _mod
 
 
