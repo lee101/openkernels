@@ -46,96 +46,78 @@ struct Q {
   int M, N, K, MT, KC, TB, f32;
 };
 
-// a CTA's warps stream chunks w, w+16, ... of one (tile, [c0, c1)) segment; partial sums land in smem
-template <int NT, bool HL>
-__device__ __forceinline__ void part(const Q& q, int tile, int c0, int c1, int lane, int wid, float4* red) {
-  const int tb = tile / q.MT, mt = tile - tb * q.MT, g = lane >> 2, t = lane & 3;
-  constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
-  const uint4* xr[NT];
-#pragma unroll
-  for (int n = 0; n < NT; n++) {
-    int tok = min(tb * 32 + n * 8 + g, q.M - 1);
-    xr[n] = (const uint4*)(q.x + (size_t)tok * q.K) + t * 2;
-  }
-  const uint4* ap = q.A + ((size_t)mt * q.KC) * 128 + lane * 4;
-  const uint4* ap2 = HL ? q.A2 + ((size_t)mt * q.KC) * 128 + lane * 4 : nullptr;
-  float acc[NT][CH][4];
-#pragma unroll
-  for (int n = 0; n < NT; n++)
-#pragma unroll
-    for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
-  uint4 a[2][4], a2[2][4], b[2][NT][2];
-  auto load = [&](int s, int c) {
-#pragma unroll
-    for (int j = 0; j < 4; j++) { a[s][j] = ldnc(ap + (size_t)c * 128 + j); if (HL) a2[s][j] = ldnc(ap2 + (size_t)c * 128 + j); }
-#pragma unroll
-    for (int n = 0; n < NT; n++) { b[s][n][0] = __ldg(xr[n] + c * 8); b[s][n][1] = __ldg(xr[n] + c * 8 + 1); }
-  };
-  auto comp = [&](int s) {
-#pragma unroll
-    for (int j = 0; j < 4; j++)
-#pragma unroll
-      for (int n = 0; n < NT; n++) {
-        const uint32_t* bb = (const uint32_t*)&b[s][n][j >> 1];
-        mma(acc[n][j % CH], a[s][j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
-        if (HL) mma(acc[n][(j + 1) % CH], a2[s][j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
-      }
-  };
-  int c = c0 + wid;
-  if (c < c1) load(0, c);
-  for (; c + WPC < c1; c += 2 * WPC) {
-    load(1, c + WPC);
-    comp(0);
-    if (c + 2 * WPC < c1) load(0, c + 2 * WPC);
-    comp(1);
-  }
-  if (c < c1) comp(0);
-#pragma unroll
-  for (int n = 0; n < NT; n++) {
-    float4 v;
-    v.x = v.y = v.z = v.w = 0.f;
-#pragma unroll
-    for (int h = 0; h < CH; h++) { v.x += acc[n][h][0]; v.y += acc[n][h][1]; v.z += acc[n][h][2]; v.w += acc[n][h][3]; }
-    red[(wid * 4 + n) * 32 + lane] = v;
-  }
-}
-
 __device__ __forceinline__ void put(const Q& q, int tok, int row, float v) {
   if (q.f32) ((float*)q.out)[(size_t)tok * q.N + row] = v; else ((__nv_bfloat16*)q.out)[(size_t)tok * q.N + row] = __float2bfloat16(v);
 }
 
-template <bool HL>
-__global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
-  __shared__ float4 red[WPC * 4 * 32];
-  __shared__ int last;
-  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-  const long long U = (long long)q.TB * q.MT * q.KC;
-  const long long a = U * blockIdx.x / gridDim.x, b = U * (blockIdx.x + 1) / gridDim.x;
-  if (a >= b) return;
-  // segments: boundary pieces first (their cross-CTA reduction then hides behind the whole tiles)
-  long long sa[3], sb[3]; int ns = 0;
-  const long long t0 = a / q.KC, t1 = (b - 1) / q.KC;
-  const long long fa = (a % q.KC) ? t0 + 1 : t0, fb = (b % q.KC) ? t1 : t1 + 1;  // full tiles [fa, fb)
-  if (t0 == t1 && (a % q.KC || b % q.KC)) { sa[ns] = a; sb[ns++] = b; }
-  else {
-    if (a % q.KC) { sa[ns] = a; sb[ns++] = (t0 + 1) * q.KC; }
-    if (b % q.KC) { sa[ns] = t1 * q.KC; sb[ns++] = b; }
-  }
-  const int nfull = (t0 == t1 && (a % q.KC || b % q.KC)) ? 0 : (int)(fb - fa);
-  for (int i = 0; i < ns + nfull; i++) {
-    long long s0, s1;
-    if (i < ns) { s0 = sa[i]; s1 = sb[i]; } else { s0 = (fa + i - ns) * q.KC; s1 = s0 + q.KC; }
-    const int tile = (int)(s0 / q.KC), c0 = (int)(s0 - (long long)tile * q.KC), c1 = (int)(s1 - (long long)tile * q.KC);
-    const int tb = tile / q.MT, mt = tile - tb * q.MT, mrem = min(32, q.M - tb * 32), nt = mrem >= 32 ? 4 : (mrem + 7) >> 3;
-    if (nt <= 1) part<1, HL>(q, tile, c0, c1, lane, wid, red);
-    else if (nt <= 2) part<2, HL>(q, tile, c0, c1, lane, wid, red);
-    else part<4, HL>(q, tile, c0, c1, lane, wid, red);
+// CTA work: an equal contiguous range of (tile, K-chunk) units, cut into segments (partial boundary tiles first).
+// Warp w takes chunks w, w+16, ... of each segment; its loads run 2 chunks ahead across segment boundaries.
+struct Segs { long long s0[8], s1[8]; int n; };
+
+template <int NT, bool HL>
+__device__ __forceinline__ void cta(const Q& q, const Segs& S, int tid, float4* red, int* last) {
+  const int lane = tid & 31, wid = tid >> 5, g = lane >> 2, t = lane & 3;
+  constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
+  // iterator over this warp's (segment, chunk) items
+  struct It { int s; long long u; };
+  auto first = [&](int s) -> It {
+    for (; s < S.n; s++) { long long u = S.s0[s] + wid; if (u < S.s1[s]) return It{s, u}; }
+    return It{S.n, 0};
+  };
+  auto next = [&](It it) -> It { it.u += WPC; if (it.u < S.s1[it.s]) return it; return first(it.s + 1); };
+  uint4 a0[4], a1[4], h0[4], h1[4], b0[NT][2], b1[NT][2];
+  auto load = [&](It it, uint4 (&a)[4], uint4 (&h)[4], uint4 (&b)[NT][2]) {
+    if (it.s >= S.n) return;
+    const int tile = (int)(it.u / q.KC), c = (int)(it.u - (long long)tile * q.KC);
+    const int tb = tile / q.MT, mt = tile - tb * q.MT;
+    const size_t off = ((size_t)mt * q.KC + c) * 128 + lane * 4;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { a[j] = ldnc(q.A + off + j); if (HL) h[j] = ldnc(q.A2 + off + j); }
+#pragma unroll
+    for (int n = 0; n < NT; n++) {
+      const int tok = min(tb * 32 + n * 8 + g, q.M - 1);
+      const uint4* xr = (const uint4*)(q.x + (size_t)tok * q.K) + t * 2 + c * 8;
+      b[n][0] = __ldg(xr); b[n][1] = __ldg(xr + 1);
+    }
+  };
+  It cur = first(0), pre = cur;
+  load(pre, a0, h0, b0);
+  pre = next(pre); load(pre, a1, h1, b1);
+  for (int s = 0; s < S.n; s++) {
+    float acc[NT][CH][4];
+#pragma unroll
+    for (int n = 0; n < NT; n++)
+#pragma unroll
+      for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
+    while (cur.s == s) {
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int n = 0; n < NT; n++) {
+          const uint32_t* bb = (const uint32_t*)&b0[n][j >> 1];
+          mma(acc[n][j % CH], a0[j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+          if (HL) mma(acc[n][(j + 1) % CH], h0[j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+        }
+#pragma unroll
+      for (int j = 0; j < 4; j++) { a0[j] = a1[j]; if (HL) h0[j] = h1[j]; }
+#pragma unroll
+      for (int n = 0; n < NT; n++) { b0[n][0] = b1[n][0]; b0[n][1] = b1[n][1]; }
+      cur = next(cur);
+      if (pre.s < S.n) { pre = next(pre); load(pre, a1, h1, b1); }
+    }
+#pragma unroll
+    for (int n = 0; n < NT; n++) {
+      float4 v; v.x = v.y = v.z = v.w = 0.f;
+#pragma unroll
+      for (int h = 0; h < CH; h++) { v.x += acc[n][h][0]; v.y += acc[n][h][1]; v.z += acc[n][h][2]; v.w += acc[n][h][3]; }
+      red[(wid * 4 + n) * 32 + lane] = v;
+    }
     __syncthreads();
-    const bool full = c0 == 0 && c1 == q.KC;
-    float* w = q.ws + (size_t)tb * 32 * q.N;
-    // thread -> (n, lane', i): sum the 16 warp partials
+    const long long s0 = S.s0[s], s1 = S.s1[s];
+    const int tile = (int)(s0 / q.KC), c0 = (int)(s0 - (long long)tile * q.KC), c1 = (int)(s1 - (long long)tile * q.KC);
+    const int tb = tile / q.MT, mt = tile - tb * q.MT, mrem = min(32, q.M - tb * 32);
     float v = 0.f; int tok = -1, row = 0;
-    if (tid < nt * 128) {
+    if (tid < NT * 128) {
       const int n = tid >> 7, ln = (tid >> 2) & 31, e = tid & 3;
       const float* rf = (const float*)red;
 #pragma unroll
@@ -143,15 +125,16 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
       const int tk = n * 8 + 2 * (ln & 3) + (e & 1);
       if (tk < mrem) { tok = tk; row = mt * 16 + (ln >> 2) + 8 * (e >> 1); }
     }
-    if (full) {
+    if (c0 == 0 && c1 == q.KC) {
       if (tok >= 0) put(q, tb * 32 + tok, row, v);
     } else {
+      float* w = q.ws + (size_t)tb * 32 * q.N;
       if (tok >= 0) atomicAdd(w + (size_t)tok * q.N + row, v);
       __threadfence();
       __syncthreads();
-      if (tid == 0) last = atomicAdd(q.cnt + tile, c1 - c0) + c1 - c0 == q.KC;
+      if (tid == 0) *last = atomicAdd(q.cnt + tile, c1 - c0) + c1 - c0 == q.KC;
       __syncthreads();
-      if (last) {
+      if (*last) {
         __threadfence();
         if (tok >= 0) { float* p = w + (size_t)tok * q.N + row; const float r = __ldcg(p); *p = 0.f; put(q, tb * 32 + tok, row, r); }
         if (tid == 0) q.cnt[tile] = 0;
@@ -159,6 +142,28 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
     }
     __syncthreads();
   }
+}
+
+template <bool HL>
+__global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
+  __shared__ float4 red[WPC * 4 * 32];
+  __shared__ int last;
+  const long long U = (long long)q.TB * q.MT * q.KC;
+  const long long a = U * blockIdx.x / gridDim.x, b = U * (blockIdx.x + 1) / gridDim.x;
+  if (a >= b) return;
+  Segs S; S.n = 0;
+  const long long t0 = a / q.KC, t1 = (b - 1) / q.KC;
+  if (t0 == t1) { S.s0[0] = a; S.s1[0] = b; S.n = 1; }
+  else {
+    if (a % q.KC) { S.s0[S.n] = a; S.s1[S.n++] = (t0 + 1) * q.KC; }
+    if (b % q.KC) { S.s0[S.n] = t1 * q.KC; S.s1[S.n++] = b; }
+    const long long fa = (a % q.KC) ? t0 + 1 : t0, fb = (b % q.KC) ? t1 : t1 + 1;
+    for (long long t = fa; t < fb && S.n < 8; t++) { S.s0[S.n] = t * q.KC; S.s1[S.n++] = (t + 1) * q.KC; }
+  }
+  const int nt = min(4, (q.M + 7) >> 3);
+  if (nt <= 1) cta<1, HL>(q, S, threadIdx.x, red, &last);
+  else if (nt <= 2) cta<2, HL>(q, S, threadIdx.x, red, &last);
+  else cta<4, HL>(q, S, threadIdx.x, red, &last);
 }
 
 static int g_grid = 0;
@@ -181,7 +186,7 @@ _DBG = []
 def _ext():
     global _mod
     if _mod is None:
-        _mod = load_inline("skinny_v2" + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("skinny_v3" + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + _DBG,
                            verbose=False)
