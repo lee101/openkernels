@@ -37,7 +37,7 @@ CUDA = r"""
 #define WPC 16
 #endif
 #ifndef RSN
-#define RSN 3
+#define RSN 2
 #endif
 #ifndef CUN
 #define CUN 2
@@ -245,10 +245,10 @@ def _big():
 def _ext():
     global _mod
     if _mod is None:
-        wpc = 16 if _big() else 8
+        wpc = next((int(d[6:]) for d in _DBG if d.startswith("-DWPC=")), 16 if _big() else 8)
         _mod = load_inline("skinny_v5_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
-                           cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + _DBG,
+                           cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + [d for d in _DBG if not d.startswith("-DWPC=")],
                            verbose=False)
     return _mod
 
