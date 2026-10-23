@@ -81,6 +81,8 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ int ldacq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory"); return v; }
+__device__ __forceinline__ void fence_ar() { asm volatile("fence.acq_rel.gpu;\n" ::: "memory"); }
+__device__ __forceinline__ void gbar(int id, int n) { asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ uint32_t rotl(uint32_t q, int d) { return __funnelshift_l(q, q, d); }
 __device__ __forceinline__ uint32_t sc2(uint32_t w, uint32_t sel) { return __byte_perm(w, 0, sel) * 16u + 0x77007700u; }
 #if TMA
@@ -94,50 +96,37 @@ __device__ __forceinline__ void mb_wait(uint32_t bar, uint32_t ph) {
 }
 #endif
 
-struct Sm { int cnt[NLOC], off[NLOC], act[NLOC], na, mode, maxc; };
+#define QI (NLOC + 2)  // ctr[QI]: dynamic tile queue
+#define RED (2 * 2 * 32 * 16)  // per-warp split-K partial slots: 2 tile parities x NT <= 2 float4 per lane
+struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, ks, maxc; int ids[16][4]; };
 
+// Work = tiles from one global queue (all W13 tiles, then all W2 tiles, expert-major). A group of ks warps of one CTA
+// takes a tile together, each streaming SPT/ks K-stages; partials meet in smem; the finisher rotates per tile.
 template <int S>
 struct Ctx {
-  const P* p; Sm* sm; const uint16_t* list; uint32_t ring, bars; int lane, W, N1, N, gw;
+  const P* p; Sm* sm; const uint16_t* list; uint32_t ring, bars; int lane, N1, N, gi, gj, ks;
   int q; unsigned long long wcyc;
-  int pu, pp, ps, pe;  // producer (item mode): item, pass, stage, stage end
-  int ph, L, Le;       // producer (stream mode): phase, stage-unit, phase end
-  __device__ __forceinline__ void srange(int ph_, int& a, int& b) const {
-    const int tot = sm->na * (ph_ ? T2E * SPT : T1E * SPT);
-    a = (int)((long long)gw * tot / W); b = (int)((long long)(gw + 1) * tot / W);
-  }
-  __device__ __forceinline__ void sbegin(int ph_) {
-    for (ph = ph_; ph < 2; ph++) { srange(ph, L, Le); if (L < Le) return; }
-  }
+  int pi, pp, ps;  // producer: group tile index, pass, stage
+  __device__ __forceinline__ int tid_of(int i) const { return ((volatile int*)sm->ids[gi])[i & 3]; }
   __device__ __forceinline__ void item(int u, int& g2, int& e, int& mt) const {
     if (u < N1) { g2 = 0; e = sm->act[u >> 9]; mt = u & 511; }
     else { int v = u - N1; g2 = 1; e = sm->act[v >> 8]; mt = v & 255; }
   }
-  __device__ __forceinline__ void load(int slot, int g2, int e, int mt, int s) {
-    const uint8_t* src = g2 ? p->w2 + ((size_t)((p->lo + e) * T2E + mt) * SPT + s) * STG
-                            : p->w1 + ((size_t)((p->lo + e) * T1E + mt) * SPT + s) * STG;
-#if TMA
-    if (lane == 0) tma_ld(ring + slot * STG, src, bars + slot * 8);
-#else
-    uint32_t d = ring + slot * STG + lane * 16; src += lane * 16;
-#pragma unroll
-    for (int i = 0; i < 9; i++) cp16(d + i * 512, src + i * 512);
-#endif
-  }
   __device__ __forceinline__ void issue(int slot) {
-    if (sm->mode) {
-      if (ph < 2) {
-        const int tile = L >> 3;
-        load(slot, ph, sm->act[ph ? tile >> 8 : tile >> 9], tile & (ph ? 255 : 511), L & 7);
-        if (++L == Le) sbegin(ph + 1);
-      }
-    } else if (pu < N) {
-      int g2, e, mt; item(pu, g2, e, mt);
-      load(slot, g2, e, mt, ps);
-      if (++ps == SPT) {
-        ps = 0;
-        if (++pp == (sm->cnt[e] + 8 * NTM - 1) / (8 * NTM)) { pp = 0; pu += W; }
-      }
+    const int u = tid_of(pi);
+    if (u < N) {
+      int g2, e, mt; item(u, g2, e, mt);
+      const int span = SPT / ks, s = gj * span + ps;
+      const uint8_t* src = g2 ? p->w2 + ((size_t)((p->lo + e) * T2E + mt) * SPT + s) * STG
+                              : p->w1 + ((size_t)((p->lo + e) * T1E + mt) * SPT + s) * STG;
+#if TMA
+      if (lane == 0) tma_ld(ring + slot * STG, src, bars + slot * 8);
+#else
+      uint32_t d = ring + slot * STG + lane * 16; src += lane * 16;
+#pragma unroll
+      for (int k = 0; k < 9; k++) cp16(d + k * 512, src + k * 512);
+#endif
+      if (++ps == span) { ps = 0; if (++pp == (sm->cnt[e] + 8 * NTM - 1) / (8 * NTM)) { pp = 0; pi++; } }
     }
 #if !TMA
     cpc();
@@ -164,7 +153,7 @@ struct Ctx {
 };
 
 template <int NT, int G2, int S>
-__device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile, int s0, int s1) {
+__device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, int s0, int s1) {
   const P& p = *C.p;
   const int lane = C.lane, g = lane >> 2, t = lane & 3;
   const int cnt = C.sm->cnt[e], off = C.sm->off[e];
@@ -231,8 +220,9 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
   }
 #ifdef PROF
   const long long ce0 = clock64();
-  struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 16 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, C.gw};
+  struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 16 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, (int)(blockIdx.x * WPC + (threadIdx.x >> 5))};
 #endif
+  extern __shared__ __align__(16) uint8_t smem[];
   float f[NT][4];
 #pragma unroll
   for (int n = 0; n < NT; n++)
@@ -241,23 +231,18 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
 #pragma unroll
       for (int h = 0; h < CH; h++) v += acc[n][h][i];
       f[n][i] = v; }
-  extern __shared__ __align__(16) uint8_t smem[];
-  if (NT <= 2 && (s0 != 0 || s1 != SPT)) {  // stream-K boundary tile: publish partial; last arriver reduces + finishes
-    float4* w = p.ws + ((size_t)tile * SPT + s0) * 64 + lane;
+  if (NT <= 2 && C.ks > 1) {  // group split-K: partials meet in smem (double-buffered by tile parity)
+    const int wid = threadIdx.x >> 5, ks = C.ks, w0 = wid - C.gj;
+    float4* red = (float4*)(smem + (size_t)WPC * S * STG + WPC * SCR + WPC * S * 8) + (ti & 1) * WPC * 64;
 #pragma unroll
-    for (int n = 0; n < NT; n++) w[n * 32] = make_float4(f[n][0], f[n][1], f[n][2], f[n][3]);
-    __threadfence(); __syncwarp();
-    int old = 0;
-    if (lane == 0) old = atomicAdd(p.tcnt + tile, ((s1 - s0) << 8) | (1 << s0));
-    old = __shfl_sync(0xffffffffu, old, 0);
-    if ((old >> 8) + s1 - s0 != SPT) return false;
-    __threadfence();
-    for (unsigned m = old & 0xff; m; m &= m - 1) {
-      const float4* r = p.ws + ((size_t)tile * SPT + __ffs(m) - 1) * 64 + lane;
+    for (int n = 0; n < NT; n++) red[(wid * 2 + n) * 32 + lane] = make_float4(f[n][0], f[n][1], f[n][2], f[n][3]);
+    gbar(1 + C.gi, ks * 32);
+    if (C.gj != (ti & (ks - 1))) return false;
+    for (int o = w0; o < w0 + ks; o++) {
+      if (o == wid) continue;
 #pragma unroll
-      for (int n = 0; n < NT; n++) { float4 v = __ldcg(r + n * 32); f[n][0] += v.x; f[n][1] += v.y; f[n][2] += v.z; f[n][3] += v.w; }
+      for (int n = 0; n < NT; n++) { float4 v = red[(o * 2 + n) * 32 + lane]; f[n][0] += v.x; f[n][1] += v.y; f[n][2] += v.z; f[n][3] += v.w; }
     }
-    if (lane == 0) p.tcnt[tile] = 0;
   }
   __nv_bfloat16* scr = (__nv_bfloat16*)(smem + (size_t)(blockDim.x >> 5) * S * STG + (threadIdx.x >> 5) * SCR);
   if (!G2) {
@@ -304,21 +289,20 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
 }
 
 template <int G2, int S>
-__device__ __forceinline__ bool dispatch(Ctx<S>& C, int nt, int e, int mt, int pass, int tile, int s0, int s1) {
-  if (nt <= 1) return run<1, G2, S>(C, e, mt, pass, tile, s0, s1);
-  if (nt <= 2) return run<2, G2, S>(C, e, mt, pass, tile, s0, s1);
-  return run<4, G2, S>(C, e, mt, pass, tile, s0, s1);
+__device__ __forceinline__ bool dispatch(Ctx<S>& C, int nt, int e, int mt, int pass, int ti, int s0, int s1) {
+  if (nt <= 1) return run<1, G2, S>(C, e, mt, pass, ti, s0, s1);
+  if (nt <= 2) return run<2, G2, S>(C, e, mt, pass, ti, s0, s1);
+  return run<4, G2, S>(C, e, mt, pass, ti, s0, s1);
 }
 
 __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   constexpr int S = NSTG;
   extern __shared__ __align__(16) uint8_t smem[];
-  Sm* sm = (Sm*)(smem + WPC * S * STG + WPC * SCR + WPC * S * 8);
-  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, R = p.M * 8, NC = (R + 31) >> 5;
-  int* hist = (int*)(sm + 1);                 // [NC][32] per-chunk expert counts -> prefixes
-  uint16_t* list = (uint16_t*)(hist + NC * 32);
+  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, R = p.M * 8;
+  const bool small = p.M <= 64;  // split-K groups (and their smem) only for small batches
+  Sm* sm = (Sm*)(smem + WPC * S * STG + WPC * SCR + WPC * S * 8 + (small ? WPC * RED : 0));
+  uint16_t* list = (uint16_t*)(sm + 1);
   uint8_t* lid = (uint8_t*)(list + R);
-  uint8_t* rk = lid + R;
   const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
   const int gw = blockIdx.x * WPC + wid;
 #ifdef PROF
@@ -329,81 +313,43 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   if (lane < S) mb_init(sbase + WPC * S * STG + WPC * SCR + (wid * S + lane) * 8);
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 #endif
-  // routing: deterministic per-expert lists in route order (identical in every CTA: stream-K partials line up)
-  for (int i = tid; i < NC * 32; i += blockDim.x) hist[i] = 0;
-  for (int i = tid; i < R; i += blockDim.x) { unsigned e = p.ids[i] - p.lo; lid[i] = e < NLOC ? e : 0xff; }
+  if (tid < NLOC) sm->cnt[tid] = 0;
   __syncthreads();
-  for (int c = wid; c < NC; c += WPC) {
-    const int i = c * 32 + lane;
-    const unsigned e = i < R ? lid[i] : 0xffu;
-    const unsigned peers = __match_any_sync(0xffffffffu, e < NLOC ? e : 64u + lane);
-    const int r = __popc(peers & ((1u << lane) - 1));
-    if (i < R) rk[i] = r;
-    if (e < NLOC && r == 0) hist[c * 32 + e] = __popc(peers);
-  }
+  for (int i = tid; i < R; i += blockDim.x) { unsigned e = p.ids[i] - p.lo; lid[i] = e < NLOC ? e : 0xff; if (e < NLOC) atomicAdd(&sm->cnt[e], 1); }
   __syncthreads();
   if (wid == 0) {
-    int c = 0;
-    for (int k = 0; k < NC; k++) { int v = hist[k * 32 + lane]; hist[k * 32 + lane] = c; c += v; }
-    int v = c;
+    int c = sm->cnt[lane], v = c;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) { int n = __shfl_up_sync(0xffffffffu, v, o); if (lane >= o) v += n; }
-    sm->cnt[lane] = c; sm->off[lane] = v - c;
+    sm->off[lane] = v - c; sm->fill[lane] = v - c;
     unsigned m = __ballot_sync(0xffffffffu, c > 0);
     if (c > 0) sm->act[__popc(m & ((1u << lane) - 1))] = lane;
     int mx = c;
 #pragma unroll
     for (int o = 16; o; o >>= 1) mx = max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    if (lane == 0) { sm->na = __popc(m); sm->maxc = mx; sm->mode = mx <= 16; }
+    if (lane == 0) { sm->na = __popc(m); sm->maxc = mx; sm->ks = (small && mx <= 16) ? 4 : 1; }
   }
   __syncthreads();
-  for (int i = tid; i < R; i += blockDim.x) { unsigned e = lid[i]; if (e < NLOC) list[sm->off[e] + hist[(i >> 5) * 32 + e] + rk[i]] = i; }
-  __syncthreads();
-
+  for (int i = tid; i < R; i += blockDim.x) { unsigned e = lid[i]; if (e < NLOC) list[atomicAdd(&sm->fill[e], 1)] = i; }
+  const int ks = sm->ks, na = sm->na;
   Ctx<S> C;
-  C.p = &p; C.sm = sm; C.list = list; C.lane = lane; C.W = gridDim.x * WPC; C.gw = gw;
-  const int na = sm->na;
+  C.p = &p; C.sm = sm; C.list = list; C.lane = lane; C.ks = ks; C.gi = wid / ks; C.gj = wid % ks;
   C.N1 = na * T1E; C.N = C.N1 + na * T2E;
   C.ring = sbase + wid * S * STG; C.bars = sbase + WPC * S * STG + WPC * SCR + wid * S * 8; C.q = 0; C.wcyc = 0;
-  C.pu = gw; C.pp = 0; C.ps = 0;
-  if (sm->mode) C.sbegin(0);
+  C.pi = 0; C.pp = 0; C.ps = 0;
+  const bool lead = C.gj == 0 && lane == 0;
+  if (lead) { sm->ids[C.gi][0] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = atomicAdd(p.ctr + QI, 1); }
+  __syncthreads();
 #ifdef PROF
   PSET(1, gtime());
 #endif
 #pragma unroll
   for (int i = 0; i < S - 1; i++) C.issue(i);
-  if (sm->mode) {  // stream-K: each warp owns an equal contiguous range of (tile, stage) units per phase
-    const int nt = (sm->maxc + 7) >> 3;
-    for (int ph = 0; ph < 2; ph++) {
-      int L, Le; C.srange(ph, L, Le);
-      while (L < Le) {
-        const int tile = L >> 3, s0 = L & 7, s1 = min(SPT, s0 + Le - L);
-        const int e = sm->act[ph ? tile >> 8 : tile >> 9], mt = tile & (ph ? 255 : 511);
-#ifdef PROF
-        long long c0 = clock64();
-#endif
-        if (ph) {
-          if (lane == 0) while (ldacq(p.ctr + e) < T1E) __nanosleep(32);
-          __syncwarp();
-#ifdef PROF
-          PADD(4, clock64() - c0); c0 = clock64();
-#endif
-        } else if (mt == 0 && s0 == 0) {
-          for (int i = lane; i < sm->cnt[e]; i += 32) p.ss[list[sm->off[e] + i]] = 0.f;
-        }
-        const int gt = ph ? na * T1E + tile : tile;
-        const bool fin = ph ? dispatch<1, S>(C, nt, e, mt, 0, gt, s0, s1) : dispatch<0, S>(C, nt, e, mt, 0, gt, s0, s1);
-        if (fin) {
-          __threadfence(); __syncwarp();
-          if (lane == 0) atomicAdd(p.ctr + (ph ? NLOC : e), 1);
-        }
-#ifdef PROF
-        PADD(ph ? 3 : 2, clock64() - c0); PADD(8, 1);
-#endif
-        L += s1 - s0;
-      }
-    }
-  } else for (int u = gw; u < C.N; u += C.W) {
+  for (int i = 0;; i++) {
+    const int u = C.tid_of(i);
+    if (u >= C.N) break;
+    int nxt = 0;
+    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 2; latency hidden behind this tile
     int g2, e, mt; C.item(u, g2, e, mt);
     const int cnt = sm->cnt[e], np = (cnt + 8 * NTM - 1) / (8 * NTM);
 #ifdef PROF
@@ -415,15 +361,21 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
 #ifdef PROF
       PADD(4, clock64() - c0); c0 = clock64();
 #endif
-    } else if (mt == 0) {
-      for (int i = lane; i < cnt; i += 32) p.ss[list[sm->off[e] + i]] = 0.f;
+    } else if (mt == 0 && C.gj == 0) {
+      for (int k = lane; k < cnt; k += 32) p.ss[list[sm->off[e] + k]] = 0.f;
     }
+    if (lead) sm->ids[C.gi][(i + 2) & 3] = nxt;  // read 2 tiles later, after the group barrier (ks > 1) / syncwarp
+    __syncwarp();
+    const int span = SPT / ks, s0 = C.gj * span;
+    bool fin = false;
     for (int ps = 0; ps < np; ps++) {
       int nt = min(NTM, (cnt - ps * 8 * NTM + 7) >> 3);
-      if (g2) dispatch<1, S>(C, nt, e, mt, ps, 0, 0, SPT); else dispatch<0, S>(C, nt, e, mt, ps, 0, 0, SPT);
+      fin = g2 ? dispatch<1, S>(C, nt, e, mt, ps, i, s0, s0 + span) : dispatch<0, S>(C, nt, e, mt, ps, i, s0, s0 + span);
     }
-    __threadfence(); __syncwarp();
-    if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
+    if (fin) {
+      fence_ar(); __syncwarp();
+      if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
+    }
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
 #endif
@@ -433,14 +385,14 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
 #endif
   const int T2 = sm->na * T2E;
 #ifdef PROF
-  PSET(5, gtime()); PSET(9, C.wcyc); PSET(11, sm->na); PSET(12, sm->mode);
+  PSET(5, gtime()); PSET(9, C.wcyc); PSET(11, sm->na); PSET(12, sm->ks);
 #endif
   if (lane == 0) while (ldacq(p.ctr + NLOC) < T2) __nanosleep(32);
   __syncwarp();
 #ifdef PROF
   PSET(6, gtime());
 #endif
-  for (int it = gw; it < p.M * 16; it += C.W) {
+  for (int it = gw; it < p.M * 16; it += gridDim.x * WPC) {
     const int t = it >> 4, col = (it & 15) * 256 + lane * 8;
     float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
@@ -467,14 +419,14 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   if (tid == 0) {
     __threadfence();
     if (atomicAdd(p.ctr + NLOC + 1, 1) == (int)gridDim.x - 1) {
-      for (int i = 0; i < NLOC + 2; i++) p.ctr[i] = 0;
+      for (int i = 0; i < NLOC + 3; i++) p.ctr[i] = 0;
       __threadfence();
     }
   }
 }
 
 static int g_grid = 0;
-static size_t smem_bytes(int M) { return (size_t)WPC * NSTG * STG + WPC * SCR + WPC * NSTG * 8 + sizeof(Sm) + (size_t)(M + 3) / 4 * 128 + (size_t)M * 8 * 4; }
+static size_t smem_bytes(int M) { return (size_t)WPC * NSTG * STG + WPC * SCR + WPC * NSTG * 8 + (M <= 64 ? WPC * RED : 0) + sizeof(Sm) + (size_t)M * 8 * 3; }
 
 void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1, torch::Tensor w2, torch::Tensor g1,
          torch::Tensor g2, torch::Tensor nw, torch::Tensor inter, torch::Tensor y, torch::Tensor ss, torch::Tensor ctr,
