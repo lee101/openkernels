@@ -849,8 +849,10 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   if (!last) return;
   __threadfence();
   M = -INFINITY;
+#pragma unroll 8
   for (int k = 0; k < p.NS; k++) M = fmaxf(M, __ldcg(p.wml + ((size_t)(b * p.NS + k) * 16 + r) * 2));
   acc = make_float4(0.f, 0.f, 0.f, 0.f); L = 0.f;
+#pragma unroll 8
   for (int k = 0; k < p.NS; k++) {
     const float m = __ldcg(p.wml + ((size_t)(b * p.NS + k) * 16 + r) * 2);
     if (m == -INFINITY) continue;
@@ -946,7 +948,9 @@ def kernel_fn(data):
     qkv = data["qkv"]
     dev = qkv.device
     if L == 1 and hq == 16 and hkv == 2 and cfg["head_dim"] == 64:  # fused single-launch decode
-        NS = max(1, 132 // B)
+        maxkeys = data["page_table"].shape[1] * cfg["page_size"]
+        span = min(maxkeys, cfg["window"] + 1) if cfg["window"] else maxkeys
+        NS = max(1, min(132 // B, (span + 511) // 512))  # >= 64 keys per warp, one wave
         key = ("f", B, NS)
         if key not in _BUF:
             _BUF[key] = (torch.empty((B * NS * 16 * 64,), dtype=torch.float32, device=dev),
