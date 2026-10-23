@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reference as R, submission as S
 
 S._DBG = ["-DPROF"] + os.environ.get("OKB_DBG", "").split()
+S.DIAG = False
 R.N_EXPERTS = 32; ws = R.generate_weights(R.WEIGHTS_SEED); R.N_EXPERTS = 256
 stt = S.prepare(ws)
 ghz = float(os.environ.get("GHZ", "1.98"))
@@ -32,6 +33,6 @@ for bs in bss:
     print(f"  sm clock MHz p10 {pct(mhz, .1):.0f} p50 {pct(mhz, .5):.0f}")
     print(f"  start  p50 {pct(us(0), .5):.1f} p99 {pct(us(0), .99):.1f} | routed p50 {pct(us(1), .5):.1f} max {max(us(1)):.1f}")
     print(f"  items done p10 {pct(us(5), .1):.1f} p50 {pct(us(5), .5):.1f} max {max(us(5)):.1f} | comb wait end max {max(us(6)):.1f} | end max {max(us(7)):.1f}")
-    for nm, col in (("g1 busy", 2), ("g2 busy", 3), ("g2 dep-wait", 4), ("tma wait", 9)):
+    for nm, col in (("g1 busy", 2), ("g2 busy", 3), ("g2 dep-wait", 4), ("tma wait", 9), ("epilogue", 15)):
         v = [cyc(col)[i] for i in act]
         print(f"  {nm:12} per-warp us p10 {pct(v, .1):6.2f} p50 {pct(v, .5):6.2f} p90 {pct(v, .9):6.2f} max {max(v):6.2f}")

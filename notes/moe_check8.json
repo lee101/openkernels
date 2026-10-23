@@ -1,0 +1,88 @@
+{
+  "board": "muse_moe_w4a16",
+  "call_id": "kc-b619ecb12db04d96",
+  "cluster": "sfo3",
+  "content_hash": "125f969b839ef04a3d5b114c0be905ce7315d61556235419acbc25af5d437f6a",
+  "created_at": 1792753260.402483,
+  "dedicated": false,
+  "duplicate_of": null,
+  "finished_at": 1792754567.9541893,
+  "id": "b619ecb12db04d96",
+  "limits": {
+    "scored": {
+      "per_day": 10,
+      "used": 0,
+      "left": 10
+    },
+    "checks": {
+      "per_day": 20,
+      "used": 8,
+      "left": 12
+    }
+  },
+  "mode": "check",
+  "output": {
+    "log": "/vfast/data/code/openkernels/muse_moe_w4a16/profiles/diag_check.b619ecb12db04d96.log"
+  },
+  "payload_ref": "muse_moe_w4a16/125f969b839ef04a3d5b114c0be905ce7315d61556235419acbc25af5d437f6a.py",
+  "result": {
+    "checks": {
+      "flagged": [],
+      "ok": true,
+      "rejected": []
+    },
+    "error": null,
+    "evaluator": {
+      "code_sha256": "afcead6a6ff090aa50fe9bc907f0fa8f4ba73d95fa92af93ec260b5e8ff00f00",
+      "files": {
+        "challenge/checks.py": "9a046c3c38db28b325dcd1557baecdf6bc9ef941d2175f9a900ba4c230bb8055",
+        "challenge/nvfp4.py": "cfdf37c7bc14b10f7353aba7d4632f4767401b92b4b073941a8030d9a961aaaf",
+        "configs/muse-spark-open.yaml": "98f07230e4e64fe91b7c76d9a3ce04948053c043d494d5f1fae56cfe2de033af",
+        "harness/eval.py": "0051a1bfac67a9f1fad06086b306653c6643b2bb253e15a794aa672312f070a9",
+        "harness/runner.py": "c905e5c80264c6d27620b6fc7d55b162dccdb8ed7282f8a513a4d2e6f2f226f2",
+        "harness/static_checks.py": "c5588b69e9e86229459a525c61b30096f6f13ff2add6cadf98f272c4ac8ca0c2",
+        "harness/worker.py": "950437610f57ddffbc1176b65d9c2ae909c47bf67b1e3fe0716a81946986f568",
+        "problems/muse_moe_w4a16/baseline.py": "4fc48bd9cdfd749863c93a2dbf4e556e0c38fb04acc4fa48a53ef34cbf6c92a1",
+        "problems/muse_moe_w4a16/reference.py": "a7e0b4fa86aa477a4e7bb5745b2b258954d72636b6da153bd239a717927cba44",
+        "problems/muse_moe_w4a16/task.yml": "cc6870087c1a115e69f40093478553e0a03c1b3e92f527c2e55c4115e2db42ad"
+      },
+      "image": "localhost:30500/kc/judge@sha256:9a7f287b80d772c6f636bbcb57422c619fe326e2aabc53803b85007bca93f68e"
+    },
+    "flags": [],
+    "gpu": "H200",
+    "log_tail": "TMA spin 0 wpc 16 S 2 stg 4608: contig 4331 GB/s  interleaved 4385 GB/s\nTMA spin 0 wpc 16 S 3 stg 4608: contig 4356 GB/s  interleaved 4380 GB/s\nTMA spin 0 wpc 8 S 4 stg 4608: contig 4336 GB/s  interleaved 4353 GB/s\nTMA spin 0 wpc 8 S 6 stg 4608: contig 4343 GB/s  interleaved 4324 GB/s\nTMA spin 0 wpc 8 S 2 stg 9216: contig 4382 GB/s  interleaved 4401 GB/s\nTMA spin 0 wpc 8 S 3 stg 9216: contig 4398 GB/s  interleaved 4405 GB/s\nTMA spin 0 wpc 4 S 4 stg 9216: contig 4319 GB/s  interleaved 4351 GB/s\nTMA spin 0 wpc 4 S 2 stg 18432: contig 4391 GB/s  interleaved 4406 GB/s\nTMA spin 0 wpc 4 S 3 stg 18432: contig 4402 GB/s  interleaved 4392 GB/s\nTMA spin 0 wpc 2 S 4 stg 18432: contig 4338 GB/s  interleaved 4331 GB/s\nTMA spin 0 wpc 2 S 2 stg 36864: contig 4372 GB/s  interleaved 4364 GB/s\nTMA spin 0 wpc 1 S 4 stg 36864: contig 4356 GB/s  interleaved 4361 GB/s\n",
+    "machine": {
+      "gpu_after": {
+        "clocks.max.sm": 1980,
+        "clocks.mem": 3201,
+        "clocks.sm": 1980,
+        "driver_version": "580.159.03",
+        "name": "NVIDIA H200",
+        "power.draw": 119.57,
+        "power.limit": 700,
+        "temperature.gpu": 31
+      },
+      "gpu_before": {
+        "clocks.max.sm": 1980,
+        "clocks.mem": 3201,
+        "clocks.sm": 1980,
+        "driver_version": "580.159.03",
+        "name": "NVIDIA H200",
+        "power.draw": 132.07,
+        "power.limit": 700,
+        "temperature.gpu": 32
+      },
+      "node": "n-djsogg5ih26gwdcnhyhbnqzfkb"
+    },
+    "passed": false,
+    "records": [],
+    "returncode": -9,
+    "score_us": null,
+    "speedup": null,
+    "speedup_ci": null,
+    "status": "timeout"
+  },
+  "started_at": 1792753659.1052315,
+  "status": "done",
+  "team": "lee101"
+}

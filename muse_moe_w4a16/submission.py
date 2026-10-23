@@ -229,6 +229,10 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
       }
     }
   }
+#ifdef PROF
+  const long long ce0 = clock64();
+  struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 16 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, C.gw};
+#endif
   float f[NT][4];
 #pragma unroll
   for (int n = 0; n < NT; n++)
@@ -563,11 +567,52 @@ def prepare(weights):
     _ext()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
-    return {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
+    st = {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
             "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(64, dtype=torch.int32, device=dev),
             "tcnt": torch.zeros(32 * 768, dtype=torch.int32, device=dev),
             "prof": torch.zeros((65536 * 16 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
             "ws": torch.empty((32 * 768 * 8 * 64 * 4,), dtype=torch.float32, device=dev)}
+    if DIAG:
+        _diag(st, weights)
+    return st
+
+
+DIAG = False  # diagnostics only: print a per-warp phase timeline from prepare() (untimed)
+
+
+def _diag(state, weights):
+    global _mod, _DBG
+    keep, _mod, _DBG = (_mod, _DBG), None, _DBG + ["-DPROF"]
+    ext = _ext()
+    state = dict(state, prof=torch.zeros((65536 * 16,), dtype=torch.int64, device="cuda"))
+    nw = torch.cuda.get_device_properties(0).multi_processor_count * (16 if _big() else 8)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    for bs in (1, 8, 32, 256):
+        sc = torch.rand((bs, 256), generator=g, device="cuda")
+        ids = sc.topk(8, -1).indices
+        pr = torch.bincount((ids // 32).flatten(), minlength=8)
+        ids = ((ids - 32 * pr.argmax()) % 256).int().contiguous()
+        x = torch.randn((bs, 4096), generator=g, device="cuda").bfloat16()
+        tw = torch.full((bs, 8), 0.125, device="cuda")
+        fl = torch.empty(2**28, device="cuda")
+        for _ in range(3):
+            fl.add_(1)
+            inter = torch.empty((bs * 8, 4096), dtype=torch.bfloat16, device="cuda"); y = torch.empty_like(inter)
+            ss = torch.empty((bs * 8,), device="cuda"); out = torch.empty_like(x)
+            ext.moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
+                    state["tcnt"], state["ws"], out, 0, state["prof"])
+        torch.cuda.synchronize()
+        P = state["prof"].view(-1, 16)[:nw].cpu().tolist()
+        t0 = min(r[0] for r in P)
+        q = lambda v, f: sorted(v)[min(len(v) - 1, int(f * len(v)))]
+        col = lambda k: [(r[k] - t0) / 1e3 for r in P]
+        mhz = [(r[14] - r[13]) / max(1, r[7] - r[0]) * 1e3 for r in P]
+        cy = lambda k: [r[k] / q(mhz, .5) for r in P]
+        print(f"DIAG bs {bs} na {P[0][11]} mode {P[0][12]} span {max(col(7)):.1f} routed {max(col(1)):.1f} "
+              f"done p10/50/max {q(col(5), .1):.1f}/{q(col(5), .5):.1f}/{max(col(5)):.1f} comb {max(col(6)):.1f} mhz {q(mhz, .5):.0f} "
+              f"g1 {q(cy(2), .5):.1f}/{max(cy(2)):.1f} g2 {q(cy(3), .5):.1f}/{max(cy(3)):.1f} dep {q(cy(4), .5):.1f}/{max(cy(4)):.1f} "
+              f"tma {q(cy(9), .5):.1f}/{max(cy(9)):.1f} segs {max(r[8] for r in P)}", flush=True)
+    _mod, _DBG = keep
 
 
 def kernel_fn(data, state):
