@@ -394,6 +394,9 @@ __global__ void __launch_bounds__(256) attn2(A a) {
 #ifndef RB3
 #define RB3 20
 #endif
+#ifndef SB
+#define SB 4
+#endif
 __global__ void __launch_bounds__(256, 2) attn3(A a) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
   const int sp = blockIdx.x % a.nsplit, b = blockIdx.x / a.nsplit;
@@ -426,16 +429,22 @@ __global__ void __launch_bounds__(256, 2) attn3(A a) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dd), "l"(src), "r"(row >= 0 ? 16 : 0));
     asm volatile("cp.async.commit_group;\n");
   };
+  // steps of SB blocks per barrier; at a step's start blocks < bi are consumed and nxt = bi + RB3 - SB are issued
   const int nb = (ke - ks + 15) >> 4;
-  int rnext = rowof(ks + (RB3 - 1) * 16);
+  int nxt = 0, rn[SB];
 #pragma unroll
-  for (int i = 0; i < RB3 - 1; i++) issue(i, rowof(ks + i * 16));
-  for (int bi = 0, kb = ks; bi < nb; bi++, kb += 16) {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(RB3 - 2));
-    __syncthreads();  // block bi visible to all warps; slot (bi - 1) % RB3 free for refill
-    const int r2 = rowof(kb + RB3 * 16);
-    issue((bi + RB3 - 1) % RB3, rnext);
-    rnext = r2;
+  for (int i = 0; i < RB3 - SB; i++) { issue(i, rowof(ks + i * 16)); nxt++; }
+#pragma unroll
+  for (int j = 0; j < SB; j++) rn[j] = rowof(ks + (nxt + j) * 16);
+  for (int bs = 0; bs < nb; bs += SB) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(RB3 - 2 * SB));
+    __syncthreads();  // blocks bs .. bs+SB-1 visible; slots of blocks bs-SB .. bs-1 free
+#pragma unroll
+    for (int j = 0; j < SB; j++) { issue((nxt + j) % RB3, rn[j]); }
+    nxt += SB;
+#pragma unroll
+    for (int j = 0; j < SB; j++) rn[j] = rowof(ks + (nxt + j) * 16);
+  for (int bi = bs, kb = ks + bs * 16; bi < min(nb, bs + SB); bi++, kb += 16) {
     const uint32_t sl = ring + (bi % RB3) * 4096;
     uint4 kw[2];
     const uint32_t ck = ((h * 4 + t) ^ (g & 7)) << 4;
@@ -490,6 +499,7 @@ __global__ void __launch_bounds__(256, 2) attn3(A a) {
       mma16(o[n], pa[0], pa[1], pa[2], pa[3], e2h(lo01), e2h(lo23));
       mma16(o[n + 1], pa[0], pa[1], pa[2], pa[3], e2h(lo01 >> 16), e2h(lo23 >> 16));
     }
+  }
   }
   const size_t it = ((size_t)b * a.hkv + h) * a.nsplit + sp;
 #pragma unroll
@@ -661,7 +671,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3 = (8, 6, 20) if _big() else (4, 3, 8)
-        _mod = load_inline("attn_v6_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v7_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t);",
                            cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3] + _DBG, verbose=False)
     return _mod
