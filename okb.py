@@ -23,7 +23,7 @@ meta = json.load(open(D.parent / "notes" / f"{D.name}.json"))
 def parse(line):
     d = {}
     for kv in line.split(","):
-        k, v = kv.strip().split(None, 1); d[k] = int(v) if re.fullmatch(r"-?\d+", v) else v
+        k, v = kv.strip().split(None, 1); d[k] = int(v) if re.fullmatch(r"-?\d+", v) else (float(v) if re.fullmatch(r"-?\d*\.\d+", v) else v)
     return d
 blk = re.search(r"must pass these \d+ tests.*?```\n(.*?)```", (D / "TASK.md").read_text(), re.S)
 tests = [parse(l) for l in blk.group(1).strip().splitlines()] if blk else []
@@ -39,8 +39,12 @@ def prep(m):
     if ws is None or not hasattr(m, "prepare"): return None
     t = time.time(); s = m.prepare(ws); torch.cuda.synchronize(); print(f"prepare {m.__name__} {time.time()-t:.1f}s"); return s
 S = prep(sub); B = prep(base) if base else None
+import inspect
+def call(m, data, st):
+    return m.kernel_fn(data, st) if len(inspect.signature(m.kernel_fn).parameters) > 1 else m.kernel_fn(data)
 def args_of(c): return {k: v for k, v in c.items() if k not in ("load", "weight", "repeats")}
 def check(data, out):
+    if hasattr(ref, "collect"): out = ref.collect(data, out)
     return ref.check_implementation(data, out, ws) if ws is not None else ref.check_implementation(data, out)
 
 bad = 0
@@ -51,7 +55,7 @@ if not a.no_check:
             kw = args_of(c); kw["seed"] = kw.get("seed", 1000) * 7 + 13 * i + (0 if i else 0)
             if i == 0 and "seed" in c: kw["seed"] = c["seed"]
             data = ref.generate_input(**kw)
-            out = sub.kernel_fn(data, S); torch.cuda.synchronize()
+            out = call(sub, data, S); torch.cuda.synchronize()
             ok, msg = check(data, out)
             bad += not ok
             if not ok or i == 0: print(f"{'OK ' if ok else 'BAD'} {kind:5} {c.get('load','')[:10]:10} {json.dumps(args_of(c))[:90]} s{kw['seed']}: {msg}")
@@ -66,10 +70,10 @@ if a.stress:  # judge-style: capture once, refresh inputs in place, replay, chec
         data = ref.generate_input(**args_of(c)); fails = 0
         st_ = torch.cuda.Stream(); st_.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st_):
-            for _ in range(2): sub.kernel_fn(data, S)
+            for _ in range(2): call(sub, data, S)
         torch.cuda.current_stream().wait_stream(st_); torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g): out = sub.kernel_fn(data, S)
+        with torch.cuda.graph(g): out = call(sub, data, S)
         for r in range(a.stress):
             kw = args_of(c); kw["seed"] = 100000 + 7919 * r; fresh = ref.generate_input(**kw); fill(data, fresh)
             g.replay(); torch.cuda.synchronize()
@@ -83,10 +87,10 @@ flush = torch.ones(int(0.5 * 2**30) // 4, dtype=torch.float32, device="cuda"); s
 def graph(m, s, data):
     st_ = torch.cuda.Stream(); st_.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(st_):
-        for _ in range(2): m.kernel_fn(data, s)
+        for _ in range(2): call(m, data, s)
     torch.cuda.current_stream().wait_stream(st_); torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g): m.kernel_fn(data, s)
+    with torch.cuda.graph(g): call(m, data, s)
     return g
 def tm(g):
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
