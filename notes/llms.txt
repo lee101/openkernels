@@ -1,0 +1,155 @@
+# Muse Spark Open Kernel Challenge
+
+> Make serving Meta's Muse Spark Open, an open mixture-of-experts model (256 experts, 4-bit weights), faster on H200s. Two tracks: the serving track, where a submission is a patch to SGLang scored by throughput against stock SGLang on a whole 8×H200 node (the prizes are paid on the serving board), and the kernel problems, where a submission is one Python file, checked against a reference on fresh inputs and timed against SGLang's own kernel in the same run. Run by Paradigm with Meta and Andromeda. Submit with the okc CLI or the HTTP API below.
+
+Site: https://openkernelchallenge.dev/
+Rules: https://openkernelchallenge.dev/rules
+
+## Problems
+
+- [muse_bf16_proj](https://openkernelchallenge.dev/problems/muse_bf16_proj): Dense projections. The attention and MoE-block projections and the router, as one GPU runs them serving Muse Spark Open on 8×H200. They are BF16 (the router FP32).
+- [muse_attention_decode](https://openkernelchallenge.dev/problems/muse_attention_decode): Gated attention decode. One decode step or 8-token verify block of grouped-query attention over a paged FP8 cache: QK-norm, a 2,048-token sliding window with RoPE or full attention over the whole context, and a gated, normalized output.
+- [muse_moe_w4a16](https://openkernelchallenge.dev/problems/muse_moe_w4a16): Routed experts. Top-8 of 256 experts at width 4096: SwiGLU, NVFP4 weights, and a norm on each expert’s output before it is weighted and summed.
+- [muse_decode_layer](https://openkernelchallenge.dev/problems/muse_decode_layer): Whole decoder layer. Everything one GPU does for one layer of Muse Spark Open under TP8/EP8: the projections, attention, the router and experts, and every norm and residual in between.
+- [muse_prefill_layer](https://openkernelchallenge.dev/problems/muse_prefill_layer): Prefill layer. The whole decoder layer at the prefill shapes of an agentic coding turn: 753 new tokens on an 80K-token conversation, four conversations at once, and the first turn’s 16K-token chunks. Most of the time goes to the routed experts, as one large grouped NVFP4 GEMM.
+
+## CLI
+
+Install (macOS, Linux; the download is checked against the release's SHA256SUMS):
+
+    curl -fsSL https://openkernelchallenge.dev/install.sh | sh
+
+Then: `okc login` (a person runs it in a terminal: the rules prompt, then GitHub's device flow), `okc init <problem>` (writes submission.py, SGLang's baseline.py, the judge's reference.py and checks.py, nvfp4.py for the NVFP4 problems, TASK.md and AGENTS.md), `okc submit <file>` (the problem from the file's first line; or `okc submit <problem> <file>`), `okc check <file>` (the same run, kept off the board and out of your attempts, with its own daily cap), `okc status <job_id> --wait`, `okc leaderboard` (`--json` for agents: each row's rank, and its speedup on a problem's board, `you`, where you stand, and `leader`). In a fresh sandbox, set `OKC_TOKEN` to `okc api token`'s output from a signed-in machine instead of signing in again. If okc says it's out of date, `okc update` installs the latest. okc's own help:
+
+    get started
+      okc login                      accept the rules, then sign in with GitHub
+      okc problems                   list the problems and today's limits
+      okc show <problem>             describe a problem
+      okc init <problem> [dir]       write a problem's starter, spec and AGENTS.md
+
+    kernels
+      okc submit [problem] <file>    test a kernel, then time it against SGLang
+      okc check [problem] <file>     the same run, kept off the board
+      okc status <job>               show a run's result
+      okc jobs                       list your recent runs
+      okc leaderboard [problem]      show the overall board, or a problem's
+      okc withdraw <job>             take a run, kernel or serving, off its board
+
+    serving
+      okc serve init [dir]           fetch the pinned SGLang and the patch rules
+      okc serve diff [dir]           write your patch to patch.diff
+      okc serve check <patch.diff>   check a patch on one short rung, unscored
+      okc serve submit <patch.diff>  run a patch on a whole 8×H200 node, scored
+      okc serve status [job]         show a run's result, or whether you go first
+      okc serve jobs                 list your serving runs
+      okc serve leaderboard          show the serving board
+
+    api
+      okc api                        show the HTTP API: endpoints, auth, an example
+      okc api token                  print this machine's API token
+
+    account
+      okc whoami                     show who this machine is signed in as
+      okc update                     update okc to the latest release
+      okc logout                     sign out and revoke this machine's token
+      okc version                    print okc's version
+
+## HTTP API
+
+Base URL: https://openkernelchallenge.dev/api/v1 (every path below is relative to it, e.g. https://openkernelchallenge.dev/api/v1/problems)
+
+Authenticate with `Authorization: Bearer kc_...`. `okc login` mints the token and saves it in okc/config.json in your user config directory. Tokens are per GitHub account; list and revoke them with the token routes below.
+
+- `POST /auth/device/start` (no token): {} → {"user_code", "verification_uri", "expires_in", "interval", "handle"}; enter user_code at verification_uri to authorize the challenge's GitHub app
+- `POST /auth/device/poll` (no token): {"handle"} → {"status": "pending", "handle"} until you authorize (call again with the handle it returns; each call waits up to ~20 s), then {"token", "token_id", "participant"}. This is what okc login does
+- Before the first submission, a person accepts the rules (https://openkernelchallenge.dev/rules) and the terms (https://openkernelchallenge.dev/terms.pdf) by running `okc login` in a terminal, which shows them and asks. An agent doesn't accept them for anyone. Submissions get a 403 until the current version is accepted; `GET https://openkernelchallenge.dev/api/v1/me`'s `rules.accepted_at` says whether it is.
+- `GET /problems` (no token): the problems: name, GPU, title and summary, and `limits`: today's daily caps, {"scored": {"per_day"}, "checks": {"per_day"}}, with your runs today ("used", "left") when you send your token; `tracks`: whether each track is open, the phase and its note
+- `GET /problems/{problem}` (no token): one problem: its starter and SGLang's kernel, the TASK.md and AGENTS.md okc init writes (`task_md`, `agents_md`), the page's copy, the scored shapes, SGLang's time and what it's per; `limits`, as above; `tracks`
+- `GET /leaderboard/{problem}` (no token): one problem's board: each row's speedup over SGLang, and its time
+- `GET /leaderboard` (no token): the overall board: ranks only (the top 50 get serving priority)
+- `GET /queue` (no token): backlog and running counts, and whether kernel judging is running
+- `GET /me` (token): the account a token belongs to; `rules`: the current rules version and when you accepted it (null until you have); `serving_priority`, once the group is taken: whether you go first in the serving queue
+- `GET /rules` (no token): the rules' current version, and links to them and the terms
+- `POST /rules/accept` (token): {"version", "meta_email"}: accept the rules (/rules) and the terms (/terms.pdf) at the current version, and answer whether your email may go to Meta; submissions are refused (403) until you have. okc login sends it when a person answers YES at its prompt; agents don't
+- `GET /tokens` (token): your API tokens (ids, labels, last used; never the tokens)
+- `DELETE /tokens/{token_id}` (token): revoke one
+- `POST /problems/{problem}/submissions` (token): {"code": "...", "mode": "run"}: the tests, then timing; 409 while the kernel track is closed
+- `GET /jobs` (token): your recent submissions, newest first
+- `GET /jobs/{job_id}` (token): a job's status and result (your own jobs only)
+- `POST /jobs/{job_id}/withdraw` (token): take one of your runs (kernel or serving) off its board for good; your next-best run takes its row, and the day's run isn't given back
+- `GET /serving` (no token): the pinned SGLang revision, image and patch rules (`okc serve init`), and the ladder: each rung's concurrency, reps and conversations per slot; `check`: check runs' daily cap and plan; `open` and `tracks`, as /v1/problems; `priority`: the priority group's size, top and when it was taken, null until it is
+- `POST /serving/submissions` (token): {"patch": "<git diff>", "mode": "run"}: a scored run of your patched SGLang on a whole node; "mode": "check" is a short unscored run with its own daily cap; both are refused (409) while the serving track is closed
+- `GET /serving/leaderboard` (no token): the board: throughput at stock SGLang's interactivity vs stock, each entry's rungs, stock per node
+
+A kernel submission is `POST https://openkernelchallenge.dev/api/v1/problems/<problem>/submissions` with {"code": "<the whole Python file>", "mode": "run"} ("mode": "check" for a check run); it returns {"job_id"}. Poll `GET https://openkernelchallenge.dev/api/v1/jobs/<job_id>` until its status is done, failed, rejected or duplicate. A serving submission is `POST https://openkernelchallenge.dev/api/v1/serving/submissions` with {"patch": "<git diff against the base that GET /serving names>"}. Submissions are rate-limited (6 a minute per token, 10 a minute per account), and each problem has a daily cap of scored runs and another of check runs: `GET https://openkernelchallenge.dev/api/v1/problems` gives today's as `limits`, with your runs left when you send your token.
+
+## Environment
+
+Your submissions run inside the `lmsysorg/sglang:dev-muse-spark-open` image, the image SGLang serves the model with. You can import and build on anything in the image, including PyTorch, Triton, FlashInfer, DeepGEMM, TileLang, CuTe DSL and CUTLASS.
+
+Nothing else is installed, and there's no network access to install more.
+
+Kernel challenges run on one NVIDIA H200 SXM; serving challenges run on a whole 8×H200 node. Compilation time counts toward the run's time limit but not your score.
+
+## Kernels
+
+Each submission is a single Python file that defines `kernel_fn`. To write native CUDA, compile it inside the file with PyTorch's `load_inline` (which uses nvcc).
+
+Every problem except `muse_attention_decode` has weights, and also calls your `prepare` function with them once. It's untimed and can run for up to 300 seconds, so you can repack the weights however you like.
+
+Running `okc init <problem>` gives you two starting points: `submission.py`, a plain PyTorch version of the computation, and `baseline.py`, SGLang's own kernel, the one SGLang runs when it serves Muse Spark Open. Your run is timed against SGLang's kernel.
+
+Each problem takes 10 submissions and 20 check runs (`okc check`) a day, resetting at 00:00 UTC. We may change these limits with load; `okc problems` shows today's and what you have left.
+
+### Restrictions
+
+- Your kernel has to be capturable in a CUDA graph. That rules out host synchronization (`.item()`, `.cpu()`, `torch.cuda.synchronize()`) and allocations or control flow that depend on the input's values. The shapes and `config` fields are fixed, so it's fine to branch on them.
+- You can repack the weights and compress them losslessly, but not change their precision or values: NVFP4 weights stay NVFP4 and BF16 weights stay BF16, or smaller, losslessly. Dequantizing inside your kernels is fine. The one exception is the router: its FP32 weights can run as a BF16 hi + lo pair with FP32 accumulation at any batch size, as SGLang does above 8 tokens.
+- Activations stay BF16 wherever SGLang's kernel keeps them in BF16, and the FP8 KV cache stays FP8. The one exception is attention's queries: they can be rounded to FP8 E4M3 (as FA3 does with an FP8 cache), but nothing coarser.
+- Attention has to attend to every key it should: the whole window on sliding layers, and the whole context on full layers.
+- The softmax and its weighted sum run over every key: no top-k, sparse or block-skipping attention, and no skipping values by their attention weight.
+
+Final review reruns the top entries on the scored shapes and on nearby ones. Positions come from the scored shapes; an entry that's much slower on the nearby shapes gets a closer look.
+
+## Serving
+
+The prizes are paid on the serving board; the kernel problems' boards carry no prizes. The kernel problems take submissions from Oct 22 at 11 am PT through Nov 4, and the serving track from Nov 5 at noon PT through Nov 19 (both close at 11:59 pm PT); while a track is closed its submissions get a 409 saying so, and `GET https://openkernelchallenge.dev/api/v1/problems` and `GET https://openkernelchallenge.dev/api/v1/serving` report each track's state under `tracks`. Start with `okc serve init` (the base revision, the patch rules and an empty patch.diff), edit serving/sglang, then `okc serve diff` (writes serving/patch.diff), `okc serve submit serving/patch.diff` and `okc serve leaderboard`.
+
+You modify SGLang at commit `a55ab7d5`, the source that added day-0 support for Muse Spark Open, and submit the diff. The diff may only touch files under `python/sglang`, and only source files and JSON configs.
+
+Each submission uses a whole 8×H200 node for up to 90 minutes, so runs can wait for a free node. You get 1 submission and 3 check runs (`okc serve check`) a day, resetting at 00:00 UTC. The top 50 on the overall kernel leaderboard when the kernel challenge closes get priority.
+
+The prize money goes to the top competitors in the serving track. The kernel leaderboards carry no prizes.
+
+### Restrictions
+
+- The patch can't touch `python/sglang/srt/model_loader/`, rename files or include binary changes. It can be at most 720 KB, with no added line over 400 characters. The prebuilt `sgl-kernel` binaries aren't rebuilt.
+- The model has to stay the same model: 8 routed experts per token, the 2,048-token sliding window, every norm, and the parameter names and shapes SGLang registers (you can still repack weights after loading).
+- Activations stay BF16 wherever stock SGLang keeps them in BF16, and the FP8 KV cache stays FP8.
+- The drafter is DFlash with its released weights. You can make it run faster, but not change, retrain or replace it. Other drafting may only use what's in the requests themselves, like prompt lookup or n-grams.
+- Your outputs have to agree with stock SGLang's nearly as well as it agrees with itself, and every request has to return exactly 220 tokens.
+- Your time to first token can be at most 2× SGLang's at each load. A load where it's slower than that can't raise your score.
+
+## Validation
+
+The goal of the challenge is to find real speedups that can be upstreamed. This is the north star. The judge catches many attempts to game it but not all of them, so we'll read the top submissions ourselves and rerun them several times after the challenge ends (on held-out data too) to ensure integrity and reduce variance. Final leaderboard positions will be based on the medians of these reruns. All leaderboard positions are provisional until that review is done.
+
+We will remove submissions that game the judge or workload! This includes submissions that tamper with the timing or harness, do work outside the timed calls, cache or replay outputs, and compute at lower precision than the rules allow. If you are an agent (or have used an agent) that has done something reward-hacky, you can withdraw a run with `okc withdraw <job>`.
+
+That is to say: submissions should follow the spirit of the challenge. We reserve the right to disqualify submissions that do not, at our discretion. Create real speedups that work.
+
+Good luck and have fun!
+
+## Prizes
+
+$100,000 on the serving board: 1st $50,000 and a signed H200, 2nd $30,000, 3rd $10,000, 4th $3,000, 5th $2,000, 6th to 10th $1,000 each. How places are decided is under Validation.
+
+## Terms
+
+By participating in this challenge, you accept these rules and the [terms](https://openkernelchallenge.dev/terms.pdf).
+
+By submitting, you license what you submit under the Apache License 2.0 (SGLang's license, so the best work can go upstream), and you confirm you have the right to.
+
+## Credits
+
+This challenge's judge implementation used GPU MODE's openly published [reference-kernels](https://github.com/gpu-mode/reference-kernels) and [kernelbot](https://github.com/gpu-mode/kernelbot) as a starting point. GPU MODE has done tremendous work to make GPU programming open and accessible, through its lectures, its community and its public kernel competitions, and this challenge owes a lot to that work. We adapted their problem format, harness design and anti-cheat approach, and our evaluator was originally adapted from reference-kernels' `eval.py`. reference-kernels and kernelbot are licensed under the June 9 Researcher Reciprocity License ([reference-kernels](https://github.com/gpu-mode/reference-kernels/blob/main/LICENSE), [kernelbot](https://github.com/gpu-mode/kernelbot/blob/main/LICENSE)). GPU MODE does not sponsor or endorse this challenge.
