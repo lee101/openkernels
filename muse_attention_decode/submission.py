@@ -48,8 +48,9 @@ CUDA = r"""
 #define LOG2E 1.4426950408889634f
 
 // ---------------------------------------------------------------- prep: one CTA (64 x Hq+2Hkv threads) per new token
+__device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, float& sn, float& cs);
 __global__ void prep(const __nv_bfloat16* qkv, const int64_t* pos, const int64_t* loc, uint8_t* kc, uint8_t* vc,
-                     const float* ksc, const float* vsc, __half* qo, int hq, int hkv, float theta, float qsc) {
+                     const float* ksc, const float* vsc, __half* qo, int hq, int hkv, float theta, float qsc, const float* invf) {
   const int tok = blockIdx.x, hd = blockIdx.y, d = threadIdx.x;  // one 64-thread block per (token, head)
   const int W = (2 * hq + 2 * hkv) * D;
   const __nv_bfloat16* row = qkv + (size_t)tok * W;
@@ -76,10 +77,7 @@ __global__ void prep(const __nv_bfloat16* qkv, const int64_t* pos, const int64_t
   x = x * rsqrtf(ss / D + 1e-5f);
   if (isq) x *= qsc;
   if (theta > 0.f) {  // interleaved RoPE: pair (2i, 2i+1), angle pos * theta^(-2i/64), fp32 as the reference
-    const int i = d >> 1;
-    const float inv = 1.0f / powf(theta, (float)(2 * i) / D);
-    const float ang = (float)pos[tok] * inv;
-    float sn, cs; sincosf(ang, &sn, &cs);
+    float sn, cs; rope_cs(invf, (int)pos[tok], d >> 1, sn, cs);
     const float other = __shfl_xor_sync(0xffffffffu, x, 1);
     x = (d & 1) ? other * sn + x * cs : x * cs - other * sn;
   }
@@ -622,15 +620,27 @@ __global__ void comb(A a, const __nv_bfloat16* qkv, __nv_bfloat16* out, float vs
 struct F {
   const __nv_bfloat16* qkv; const int64_t* loc; uint8_t* kc; uint8_t* vc; const int* pt; const int* seq;
   float* wo; float* wml; int* cnt; __nv_bfloat16* out;
-  int B, ps, maxp, window, NS; float theta, qsc, qk, kinv, vinv, vscale;
+  int B, ps, maxp, window, NS; float theta, qsc, qk, kinv, vinv, vscale; unsigned long long* prof; const float* invf;
 };
+#ifdef PROF
+__device__ __forceinline__ unsigned long long gtm() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
+#define PT(k) do { if ((threadIdx.x & 31) == 0) p.prof[(blockIdx.x * 8 + (threadIdx.x >> 5)) * 8 + (k)] = gtm(); } while (0)
+#else
+#define PT(k)
+#endif
 #ifndef RBF
 #define RBF 5
 #endif
-__device__ __forceinline__ float ropef(float theta, int pair) { return 1.0f / powf(theta, (float)(2 * pair) / D); }
+// RoPE angle pos * inv_freq[pair] in fp32 (as the reference), cos/sin after an exact double-precision reduction
+__device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, float& sn, float& cs) {
+  const float ang = (float)pos * invf[pair];
+  const double a = (double)ang, k = rint(a * 0.15915494309189535);
+  __sincosf((float)(a - k * 6.283185307179586), &sn, &cs);
+}
 
 __global__ void __launch_bounds__(256, 1) fdec(F p) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
+  PT(0);
   const int b = blockIdx.x / p.NS, s = blockIdx.x % p.NS;
   const int seq = p.seq[b];
   const int k0 = p.window ? max(0, seq - p.window + 1) : 0, span = seq + 1 - k0;
@@ -653,7 +663,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     if (p.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 4; i += 2) {
-        float sn, cs2; sincosf((float)seq * ropef(p.theta, (d0 + i) >> 1), &sn, &cs2);
+        float sn, cs2; rope_cs(p.invf, seq, (d0 + i) >> 1, sn, cs2);
         const float e = k[i], o = k[i + 1];
         k[i] = e * cs2 - o * sn; k[i + 1] = e * sn + o * cs2;
       }
@@ -692,7 +702,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     if (p.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 16; i += 2) {
-        float sn, cs2; sincosf((float)seq * ropef(p.theta, (t * 16 + i) >> 1), &sn, &cs2);
+        float sn, cs2; rope_cs(p.invf, seq, (t * 16 + i) >> 1, sn, cs2);
         const float e = x[i], o = x[i + 1];
         x[i] = e * cs2 - o * sn; x[i + 1] = e * sn + o * cs2;
       }
@@ -700,7 +710,9 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
 #pragma unroll
     for (int j = 0; j < 4; j++) { qa[h][j][0] = pk(x[4 * j], x[4 * j + 1]); qa[h][j][2] = pk(x[4 * j + 2], x[4 * j + 3]); qa[h][j][1] = 0; qa[h][j][3] = 0; }
   }
+  PT(1);
   __syncthreads();  // table ready
+  PT(2);
   float o[2][8][2], mx[2] = {-INFINITY, -INFINITY}, ls[2] = {0.f, 0.f};
 #pragma unroll
   for (int h = 0; h < 2; h++)
@@ -791,6 +803,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
       }
     }
   }
+  PT(3);
   asm volatile("cp.async.wait_group 0;\n");
   __syncthreads();  // rings free: reuse for the warps' partials
   float* mo = (float*)smem;                 // [8 warps][16 rows][64]
@@ -837,7 +850,8 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     for (int i = 0; i < 4; i++) ob[i] = __float2bfloat16(vals[i] * rn / (1.f + expf(-__bfloat162float(gt[i]))));
     *(uint2*)(p.out + (size_t)b * 16 * D + r * D + dv * 4) = *(uint2*)ob;
   };
-  if (p.NS == 1) { finish(acc, L); return; }
+  PT(4);
+  if (p.NS == 1) { finish(acc, L); PT(5); return; }
   float* gwo = p.wo + ((size_t)(b * p.NS + s) * 16 + r) * D;
   ((float4*)gwo)[dv] = acc;
   if (dv == 0) { p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2] = M; p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2 + 1] = L; }
@@ -846,6 +860,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   __shared__ int last;
   if (tid == 0) last = atomicAdd(p.cnt + b, 1) == p.NS - 1;
   __syncthreads();
+  PT(5);
   if (!last) return;
   __threadfence();
   M = -INFINITY;
@@ -862,17 +877,19 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     acc.x += wt * v.x; acc.y += wt * v.y; acc.z += wt * v.z; acc.w += wt * v.w;
   }
   finish(acc, L);
+  PT(6);
   if (tid == 0) p.cnt[b] = 0;
 }
 
 void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc, torch::Tensor pt, torch::Tensor seq,
               torch::Tensor wo, torch::Tensor wml, torch::Tensor cnt, torch::Tensor out, int64_t ps, int64_t window, double theta,
-              double qk_factor, double sm_scale, double kv_scale, int64_t NS) {
+              double qk_factor, double sm_scale, double kv_scale, int64_t NS, torch::Tensor prof, torch::Tensor invf) {
   F p;
   p.qkv = (const __nv_bfloat16*)qkv.data_ptr(); p.loc = loc.data_ptr<int64_t>(); p.kc = (uint8_t*)kc.data_ptr(); p.vc = (uint8_t*)vc.data_ptr();
   p.pt = pt.data_ptr<int>(); p.seq = seq.data_ptr<int>(); p.wo = wo.data_ptr<float>(); p.wml = wml.data_ptr<float>(); p.cnt = cnt.data_ptr<int>();
   p.out = (__nv_bfloat16*)out.data_ptr(); p.B = seq.size(0); p.ps = ps; p.maxp = pt.size(1); p.window = window; p.NS = NS;
   p.theta = theta; p.qsc = qk_factor; p.qk = (float)(sm_scale * 1.4426950408889634); p.kinv = 1.f / kv_scale; p.vinv = 1.f / kv_scale; p.vscale = kv_scale;
+  p.prof = prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr; p.invf = invf.data_ptr<float>();
   const int sm = 8 * RBF * 4096 + 256;
   static bool once = false;
   if (!once) { cudaFuncSetAttribute(fdec, cudaFuncAttributeMaxDynamicSharedMemorySize, sm); once = true; }
@@ -882,12 +899,12 @@ void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Ten
 void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc, torch::Tensor ksc,
          torch::Tensor vsc, torch::Tensor pt, torch::Tensor seq, torch::Tensor qbuf, torch::Tensor wo, torch::Tensor wml,
          torch::Tensor out, int64_t hq, int64_t hkv, int64_t ps, int64_t window, double theta, double qk_factor,
-         double sm_scale, double kv_scale, int64_t nsplit) {
+         double sm_scale, double kv_scale, int64_t nsplit, torch::Tensor invf) {
   auto st = at::cuda::getCurrentCUDAStream();
   const int B = seq.size(0), toks = qkv.size(0) * qkv.size(1), L = toks / B;
   prep<<<dim3(toks, hq + 2 * hkv), D, 0, st>>>((const __nv_bfloat16*)qkv.data_ptr(), pos.data_ptr<int64_t>(), loc.data_ptr<int64_t>(),
       (uint8_t*)kc.data_ptr(), (uint8_t*)vc.data_ptr(), ksc.data_ptr<float>(), vsc.data_ptr<float>(), (__half*)qbuf.data_ptr(),
-      (int)hq, (int)hkv, (float)theta, (float)qk_factor);
+      (int)hq, (int)hkv, (float)theta, (float)qk_factor, invf.data_ptr<float>());
 #ifdef ONLYPREP
   return;
 #endif
@@ -923,6 +940,17 @@ void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor 
 
 _mod = None
 _DBG = []
+_NOPROF = None
+_INV = {}
+
+
+def _invf(theta, dev):
+    """RoPE inverse frequencies exactly as the reference builds them (fp32), cached per theta"""
+    k = (float(theta), str(dev))
+    if k not in _INV:
+        t = theta if theta else 1.0
+        _INV[k] = (1.0 / (t ** (torch.arange(0, 64, 2, device=dev).float() / 64))).contiguous()
+    return _INV[k]
 _BUF = {}
 
 
@@ -936,13 +964,52 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v8_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
-                           cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t);",
+        _mod = load_inline("attn_v9_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+                           cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG, verbose=False)
     return _mod
 
 
+DIAG = False
+
+
+def _diag(dev):
+    """timeline of the fused decode kernel on synthetic batch-1 inputs (sliding and full), printed once"""
+    global _mod, _DBG, _NOPROF
+    keep = (_mod, _DBG)
+    _mod, _DBG = None, _DBG + ["-DPROF"]
+    for window, theta, ctx in ((2048, 500000.0, 80000), (0, 0.0, 80000), (2048, 500000.0, 1000)):
+        for B in (1, 32):
+            mp = ctx + 8
+            pt = torch.randperm(B * mp, device=dev, dtype=torch.int64).to(torch.int32).view(B, mp)
+            kc = torch.randn((B * mp, 1, 2, 64), device=dev).to(torch.float8_e4m3fn); vc = kc.clone()
+            seq = torch.full((B,), ctx, dtype=torch.int32, device=dev)
+            loc = pt[:, ctx].long()
+            qkv = torch.randn((B, 1, 2304), device=dev).bfloat16()
+            span = min(mp, window + 1) if window else mp
+            NS = max(1, min(132 // B, (span + 511) // 512))
+            wo = torch.empty((B * NS * 16 * 64,), device=dev); wml = torch.empty((B * NS * 32,), device=dev)
+            cnt = torch.zeros((B,), dtype=torch.int32, device=dev); out = torch.empty((B, 1, 1024), dtype=torch.bfloat16, device=dev)
+            prof = torch.zeros((B * NS * 8 * 8,), dtype=torch.int64, device=dev)
+            fl = torch.ones(2 ** 26, device=dev)
+            for it in range(3):
+                fl.sum()
+                _ext().run_fdec(qkv, loc, kc, vc, pt, seq, wo, wml, cnt, out, 1, window, theta, 5.47, 0.125, 1.0, NS, prof, _invf(theta, dev))
+            torch.cuda.synchronize()
+            P = prof.view(-1, 8).cpu().tolist()
+            t0 = min(r[0] for r in P)
+            col = lambda k: [(r[k] - t0) / 1e3 for r in P if r[k]]
+            mx = lambda k: max(col(k)) if col(k) else -1
+            print("FDIAG win %d B %d NS %d: start max %.1f prolog %.1f sync %.1f loop-end p50 %.1f max %.1f merged %.1f last-end %.1f" % (
+                window, B, NS, mx(0), mx(1), mx(2), sorted(col(3))[len(col(3)) // 2], mx(3), mx(5), mx(6)), flush=True)
+    _mod, _DBG = keep
+
+
 def kernel_fn(data):
+    global DIAG
+    if DIAG:
+        DIAG = False
+        _diag(data["qkv"].device)
     cfg = data["config"]
     B, L, hq, hkv = cfg["batch"], cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"]
     qkv = data["qkv"]
@@ -960,7 +1027,8 @@ def kernel_fn(data):
         out = torch.empty((B, 1, hq * 64), dtype=torch.bfloat16, device=dev)
         ks = float(cfg["kv_scale"])
         _ext().run_fdec(qkv, data["cache_loc"], data["k_cache"], data["v_cache"], data["page_table"], data["seq_lens"], wo, wml, cnt,
-                        out, cfg["page_size"], cfg["window"], cfg["rope_theta"], cfg["qk_scale_factor"], cfg["sm_scale"] * ks, ks, NS)
+                        out, cfg["page_size"], cfg["window"], cfg["rope_theta"], cfg["qk_scale_factor"], cfg["sm_scale"] * ks, ks, NS,
+                        torch.empty(0, device=dev), _invf(cfg["rope_theta"], dev))
         return out
     ps = cfg["page_size"]
     maxkeys = data["page_table"].shape[1] * ps
@@ -984,5 +1052,5 @@ def kernel_fn(data):
     # k_scale enters the logits: fold it into the query scale (qk_scale_factor already in q)
     _ext().run(qkv, data["positions"], data["cache_loc"], data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"],
                data["page_table"], data["seq_lens"], qbuf, wo, wml, out, hq, hkv, ps, cfg["window"], cfg["rope_theta"],
-               cfg["qk_scale_factor"], cfg["sm_scale"] * ks, ks, nsplit)
+               cfg["qk_scale_factor"], cfg["sm_scale"] * ks, ks, nsplit, _invf(cfg["rope_theta"], dev))
     return out
