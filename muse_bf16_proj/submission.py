@@ -36,6 +36,12 @@ CUDA = r"""
 #ifndef WPC
 #define WPC 16
 #endif
+#ifndef RSN
+#define RSN 3
+#endif
+#ifndef CUN
+#define CUN 2
+#endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define TMA 1
 #else
@@ -66,11 +72,12 @@ __device__ __forceinline__ void put(const Q& q, int tok, int row, float v) {
   if (q.f32) ((float*)q.out)[(size_t)tok * q.N + row] = v; else ((__nv_bfloat16*)q.out)[(size_t)tok * q.N + row] = __float2bfloat16(v);
 }
 
-// Each warp streams an equal contiguous range of (tile, 64-wide K chunk) units through its own RS-deep TMA ring
-// (2 KB A fragments per unit, +2 KB for the router's lo half); tiles split across warps meet in fp32 atomics.
-template <int NT, bool HL, int RS>
+// Each warp streams an equal contiguous range of (tile, unit) work through its own RS-deep TMA ring; a unit is CU
+// consecutive 64-wide K chunks (2 KB of A fragments each; the router's lo half rides along). Partial tiles are
+// summed with fp32 red.add into ws; a PDL-launched finalize kernel converts ws to the output and clears it.
+template <int NT, bool HL, int RS, int CU>
 __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
-  constexpr int SB = HL ? 4096 : 2048;
+  constexpr int SB = (HL ? 2 : 1) * CU * 2048;
   constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
   extern __shared__ __align__(128) uint8_t smem[];
   const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -80,31 +87,33 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
 #if TMA
   if (lane < RS) mbinit(bars + lane * 8, 1);
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");  // let the finalize kernel get scheduled early
 #else
   if (lane < RS) mbinit(bars + lane * 8, 32);
 #endif
   __syncwarp();
-  const long long U = (long long)q.TB * q.MT * q.KC;
+  const int KU = q.KC / CU;
+  const long long U = (long long)q.TB * q.MT * KU;
   const long long L0 = U * gw / W, Le = U * (gw + 1) / W;
   if (L0 >= Le) return;
   long long pu = L0;
   auto issue = [&](int slot) {
     if (pu < Le) {
-      const long long tile = pu / q.KC; const int c = (int)(pu - tile * q.KC), mt = (int)(tile % q.MT);
-      const size_t off = ((size_t)mt * q.KC + c) * 2048;
+      const long long tile = pu / KU; const int cu = (int)(pu - tile * KU), mt = (int)(tile % q.MT);
+      const size_t off = ((size_t)mt * q.KC + cu * CU) * 2048;
       const uint32_t d = ring + slot * SB, bar = bars + slot * 8;
 #if TMA
       if (lane == 0) {
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "n"(SB) : "memory");
-        asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], 2048, [%2];\n" :: "r"(d), "l"(q.A + off), "r"(bar) : "memory");
-        if (HL) asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], 2048, [%2];\n" :: "r"(d + 2048), "l"(q.A2 + off), "r"(bar) : "memory");
+        asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" :: "r"(d), "l"(q.A + off), "n"(CU * 2048), "r"(bar) : "memory");
+        if (HL) asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" :: "r"(d + CU * 2048), "l"(q.A2 + off), "n"(CU * 2048), "r"(bar) : "memory");
       }
 #else
 #pragma unroll
-      for (int k = 0; k < 4; k++) cp16(d + k * 512 + lane * 16, q.A + off + k * 512 + lane * 16);
+      for (int k = 0; k < 4 * CU; k++) cp16(d + k * 512 + lane * 16, q.A + off + k * 512 + lane * 16);
       if (HL) {
 #pragma unroll
-        for (int k = 0; k < 4; k++) cp16(d + 2048 + k * 512 + lane * 16, q.A2 + off + k * 512 + lane * 16);
+        for (int k = 0; k < 4 * CU; k++) cp16(d + CU * 2048 + k * 512 + lane * 16, q.A2 + off + k * 512 + lane * 16);
       }
       asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(bar) : "memory");
 #endif
@@ -118,9 +127,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
 #pragma unroll
   for (int i = 0; i < RS - 1; i++) issue(i);
   uint4 b0[NT][2], b1[NT][2];
-  auto ldb = [&](long long u, uint4 (&b)[NT][2]) {
-    if (u >= Le) return;
-    const long long tile = u / q.KC; const int c = (int)(u - tile * q.KC), tb = (int)(tile / q.MT);
+  auto ldb = [&](long long cg, uint4 (&b)[NT][2]) {  // cg: global chunk index tile * KC + c
+    const long long tile = cg / q.KC; const int c = (int)(cg - tile * q.KC), tb = (int)(tile / q.MT);
 #pragma unroll
     for (int n = 0; n < NT; n++) {
       const int tok = min(tb * 32 + n * 8 + g, q.M - 1);
@@ -128,88 +136,81 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
       b[n][0] = __ldg(xr); b[n][1] = __ldg(xr + 1);
     }
   };
-  ldb(L0, b0);
+  const long long CE = Le * CU;  // chunk range end
+  ldb(L0 * CU, b0);
   float acc[NT][CH][4];
   int qn = 0;
   long long u = L0;
   while (u < Le) {
-    const long long tile = u / q.KC; const int c0 = (int)(u - tile * q.KC);
-    const int c1 = (int)min((long long)q.KC, c0 + (Le - u));
+    const long long tile = u / KU; const int u0 = (int)(u - tile * KU);
+    const int u1 = (int)min((long long)KU, u0 + (Le - u));
 #pragma unroll
     for (int n = 0; n < NT; n++)
 #pragma unroll
       for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
-    for (int c = c0; c < c1; c++, u++, qn++) {
+    for (int uu = u0; uu < u1; uu++, u++, qn++) {
       const int slot = qn % RS;
       mbwait(bars + slot * 8, (qn / RS) & 1);
       __syncwarp();
       issue((qn + RS - 1) % RS);
-      ldb(u + 1, b1);
-      const uint32_t sa = ring + slot * SB + lane * 16;
 #pragma unroll
-      for (int j = 0; j < 4; j++) {
-        const uint4 a = lds(sa + j * 512);
-        uint4 h; if (HL) h = lds(sa + 2048 + j * 512);
+      for (int i = 0; i < CU; i++) {
+        const long long cg = u * CU + i;
+        if (cg + 1 < CE) ldb(cg + 1, b1);
+        const uint32_t sa = ring + slot * SB + i * 2048 + lane * 16;
 #pragma unroll
-        for (int n = 0; n < NT; n++) {
-          const uint32_t* bb = (const uint32_t*)&b0[n][j >> 1];
-          mma(acc[n][j % CH], a, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
-          if (HL) mma(acc[n][(j + 1) % CH], h, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+        for (int j = 0; j < 4; j++) {
+          const uint4 a = lds(sa + j * 512);
+          uint4 h; if (HL) h = lds(sa + CU * 2048 + j * 512);
+#pragma unroll
+          for (int n = 0; n < NT; n++) {
+            const uint32_t* bb = (const uint32_t*)&b0[n][j >> 1];
+            mma(acc[n][j % CH], a, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+            if (HL) mma(acc[n][(j + 1) % CH], h, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+          }
         }
+#pragma unroll
+        for (int n = 0; n < NT; n++) { b0[n][0] = b1[n][0]; b0[n][1] = b1[n][1]; }
       }
-#pragma unroll
-      for (int n = 0; n < NT; n++) { b0[n][0] = b1[n][0]; b0[n][1] = b1[n][1]; }
     }
-    float f[NT][4];
-#pragma unroll
-    for (int n = 0; n < NT; n++)
-#pragma unroll
-      for (int i = 0; i < 4; i++) { float v = 0.f;
-#pragma unroll
-        for (int h = 0; h < CH; h++) v += acc[n][h][i];
-        f[n][i] = v; }
     const int tb = (int)(tile / q.MT), mt = (int)(tile - (long long)tb * q.MT), row0 = mt * 16 + g, mrem = min(32, q.M - tb * 32);
-    if (c0 == 0 && c1 == q.KC) {
-#pragma unroll
-      for (int n = 0; n < NT; n++) {
-        const int tk = n * 8 + 2 * t;
-        if (tk < mrem) { put(q, tb * 32 + tk, row0, f[n][0]); put(q, tb * 32 + tk, row0 + 8, f[n][2]); }
-        if (tk + 1 < mrem) { put(q, tb * 32 + tk + 1, row0, f[n][1]); put(q, tb * 32 + tk + 1, row0 + 8, f[n][3]); }
-      }
-      continue;
-    }
     float* w = q.ws + (size_t)tb * 32 * q.N;
 #pragma unroll
     for (int n = 0; n < NT; n++) {
+      float f[4];
+#pragma unroll
+      for (int i2 = 0; i2 < 4; i2++) { f[i2] = 0.f;
+#pragma unroll
+        for (int h = 0; h < CH; h++) f[i2] += acc[n][h][i2]; }
       const int tk = n * 8 + 2 * t;
-      if (tk < mrem) { atomicAdd(w + (size_t)tk * q.N + row0, f[n][0]); atomicAdd(w + (size_t)tk * q.N + row0 + 8, f[n][2]); }
-      if (tk + 1 < mrem) { atomicAdd(w + (size_t)(tk + 1) * q.N + row0, f[n][1]); atomicAdd(w + (size_t)(tk + 1) * q.N + row0 + 8, f[n][3]); }
+      if (tk < mrem) { atomicAdd(w + (size_t)tk * q.N + row0, f[0]); atomicAdd(w + (size_t)tk * q.N + row0 + 8, f[2]); }
+      if (tk + 1 < mrem) { atomicAdd(w + (size_t)(tk + 1) * q.N + row0, f[1]); atomicAdd(w + (size_t)(tk + 1) * q.N + row0 + 8, f[3]); }
     }
-    __threadfence(); __syncwarp();
-    int old = 0;
-    if (lane == 0) old = atomicAdd(q.cnt + tile, c1 - c0);
-    old = __shfl_sync(0xffffffffu, old, 0);
-    if (old + c1 - c0 != q.KC) continue;
-    __threadfence();
-    if (lane == 0) q.cnt[tile] = 0;
-    float v[16];
-#pragma unroll
-    for (int k = 0; k < 16; k++) { const int i = lane + 32 * k, tk = i >> 4; v[k] = tk < mrem ? __ldcg(w + (size_t)tk * q.N + mt * 16 + (i & 15)) : 0.f; }
-#pragma unroll
-    for (int k = 0; k < 16; k++) {
-      const int i = lane + 32 * k, tk = i >> 4, r = mt * 16 + (i & 15);
-      if (tk < mrem) { w[(size_t)tk * q.N + r] = 0.f; put(q, tb * 32 + tk, r, v[k]); }
-    }
+  }
+}
+
+// ws (fp32 sums, [M][N]) -> out; ws cleared for the next call. Launched as a programmatic dependent.
+__global__ void __launch_bounds__(256) fin(Q q) {
+#if TMA
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+  const int n4 = q.M * q.N / 4;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+    float4* p = (float4*)q.ws + i;
+    const float4 v = __ldcg(p);
+    *p = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (q.f32) ((float4*)q.out)[i] = v;
+    else { __nv_bfloat162 o[2] = {__floats2bfloat162_rn(v.x, v.y), __floats2bfloat162_rn(v.z, v.w)}; ((uint2*)q.out)[i] = *(uint2*)o; }
   }
 }
 
 static int g_grid = 0;
 template <int NT, bool HL> static void go(const Q& q, cudaStream_t st) {
-  constexpr int RS = HL ? 3 : 6;
-  const size_t sm = (size_t)WPC * RS * (HL ? 4096 : 2048) + WPC * RS * 8;
+  constexpr int RS = HL ? 3 : RSN, CU = HL ? 1 : CUN;
+  const size_t sm = (size_t)WPC * RS * (HL ? 2 : 1) * CU * 2048 + WPC * RS * 8;
   static bool once = false;
-  if (!once) { cudaFuncSetAttribute(skinny<NT, HL, RS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); once = true; }
-  skinny<NT, HL, RS><<<g_grid, WPC * 32, sm, st>>>(q);
+  if (!once) { cudaFuncSetAttribute(skinny<NT, HL, RS, CU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); once = true; }
+  skinny<NT, HL, RS, CU><<<g_grid, WPC * 32, sm, st>>>(q);
 }
 void run(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t N) {
   if (!g_grid) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&g_grid, cudaDevAttrMultiProcessorCount, dev); }
@@ -222,6 +223,12 @@ void run(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, 
   const int nt = q.M >= 32 ? 4 : (q.M + 7) / 8;
   if (q.A2) { if (nt <= 1) go<1, true>(q, st); else if (nt <= 2) go<2, true>(q, st); else go<4, true>(q, st); }
   else { if (nt <= 1) go<1, false>(q, st); else if (nt <= 2) go<2, false>(q, st); else go<4, false>(q, st); }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(std::min(g_grid * 4, (q.M * q.N / 4 + 255) / 256)); cfg.blockDim = dim3(256); cfg.stream = st;
+  cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
+  static int major = 0; if (!major) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev); }
+  cfg.attrs = at; cfg.numAttrs = major >= 9 ? 1 : 0;
+  cudaLaunchKernelEx(&cfg, fin, q);
 }
 """
 
@@ -239,7 +246,7 @@ def _ext():
     global _mod
     if _mod is None:
         wpc = 16 if _big() else 8
-        _mod = load_inline("skinny_v4_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("skinny_v5_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + _DBG,
                            verbose=False)

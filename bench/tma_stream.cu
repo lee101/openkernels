@@ -35,6 +35,14 @@ __global__ void stream(const uint8_t* src, size_t nstage, int stg, int S, int mo
   if (acc == 12345.f) out[0] = acc;
 }
 double run(torch::Tensor buf, int64_t wpc, int64_t S, int64_t stg, int64_t mode, int64_t spin, int64_t reps) {
+  if (reps == 0) {  // single capturable launch
+    int dev; cudaGetDevice(&dev); int sms; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    size_t smem = (size_t)wpc * S * stg + wpc * S * 8;
+    cudaFuncSetAttribute(stream, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    static float* out = nullptr; if (!out) cudaMalloc(&out, 4);
+    stream<<<sms, wpc * 32, smem, at::cuda::getCurrentCUDAStream()>>>(buf.data_ptr<uint8_t>(), buf.numel() / stg, stg, S, mode, spin, out);
+    return 0;
+  }
   int dev; cudaGetDevice(&dev); int sms; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   size_t smem = (size_t)wpc * S * stg + wpc * S * 8;
   cudaFuncSetAttribute(stream, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
