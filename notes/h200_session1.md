@@ -13,3 +13,10 @@
 - v6 (warp-specialized producer/consumer ring) judge 1.188; pod head-to-head (read-only flush): v4 bs1 57.8 bs16 125 bs32 226 bs8 110 bs128 320 bs256 378 vs v6 59.5/161/312/145/386/528 -> v4 kept
 - okb flush fixed: was writing 1.5GB before each replay (write-back stole HBM BW); now read-only like the judge
 - total pod spend ~ $14 (3 sessions)
+
+# bf16_proj (H200 checks)
+- per-kernel GPU (cuBLAS): qkv m1 9.4+1.7 splitK reduce, pooler 18.6+1.6, o 5.2, unp-slice 4.4+1.4; judge ~= kernels + 1.5-2us
+- pure TMA stream single launch (graph-empty): 8.4MB 2.0, 16.8MB 5.7, 37.7MB 10.0, 67MB 16.5us (16w x2 x4.6KB best; 2KB stages slower)
+- v1 0.84 | v2 CTA smem 0.78 | v3 0.66 | v4 TMA 6x2KB 0.86 | TWOK 0.86 | v5 4KB stages + red + PDL fin 0.94
+- sweep m1 (graph-empty): cublas qkv 15.5 poo 21.7 o 7.4 unp 8.4; ours RSN2/CUN2 qkv 14.6 poo 21.5 o 9.2 unp 7.4
+- router hi/lo: 1.3-3.25x at m<=32; m=128/256 router path still slower than SGLang split2
