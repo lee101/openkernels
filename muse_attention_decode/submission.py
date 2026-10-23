@@ -100,6 +100,7 @@ __device__ __forceinline__ uint32_t e2h(uint32_t two) {  // 2 x e4m3 (low 16 bit
   __half2_raw r = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffff), __NV_E4M3);
   return *(uint32_t*)&r;
 }
+__device__ __forceinline__ float ex2(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
 __device__ __forceinline__ uint32_t pk(float a, float b) { __half2 h = __floats2half2_rn(a, b); return *(uint32_t*)&h; }
 __device__ __forceinline__ uint4 ldg16(const void* p) { return __ldg((const uint4*)p); }
 __device__ __forceinline__ uint2 ldg8(const void* p) { return __ldg((const uint2*)p); }
@@ -227,10 +228,10 @@ __global__ void __launch_bounds__(256) attn(A a) {
         bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 1));
         bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 2));
         const float nm = fmaxf(mx[m][hh], bm);
-        const float sc = nm == -INFINITY ? 1.f : exp2f(mx[m][hh] - nm);
+        const float sc = nm == -INFINITY ? 1.f : ex2(mx[m][hh] - nm);
         mx[m][hh] = nm;
-        float p0 = nm == -INFINITY ? 0.f : exp2f(s[m][0][hh * 2] - nm), p1 = nm == -INFINITY ? 0.f : exp2f(s[m][0][hh * 2 + 1] - nm);
-        float p2 = nm == -INFINITY ? 0.f : exp2f(s[m][1][hh * 2] - nm), p3 = nm == -INFINITY ? 0.f : exp2f(s[m][1][hh * 2 + 1] - nm);
+        float p0 = nm == -INFINITY ? 0.f : ex2(s[m][0][hh * 2] - nm), p1 = nm == -INFINITY ? 0.f : ex2(s[m][0][hh * 2 + 1] - nm);
+        float p2 = nm == -INFINITY ? 0.f : ex2(s[m][1][hh * 2] - nm), p3 = nm == -INFINITY ? 0.f : ex2(s[m][1][hh * 2 + 1] - nm);
         ls[m][hh] = ls[m][hh] * sc + (p0 + p1 + p2 + p3);
 #pragma unroll
         for (int n = 0; n < 8; n++) { o[m][n][hh * 2] *= sc; o[m][n][hh * 2 + 1] *= sc; }
@@ -356,9 +357,9 @@ __global__ void __launch_bounds__(256) attn2(A a) {
       float bm = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
       bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 1));
       bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 2));
-      const float nm = fmaxf(mx[h], bm), sc = exp2f(mx[h] - nm);  // nm finite: every block has a valid key
+      const float nm = fmaxf(mx[h], bm), sc = ex2(mx[h] - nm);  // nm finite: every block has a valid key
       mx[h] = nm;
-      const float p0 = exp2f(v[0] - nm), p1 = exp2f(v[1] - nm), p2 = exp2f(v[2] - nm), p3 = exp2f(v[3] - nm);
+      const float p0 = ex2(v[0] - nm), p1 = ex2(v[1] - nm), p2 = ex2(v[2] - nm), p3 = ex2(v[3] - nm);
       ls[h] = ls[h] * sc + (p0 + p1 + p2 + p3);
       const uint32_t pa0 = pk(p0, p1), pa2 = pk(p2, p3);
 #pragma unroll
@@ -471,11 +472,11 @@ __global__ void __launch_bounds__(256, 2) attn3(A a) {
       bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 1));
       bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 2));
       const float nm = fmaxf(mx[hh], bm);
-      const float sc = nm == -INFINITY ? 1.f : exp2f(mx[hh] - nm);
+      const float sc = nm == -INFINITY ? 1.f : ex2(mx[hh] - nm);
       mx[hh] = nm;
       float pp[4];
 #pragma unroll
-      for (int i = 0; i < 4; i++) pp[i] = nm == -INFINITY ? 0.f : exp2f(v[i] - nm);
+      for (int i = 0; i < 4; i++) pp[i] = nm == -INFINITY ? 0.f : ex2(v[i] - nm);
       ls[hh] = ls[hh] * sc + (pp[0] + pp[1] + pp[2] + pp[3]);
 #pragma unroll
       for (int n = 0; n < 8; n++) { o[n][hh * 2] *= sc; o[n][hh * 2 + 1] *= sc; }
@@ -524,7 +525,7 @@ __global__ void __launch_bounds__(1024) comb2(A a, const __nv_bfloat16* qkv, __n
     const float* ml = a.wml + ((base + s) * a.rows + r) * 2;
     const float m = ml[0];
     if (m == -INFINITY) continue;
-    const float w = exp2f(m - M);
+    const float w = ex2(m - M);
     if (dv == 0) Ls += w * ml[1];
     const float4 v = ((const float4*)(a.wo + ((base + s) * a.rows + r) * D))[dv];
     acc.x += w * v.x; acc.y += w * v.y; acc.z += w * v.z; acc.w += w * v.w;
@@ -660,7 +661,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3 = (8, 6, 20) if _big() else (4, 3, 8)
-        _mod = load_inline("attn_v5_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v6_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t);",
                            cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3] + _DBG, verbose=False)
     return _mod
