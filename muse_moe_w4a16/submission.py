@@ -104,9 +104,12 @@ __device__ __forceinline__ void mb_wait(uint32_t bar, uint32_t ph) {
 #define NACC 16        // per-unit smem accumulators (16 rows x NTM*8 tokens fp32)
 #endif
 #define NCW (WPC - 1)  // consumer warps; warp 0 produces
+#ifndef CHK
+#define CHK 4          // consecutive stages of one tile per consumer work item
+#endif
 #define ACCB (NTM * 32 * 16)
 struct Hdr { int u, s, k, pass; };
-struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, maxc, cnext; int accn[NACC], accph[NACC]; Hdr hdr[NSLOT]; };
+struct Sm { int rel[NSLOT], take[NSLOT]; int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, maxc, cnext, pseq, pdone; int accn[NACC], accph[NACC]; Hdr hdr[NSLOT]; };
 
 #if TMA
 #define FULLCNT 1
@@ -115,12 +118,33 @@ struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, maxc, cnext; in
 #endif
 __device__ __forceinline__ void mbinit(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(b), "r"(n)); }
 __device__ __forceinline__ void mbarrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(b) : "memory"); }
+__device__ __forceinline__ bool mbtest(uint32_t b, uint32_t ph) {
+  uint32_t r;
+  asm volatile("{\n.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n" : "=r"(r) : "r"(b), "r"(ph) : "memory");
+  return r;
+}
 __device__ __forceinline__ void mbwait(uint32_t b, uint32_t ph) {
+#ifdef TRACE
+  long long n = 0;
+  while (!mbtest(b, ph)) if (++n == 50000000) printf("STUCK mbwait blk %d w %d bar %u ph %u\n", blockIdx.x, threadIdx.x >> 5, b, ph);
+  return;
+#endif
 #if TMA
   asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W;\n}\n" :: "r"(b), "r"(ph) : "memory");
 #else
   asm volatile("{\n.reg .pred p;\nW: mbarrier.test_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W;\n}\n" :: "r"(b), "r"(ph) : "memory");
 #endif
+}
+
+// a parity wait is only meaningful within one lap of the ring: first wait for the producer to reach the slot
+__device__ __forceinline__ void slotwait(const Sm* sm, uint32_t fullb, int q) {
+#ifdef TRACE
+  long long n = 0;
+  while (*(volatile const int*)&sm->pseq <= q) { if (++n == 50000000) printf("STUCK pseq blk %d w %d q %d pseq %d\n", blockIdx.x, threadIdx.x >> 5, q, *(volatile const int*)&sm->pseq); }
+#else
+  while (*(volatile const int*)&sm->pseq <= q) {}
+#endif
+  mbwait(fullb + (q % NSLOT) * 8, (q / NSLOT) & 1);
 }
 
 struct K {
@@ -134,7 +158,7 @@ struct K {
 
 // one 512-K stage of a 16-row tile: dequant from the ring slot, B (activations) from global, partial sums out
 template <int NT, int G2>
-__device__ __forceinline__ void stage(const K& C, uint32_t slot, int e, int pass, int s, float (&f)[NT][4]) {
+__device__ __forceinline__ void stage(const K& C, int sq, int e, int pass, int s, float (&f)[NT][4]) {
   const P& p = *C.p;
   const int lane = C.lane, g = lane >> 2, t = lane & 3;
   const int cnt = C.sm->cnt[e], off = C.sm->off[e];
@@ -147,10 +171,13 @@ __device__ __forceinline__ void stage(const K& C, uint32_t slot, int e, int pass
     rp[n] = (const uint4*)((G2 ? p.inter + (size_t)r * HD : p.x + (size_t)(r >> 3) * HD) + t * 16) + s * 64;
   }
   uint4 B[D + 1][NT][2];
-  auto ldb = [&](uint4 (&b)[NT][2], int c) {
+  auto ldb = [&](uint4 (&b)[NT][2], int c) {  // c: chunk index across the item's stages
 #pragma unroll
     for (int n = 0; n < NT; n++) {
-      const uint4* q = rp[n] + c * 8;
+      const uint4* q = rp[n] + (c >> 3) * 64 + (c & 7) * 8;
+#ifdef BCHK
+      if ((c >> 3) + s >= 8 || c < 0) printf("BAD ldb c %d s %d sq %d blk %d\n", c, s, sq, blockIdx.x);
+#endif
       if (G2) { b[n][0] = __ldca(q); b[n][1] = __ldca(q + 1); } else { b[n][0] = __ldg(q); b[n][1] = __ldg(q + 1); }
     }
   };
@@ -161,14 +188,21 @@ __device__ __forceinline__ void stage(const K& C, uint32_t slot, int e, int pass
     for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
 #pragma unroll
   for (int c = 0; c < D; c++) ldb(B[c], c);
-  slot += lane * 16;
+  for (int ss = 0; ss < CHK; ss++) {
+  const int sl = (sq + ss) % NSLOT;
+  slotwait(C.sm, C.fullb, sq + ss);
+#ifdef TRACE
+  if (lane == 0) atomicAdd(&C.sm->take[sl], 1);
+#endif
+  const uint32_t slot = C.ring + sl * STG + lane * 16;
   const uint4 sc = lds(slot + 4096);
 #pragma unroll
   for (int c = 0; c < 8; c++) {
     const uint4 w = lds(slot + c * 512);
     const uint32_t sw = (c < 4 ? (c < 2 ? sc.x : sc.y) : (c < 6 ? sc.z : sc.w));
     const uint32_t sA = sc2(sw, (c & 1) ? 0x4242 : 0x4040), sB = sc2(sw, (c & 1) ? 0x4343 : 0x4141);
-    if (c + D < 8) ldb(B[(c + D) % (D + 1)], c + D);
+    if (c + D < 8) ldb(B[(c + D) % (D + 1)], ss * 8 + c + D);
+    else if (ss + 1 < CHK) ldb(B[(c + D) % (D + 1)], ss * 8 + c + D);
     const uint4 (&bc)[NT][2] = B[c % (D + 1)];
     const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
@@ -184,6 +218,12 @@ __device__ __forceinline__ void stage(const K& C, uint32_t slot, int e, int pass
         mma(acc[n][j % CH], a0, a1, a2, a3, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
       }
     }
+  }
+  __syncwarp();
+  if (lane == 0) mbarrive(C.emptyb + sl * 8);  // slot may be refilled
+#ifdef TRACE
+  if (lane == 0) atomicAdd(&C.sm->rel[sl], 1);
+#endif
   }
 #pragma unroll
   for (int n = 0; n < NT; n++)
@@ -244,11 +284,9 @@ __device__ __forceinline__ void finish(const K& C, int e, int mt, int pass, cons
 
 // consumer: one stage-unit; the warp that lands a unit's 8th stage runs its epilogue
 template <int NT, int G2>
-__device__ __forceinline__ void consume(const K& C, uint32_t slotaddr, uint32_t emptybar, const Hdr& h, int e, int mt) {
+__device__ __forceinline__ void consume(const K& C, int sq, const Hdr& h, int e, int mt) {
   float f[NT][4];
-  stage<NT, G2>(C, slotaddr, e, h.pass, h.s, f);
-  __syncwarp();
-  if (C.lane == 0) mbarrive(emptybar);  // slot may be refilled
+  stage<NT, G2>(C, sq, e, h.pass, h.s, f);
   float* a = (float*)(C.acc + h.k * (NTM * 32));
 #pragma unroll
   for (int n = 0; n < NT; n++)
@@ -258,7 +296,7 @@ __device__ __forceinline__ void consume(const K& C, uint32_t slotaddr, uint32_t 
   int old = 0;
   if (C.lane == 0) old = atomicAdd(&C.sm->accn[h.k], 1);
   old = __shfl_sync(0xffffffffu, old, 0);
-  if (old != SPT - 1) return;
+  if (old != SPT / CHK - 1) return;
   __threadfence_block();
   volatile float* va = a;
 #pragma unroll
@@ -283,7 +321,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   if (tid < NSLOT) { mbinit(fullb + tid * 8, FULLCNT); mbinit(emptyb + tid * 8, 1); }
   if (tid < NLOC) sm->cnt[tid] = 0;
   if (tid < NACC) { sm->accn[tid] = 0; sm->accph[tid] = 0; }
-  if (tid == 0) sm->cnext = 0;
+  if (tid == 0) { sm->cnext = 0; sm->pseq = 0; sm->pdone = 0; }
+  if (tid < NSLOT) { sm->rel[tid] = 0; sm->take[tid] = 0; }
 #if TMA
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 #endif
@@ -317,15 +356,24 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       if (!g2 && mt == 0) for (int i = lane; i < sm->cnt[e]; i += 32) p.ss[list[sm->off[e] + i]] = 0.f;
       for (int ps = 0; ps < np; ps++, units++) {
         const int k = units % NACC;
+#ifdef TRACE
+        if (lane == 0) { long long n = 0; while (((volatile int*)sm->accph)[k] != units / NACC) { if (++n == 50000000) printf("STUCK acc blk %d k %d units %d ph %d\n", blockIdx.x, k, units, sm->accph[k]); } }
+#else
         if (lane == 0) while (((volatile int*)sm->accph)[k] != units / NACC) {}
+#endif
         __syncwarp();
         float4* a = accs + k * (NTM * 32);
         for (int i = lane; i < NTM * 32; i += 32) a[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         __syncwarp();
         for (int s = 0; s < SPT; s++, seq++) {
           const int slot = seq % NSLOT;
+#ifdef TRACE
+          if (seq >= NSLOT) { long long n = 0; while (!mbtest(emptyb + slot * 8, ((seq / NSLOT) - 1) & 1)) if (++n == 50000000 && lane == 0) printf("STUCKP blk %d seq %d slot %d rel %d take %d\n", blockIdx.x, seq, slot, sm->rel[slot], sm->take[slot]); }
+#else
           if (seq >= NSLOT) mbwait(emptyb + slot * 8, ((seq / NSLOT) - 1) & 1);
+#endif
           if (lane == 0) sm->hdr[slot] = Hdr{u, s, k, ps};
+
           const uint8_t* src = g2 ? p.w2 + ((size_t)((p.lo + e) * T2E + mt) * SPT + s) * STG
                                   : p.w1 + ((size_t)((p.lo + e) * T1E + mt) * SPT + s) * STG;
 #if TMA
@@ -334,43 +382,46 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
           for (int q = 0; q < 9; q++) cp16(sbase + slot * STG + lane * 16 + q * 512, src + lane * 16 + q * 512);
           asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(fullb + slot * 8) : "memory");
 #endif
+          if (lane == 0) *(volatile int*)&sm->pseq = seq + 1;
         }
       }
       u = nx;
       if (lane == 0 && nx < C.N) nx = atomicAdd(p.ctr + QI, 1);
       nx = __shfl_sync(0xffffffffu, nx, 0);
     }
-    for (int w = 0; w < NCW; w++, seq++) {  // one stop marker per consumer
-      const int slot = seq % NSLOT;
-      if (seq >= NSLOT) mbwait(emptyb + slot * 8, ((seq / NSLOT) - 1) & 1);
-      if (lane == 0) { sm->hdr[slot] = Hdr{-1, 0, 0, 0}; __threadfence_block(); }
-      __syncwarp();
-#if TMA
-      if (lane == 0) mbarrive(fullb + slot * 8);
-#else
-      mbarrive(fullb + slot * 8);
-#endif
-    }
+    if (lane == 0) { __threadfence_block(); *(volatile int*)&sm->pdone = 1; }
   } else {  // consumers
     int okE = -1;
     for (;;) {
       int sq = 0;
-      if (lane == 0) sq = atomicAdd(&sm->cnext, 1);
+      if (lane == 0) sq = atomicAdd(&sm->cnext, CHK);
       sq = __shfl_sync(0xffffffffu, sq, 0);
       const int slot = sq % NSLOT;
-      mbwait(fullb + slot * 8, (sq / NSLOT) & 1);
+      int stop = 0;
+      if (lane == 0) {  // wait until the producer has reached sq, or finished short of it
+        for (;;) {
+          const int done = *(volatile int*)&sm->pdone;
+          if (*(volatile int*)&sm->pseq > sq) break;
+          if (done) { stop = 1; break; }
+        }
+      }
+      if (__shfl_sync(0xffffffffu, stop, 0)) break;
+      slotwait(sm, fullb, sq);
       volatile Hdr* vh = sm->hdr + slot;
       const Hdr h{vh->u, vh->s, vh->k, vh->pass};
-      if (h.u < 0) break;
       int g2, e, mt; C.item(h.u, g2, e, mt);
+
       if (g2 && e != okE) {
+#ifdef TRACE
+        if (lane == 0) { const int tgt = T1E * C.npass(e); long long n = 0; while (ldacq(p.ctr + e) < tgt) { if (++n == 2000000) printf("STUCK dep blk %d w %d e %d have %d tgt %d\n", blockIdx.x, wid, e, p.ctr[e], tgt); } }
+#else
         if (lane == 0) { const int tgt = T1E * C.npass(e); while (ldacq(p.ctr + e) < tgt) __nanosleep(64); }
+#endif
         __syncwarp(); okE = e;
       }
       const int nt = min(NTM, (sm->cnt[e] - h.pass * 8 * NTM + 7) >> 3);
-      const uint32_t sa = sbase + slot * STG, eb = emptyb + slot * 8;
-      if (g2) { if (nt <= 1) consume<1, 1>(C, sa, eb, h, e, mt); else if (nt <= 2) consume<2, 1>(C, sa, eb, h, e, mt); else consume<4, 1>(C, sa, eb, h, e, mt); }
-      else { if (nt <= 1) consume<1, 0>(C, sa, eb, h, e, mt); else if (nt <= 2) consume<2, 0>(C, sa, eb, h, e, mt); else consume<4, 0>(C, sa, eb, h, e, mt); }
+      if (g2) { if (nt <= 1) consume<1, 1>(C, sq, h, e, mt); else if (nt <= 2) consume<2, 1>(C, sq, h, e, mt); else consume<4, 1>(C, sq, h, e, mt); }
+      else { if (nt <= 1) consume<1, 0>(C, sq, h, e, mt); else if (nt <= 2) consume<2, 0>(C, sq, h, e, mt); else consume<4, 0>(C, sq, h, e, mt); }
     }
   }
   const int gw = blockIdx.x * WPC + wid;
@@ -462,11 +513,18 @@ def _place(word, code, pair, hi):
     return word
 
 
-def _repack(w, sf, perm):
+def _repack(w, sf, perm, chunk=64):
+    """chunked over 16-row tiles to bound temporary memory"""
+    R = w.shape[0]
+    return torch.cat([_repack1(w, sf, perm[i:i + chunk * 16]) for i in range(0, R, chunk * 16)], 0)
+
+
+def _repack1(w, sf, perm):
     """w uint8 [R, K/2], sf e4m3 [R, K/16] -> uint8 [R/16, K/512, 4608] in mma A-fragment order."""
-    R, K = w.shape[0], w.shape[1] * 2
+    R, K = perm.numel(), w.shape[1] * 2
     MT, NS = R // 16, K // 512
-    codes = torch.stack((w & 15, w >> 4), -1).view(R, K)[perm].to(torch.int64)
+    wp = w[perm]
+    codes = torch.stack((wp & 15, wp >> 4), -1).view(R, K).to(torch.int64)
     s8 = sf.view(torch.uint8)[perm].to(torch.int64)
     neg = (s8 >> 7).repeat_interleave(16, 1)  # fold a negative block scale into the codes' signs (same values)
     codes = codes ^ (neg << 3)
