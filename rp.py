@@ -7,7 +7,7 @@ from pathlib import Path
 
 API = "https://api.runpod.io/graphql"
 TAG = "okc-h200"
-IMAGE = "lmsysorg/sglang:dev-muse-spark-open"
+IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 GPU = "NVIDIA H200"
 BUDGET = Path(__file__).with_name("notes") / "rp_budget.json"
 CAP_MIN = 120  # per-day GPU-minute cap; raise deliberately
@@ -53,34 +53,43 @@ def reap():
         if not ttl or now > ttl: down(p["id"])
 
 
-def up(minutes, cloud):
+def up(minutes, cloud, image):
     budget(minutes)
-    pub = Path.home().joinpath(".ssh/id_ed25519.pub").read_text().strip() if Path.home().joinpath(".ssh/id_ed25519.pub").exists() else Path.home().joinpath(".ssh/id_rsa.pub").read_text().strip()
+    home = Path.home()
+    pub = next((home / f".ssh/{k}.pub").read_text().strip() for k in ("id_ed25519", "id_rsa") if (home / f".ssh/{k}.pub").exists())
     ttl = int(time.time()) + minutes * 60
-    # pod self-destructs at TTL even if this machine dies
-    cmd = (f"mkdir -p ~/.ssh && echo '{pub}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys; "
-           "(apt-get install -y openssh-server >/dev/null 2>&1 || true); service ssh start || /usr/sbin/sshd; "
-           f"sleep {minutes * 60}; kill 1")
-    inp = {"name": f"{TAG}-{int(time.time())}", "imageName": IMAGE, "gpuTypeId": GPU, "cloudType": cloud, "gpuCount": 1,
-           "containerDiskInGb": 80, "volumeInGb": 0, "ports": "22/tcp", "startSsh": True,
-           "dockerArgs": f"bash -lc \"{cmd}\"", "env": [{"key": "TTL_EPOCH", "value": str(ttl)}]}
+    inp = {"name": f"{TAG}-{int(time.time())}", "imageName": image, "gpuTypeId": GPU, "cloudType": cloud, "gpuCount": 1,
+           "containerDiskInGb": 60, "volumeInGb": 0, "ports": "22/tcp", "startSsh": True,
+           "env": [{"key": "PUBLIC_KEY", "value": pub}, {"key": "TTL_EPOCH", "value": str(ttl)}]}
     p = gql("mutation($i:PodFindAndDeployOnDemandInput){podFindAndDeployOnDemand(input:$i){id costPerHr}}", {"i": inp})["podFindAndDeployOnDemand"]
-    print("pod", p["id"], "$/hr", p["costPerHr"], "ttl", minutes, "min")
-    for _ in range(120):
+    print("pod", p["id"], "$/hr", p["costPerHr"], "ttl", minutes, "min", flush=True)
+    # local watchdog terminates the pod at TTL even if this session dies
+    import subprocess
+    subprocess.Popen([sys.executable, __file__, "killat", p["id"], str(ttl)], start_new_session=True,
+                     stdout=open(BUDGET.with_name("rp_watchdog.log"), "a"), stderr=subprocess.STDOUT)
+    for _ in range(90):
         time.sleep(10)
         q = [x for x in pods() if x["id"] == p["id"]]
         rt = q and q[0].get("runtime")
         if rt and rt.get("ports"):
             for pt in rt["ports"]:
-                if pt["privatePort"] == 22 and pt["type"] == "tcp": print(f"ssh -o StrictHostKeyChecking=no root@{pt['ip']} -p {pt['publicPort']}"); return
-    print("not ready after 20 min; terminating"); down(p["id"])
+                if pt["privatePort"] == 22 and pt["type"] == "tcp":
+                    print(f"ssh -o StrictHostKeyChecking=no root@{pt['ip']} -p {pt['publicPort']}"); return
+    print("not ready after 15 min; terminating"); down(p["id"])
+
+
+def killat(pid, ttl):
+    while time.time() < ttl: time.sleep(20)
+    try: down(pid)
+    except Exception as e: print("killat", pid, e)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("cmd"); ap.add_argument("id", nargs="?"); ap.add_argument("--minutes", type=int, default=30)
-    ap.add_argument("--cloud", default="SECURE")
+    ap.add_argument("--cloud", default="SECURE"); ap.add_argument("--image", default=IMAGE); ap.add_argument("ttl", nargs="?")
     a = ap.parse_args()
-    if a.cmd == "up": up(a.minutes, a.cloud)
+    if a.cmd == "up": up(a.minutes, a.cloud, a.image)
+    elif a.cmd == "killat": killat(a.id, int(a.ttl))
     elif a.cmd == "ls": [print(p["id"], p["name"], p["desiredStatus"], p["costPerHr"], (p.get("runtime") or {}).get("uptimeInSeconds")) for p in pods()]
     elif a.cmd == "down": [down(p["id"]) for p in pods() if not a.id or p["id"] == a.id]
     elif a.cmd == "reap": reap()

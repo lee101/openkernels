@@ -17,7 +17,8 @@ def load(p, name):
 
 ref = load(D / "reference.py", "reference"); sub = load(a.sub, "sub_mod")
 import os
-if os.environ.get("OKB_DBG"): sub._DBG = os.environ["OKB_DBG"].split(); base = load(a.base, "base_mod") if a.base else None
+if os.environ.get("OKB_DBG"): sub._DBG = os.environ["OKB_DBG"].split()
+base = load(a.base, "base_mod") if a.base else None
 meta = json.load(open(D.parent / "notes" / f"{D.name}.json"))
 def parse(line):
     d = {}
