@@ -46,8 +46,9 @@ struct Q {
   int M, N, K, MT, KC, TB, f32;
 };
 
+// a CTA's warps stream chunks w, w+16, ... of one (tile, [c0, c1)) segment; partial sums land in smem
 template <int NT, bool HL>
-__device__ __forceinline__ void seg(const Q& q, int tile, int c0, int c1, int lane) {
+__device__ __forceinline__ void part(const Q& q, int tile, int c0, int c1, int lane, int wid, float4* red) {
   const int tb = tile / q.MT, mt = tile - tb * q.MT, g = lane >> 2, t = lane & 3;
   constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
   const uint4* xr[NT];
@@ -80,76 +81,83 @@ __device__ __forceinline__ void seg(const Q& q, int tile, int c0, int c1, int la
         if (HL) mma(acc[n][(j + 1) % CH], a2[s][j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
       }
   };
-  load(0, c0);
-  int c = c0;
-  for (; c + 1 < c1; c += 2) {
-    load(1, c + 1);
+  int c = c0 + wid;
+  if (c < c1) load(0, c);
+  for (; c + WPC < c1; c += 2 * WPC) {
+    load(1, c + WPC);
     comp(0);
-    if (c + 2 < c1) load(0, c + 2);
+    if (c + 2 * WPC < c1) load(0, c + 2 * WPC);
     comp(1);
   }
   if (c < c1) comp(0);
-  float f[NT][4];
-#pragma unroll
-  for (int n = 0; n < NT; n++)
-#pragma unroll
-    for (int i = 0; i < 4; i++) { float v = 0.f;
-#pragma unroll
-      for (int h = 0; h < CH; h++) v += acc[n][h][i];
-      f[n][i] = v; }
-  const int row0 = mt * 16 + g;
-  auto put = [&](int tok, int row, float v) {
-    if (tok >= q.M || row >= q.N) return;
-    if (q.f32) ((float*)q.out)[(size_t)tok * q.N + row] = v; else ((__nv_bfloat16*)q.out)[(size_t)tok * q.N + row] = __float2bfloat16(v);
-  };
-  if (c0 == 0 && c1 == q.KC) {
-#pragma unroll
-    for (int n = 0; n < NT; n++) {
-      const int tk = tb * 32 + n * 8 + 2 * t;
-      put(tk, row0, f[n][0]); put(tk + 1, row0, f[n][1]); put(tk, row0 + 8, f[n][2]); put(tk + 1, row0 + 8, f[n][3]);
-    }
-    return;
-  }
-  // partial: accumulate into ws[tok][row] (tok within this token block), last arriver writes out
-  float* w = q.ws + (size_t)tb * 32 * q.N;
-  const int mrem = min(32, q.M - tb * 32);
 #pragma unroll
   for (int n = 0; n < NT; n++) {
-    const int tk = n * 8 + 2 * t;
-    if (tk < mrem) { atomicAdd(w + (size_t)tk * q.N + row0, f[n][0]); atomicAdd(w + (size_t)tk * q.N + row0 + 8, f[n][2]); }
-    if (tk + 1 < mrem) { atomicAdd(w + (size_t)(tk + 1) * q.N + row0, f[n][1]); atomicAdd(w + (size_t)(tk + 1) * q.N + row0 + 8, f[n][3]); }
-  }
-  __threadfence(); __syncwarp();
-  int old = 0;
-  if (lane == 0) old = atomicAdd(q.cnt + tile, c1 - c0);
-  old = __shfl_sync(0xffffffffu, old, 0);
-  if (old + c1 - c0 != q.KC) return;
-  __threadfence();
-  if (lane == 0) q.cnt[tile] = 0;
-  float v[16];  // this tile: mrem tokens x 16 rows; all loads in flight before any store
+    float4 v;
+    v.x = v.y = v.z = v.w = 0.f;
 #pragma unroll
-  for (int k = 0; k < 16; k++) { const int i = lane + 32 * k, tk = i >> 4; v[k] = tk < mrem ? __ldcg(w + (size_t)tk * q.N + mt * 16 + (i & 15)) : 0.f; }
-#pragma unroll
-  for (int k = 0; k < 16; k++) {
-    const int i = lane + 32 * k, tk = i >> 4, r = mt * 16 + (i & 15);
-    if (tk < mrem) { w[(size_t)tk * q.N + r] = 0.f; put(tb * 32 + tk, r, v[k]); }
+    for (int h = 0; h < CH; h++) { v.x += acc[n][h][0]; v.y += acc[n][h][1]; v.z += acc[n][h][2]; v.w += acc[n][h][3]; }
+    red[(wid * 4 + n) * 32 + lane] = v;
   }
+}
+
+__device__ __forceinline__ void put(const Q& q, int tok, int row, float v) {
+  if (q.f32) ((float*)q.out)[(size_t)tok * q.N + row] = v; else ((__nv_bfloat16*)q.out)[(size_t)tok * q.N + row] = __float2bfloat16(v);
 }
 
 template <bool HL>
 __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
-  const int lane = threadIdx.x & 31, W = gridDim.x * WPC, gw = blockIdx.x * WPC + (threadIdx.x >> 5);
+  __shared__ float4 red[WPC * 4 * 32];
+  __shared__ int last;
+  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
   const long long U = (long long)q.TB * q.MT * q.KC;
-  long long L = U * gw / W;
-  const long long Le = U * (gw + 1) / W;
-  while (L < Le) {
-    const int tile = (int)(L / q.KC), c0 = (int)(L - (long long)tile * q.KC);
-    const int c1 = (int)min((long long)q.KC, c0 + (Le - L));
-    const int tb = tile / q.MT, rem = q.M - tb * 32, nt = rem >= 32 ? 4 : (rem + 7) >> 3;
-    if (nt <= 1) seg<1, HL>(q, tile, c0, c1, lane);
-    else if (nt <= 2) seg<2, HL>(q, tile, c0, c1, lane);
-    else seg<4, HL>(q, tile, c0, c1, lane);
-    L += c1 - c0;
+  const long long a = U * blockIdx.x / gridDim.x, b = U * (blockIdx.x + 1) / gridDim.x;
+  if (a >= b) return;
+  // segments: boundary pieces first (their cross-CTA reduction then hides behind the whole tiles)
+  long long sa[3], sb[3]; int ns = 0;
+  const long long t0 = a / q.KC, t1 = (b - 1) / q.KC;
+  const long long fa = (a % q.KC) ? t0 + 1 : t0, fb = (b % q.KC) ? t1 : t1 + 1;  // full tiles [fa, fb)
+  if (t0 == t1 && (a % q.KC || b % q.KC)) { sa[ns] = a; sb[ns++] = b; }
+  else {
+    if (a % q.KC) { sa[ns] = a; sb[ns++] = (t0 + 1) * q.KC; }
+    if (b % q.KC) { sa[ns] = t1 * q.KC; sb[ns++] = b; }
+  }
+  const int nfull = (t0 == t1 && (a % q.KC || b % q.KC)) ? 0 : (int)(fb - fa);
+  for (int i = 0; i < ns + nfull; i++) {
+    long long s0, s1;
+    if (i < ns) { s0 = sa[i]; s1 = sb[i]; } else { s0 = (fa + i - ns) * q.KC; s1 = s0 + q.KC; }
+    const int tile = (int)(s0 / q.KC), c0 = (int)(s0 - (long long)tile * q.KC), c1 = (int)(s1 - (long long)tile * q.KC);
+    const int tb = tile / q.MT, mt = tile - tb * q.MT, mrem = min(32, q.M - tb * 32), nt = mrem >= 32 ? 4 : (mrem + 7) >> 3;
+    if (nt <= 1) part<1, HL>(q, tile, c0, c1, lane, wid, red);
+    else if (nt <= 2) part<2, HL>(q, tile, c0, c1, lane, wid, red);
+    else part<4, HL>(q, tile, c0, c1, lane, wid, red);
+    __syncthreads();
+    const bool full = c0 == 0 && c1 == q.KC;
+    float* w = q.ws + (size_t)tb * 32 * q.N;
+    // thread -> (n, lane', i): sum the 16 warp partials
+    float v = 0.f; int tok = -1, row = 0;
+    if (tid < nt * 128) {
+      const int n = tid >> 7, ln = (tid >> 2) & 31, e = tid & 3;
+      const float* rf = (const float*)red;
+#pragma unroll
+      for (int ww = 0; ww < WPC; ww++) v += rf[((ww * 4 + n) * 32 + ln) * 4 + e];
+      const int tk = n * 8 + 2 * (ln & 3) + (e & 1);
+      if (tk < mrem) { tok = tk; row = mt * 16 + (ln >> 2) + 8 * (e >> 1); }
+    }
+    if (full) {
+      if (tok >= 0) put(q, tb * 32 + tok, row, v);
+    } else {
+      if (tok >= 0) atomicAdd(w + (size_t)tok * q.N + row, v);
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) last = atomicAdd(q.cnt + tile, c1 - c0) + c1 - c0 == q.KC;
+      __syncthreads();
+      if (last) {
+        __threadfence();
+        if (tok >= 0) { float* p = w + (size_t)tok * q.N + row; const float r = __ldcg(p); *p = 0.f; put(q, tb * 32 + tok, row, r); }
+        if (tid == 0) q.cnt[tile] = 0;
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -173,7 +181,7 @@ _DBG = []
 def _ext():
     global _mod
     if _mod is None:
-        _mod = load_inline("skinny_v1" + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("skinny_v2" + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + _DBG,
                            verbose=False)
