@@ -64,8 +64,8 @@ struct P {
 };
 #ifdef PROF
 __device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
-#define PSET(k, v) do { if (lane == 0) p.prof[gw * 32 + (k)] = (v); } while (0)
-#define PADD(k, v) do { if (lane == 0) p.prof[gw * 32 + (k)] += (v); } while (0)
+#define PSET(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] = (v); } while (0)
+#define PADD(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] += (v); } while (0)
 #else
 #define PSET(k, v)
 #define PADD(k, v)
@@ -98,7 +98,7 @@ __device__ __forceinline__ void mb_wait(uint32_t bar, uint32_t ph) {
 
 #define QI (NLOC + 2)  // ctr[QI]: dynamic tile queue
 #define RED (2 * 2 * 32 * 16)  // per-warp split-K partial slots: 2 tile parities x NT <= 2 float4 per lane
-struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, ks, maxc; int arr[16][2], cons[16][2]; unsigned long long ids[16][8]; };  // tile-id ring: group drift is bounded to 5 live tiles
+struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, ks, maxc; int ids[16][4]; };
 
 // Work = tiles from one global queue (all W13 tiles, then all W2 tiles, expert-major). A group of ks warps of one CTA
 // takes a tile together, each streaming SPT/ks K-stages; partials meet in smem; the finisher rotates per tile.
@@ -107,17 +107,7 @@ struct Ctx {
   const P* p; Sm* sm; const uint16_t* list; uint32_t ring, bars; int lane, N1, N, gi, gj, ks;
   int q; unsigned long long wcyc;
   int pi, pp, ps;  // producer: group tile index, pass, stage
-  __device__ __forceinline__ int tid_of(int i) const {  // tile id of this group's i-th tile (tagged: wait until published)
-    volatile unsigned long long* a = &sm->ids[gi][i & 7];
-    unsigned long long v;
-#ifdef SPINDBG
-    long long n = 0;
-    while (((v = *a) >> 32) != (unsigned)i) { if (++n == 20000000) { printf("HANG tid_of blk %d w %d gi %d i %d tag %u\n", blockIdx.x, threadIdx.x >> 5, gi, i, (unsigned)(v >> 32)); break; } }
-#else
-    while (((v = *a) >> 32) != (unsigned)i) {}
-#endif
-    return (int)(unsigned)v;
-  }
+  __device__ __forceinline__ int tid_of(int i) const { return ((volatile int*)sm->ids[gi])[i & 3]; }
   __device__ __forceinline__ void item(int u, int& g2, int& e, int& mt) const {
     if (u < N1) { g2 = 0; e = sm->act[u >> 9]; mt = u & 511; }
     else { int v = u - N1; g2 = 1; e = sm->act[v >> 8]; mt = v & 255; }
@@ -193,10 +183,6 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
     for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
 #pragma unroll
   for (int c = 0; c < D; c++) ldb(B[c], s0, c);
-#ifdef PROF
-  const long long cr0 = clock64();
-  bool firstc = true;
-#endif
   for (int s = s0; s < s1; s++) {
     const uint32_t slot = C.acquire();
     const uint4 sc = lds(slot + 4096);
@@ -208,9 +194,6 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
       if (c + D < 8) ldb(B[(c + D) % (D + 1)], s, c + D);
       else if (s + 1 < s1) ldb(B[(c + D) % (D + 1)], s + 1, c + D - 8);
       const uint4 (&bc)[NT][2] = B[c % (D + 1)];
-#ifdef PROF
-      if (firstc) { firstc = false; uint32_t z = bc[0][0].x & 0; if (lane == 0) p.prof[(blockIdx.x * WPC + (threadIdx.x >> 5)) * 32 + 17] += clock64() - cr0 + z; }
-#endif
       const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
       for (int j = 0; j < 4; j++) {
@@ -237,7 +220,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
   }
 #ifdef PROF
   const long long ce0 = clock64();
-  struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 32 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, (int)(blockIdx.x * WPC + (threadIdx.x >> 5))};
+  struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 16 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, (int)(blockIdx.x * WPC + (threadIdx.x >> 5))};
 #endif
   extern __shared__ __align__(16) uint8_t smem[];
   float f[NT][4];
@@ -250,35 +233,16 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
       f[n][i] = v; }
   if (NT <= 2 && C.ks > 1) {  // group split-K: partials meet in smem (double-buffered by tile parity)
     const int wid = threadIdx.x >> 5, ks = C.ks, w0 = wid - C.gj;
-    volatile float4* red = (volatile float4*)(smem + (size_t)WPC * S * STG + WPC * SCR + WPC * S * 8) + (ti & 1) * WPC * 64;
-    volatile int* cons = &C.sm->cons[C.gi][ti & 1];
-#ifdef PROF
-    long long cb = clock64();
-#endif
-#ifdef SPINDBG
-    if (lane == 0) { long long n = 0; while (*cons != (ti >> 1)) { if (++n == 20000000) { printf("HANG cons blk %d w %d ti %d cons %d arr %d\n", blockIdx.x, wid, ti, *cons, C.sm->arr[C.gi][ti & 1]); break; } } }
-#else
-    if (lane == 0) while (*cons != (ti >> 1)) {}  // slot parity free once tile ti-2's finisher has read it
-#endif
-    __syncwarp();
-#ifdef PROF
-    if (lane == 0) p.prof[(blockIdx.x * WPC + wid) * 32 + 16] += clock64() - cb;
-#endif
+    float4* red = (float4*)(smem + (size_t)WPC * S * STG + WPC * SCR + WPC * S * 8) + (ti & 1) * WPC * 64;
 #pragma unroll
-    for (int n = 0; n < NT; n++) { volatile float4* d = red + (wid * 2 + n) * 32 + lane; d->x = f[n][0]; d->y = f[n][1]; d->z = f[n][2]; d->w = f[n][3]; }
-    __threadfence_block(); __syncwarp();
-    int old = 0;
-    if (lane == 0) old = atomicAdd(&C.sm->arr[C.gi][ti & 1], 1);
-    old = __shfl_sync(0xffffffffu, old, 0);
-    if (old != (ti >> 1) * ks + ks - 1) return false;  // last arriver finishes
-    __threadfence_block();
+    for (int n = 0; n < NT; n++) red[(wid * 2 + n) * 32 + lane] = make_float4(f[n][0], f[n][1], f[n][2], f[n][3]);
+    gbar(1 + C.gi, ks * 32);
+    if (C.gj != (ti & (ks - 1))) return false;
     for (int o = w0; o < w0 + ks; o++) {
       if (o == wid) continue;
 #pragma unroll
-      for (int n = 0; n < NT; n++) { volatile float4* v = red + (o * 2 + n) * 32 + lane; f[n][0] += v->x; f[n][1] += v->y; f[n][2] += v->z; f[n][3] += v->w; }
+      for (int n = 0; n < NT; n++) { float4 v = red[(o * 2 + n) * 32 + lane]; f[n][0] += v.x; f[n][1] += v.y; f[n][2] += v.z; f[n][3] += v.w; }
     }
-    __syncwarp();
-    if (lane == 0) { __threadfence_block(); *cons = (ti >> 1) + 1; }
   }
   __nv_bfloat16* scr = (__nv_bfloat16*)(smem + (size_t)(blockDim.x >> 5) * S * STG + (threadIdx.x >> 5) * SCR);
   if (!G2) {
@@ -342,7 +306,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
   const int gw = blockIdx.x * WPC + wid;
 #ifdef PROF
-  if (lane == 0) { for (int k = 0; k < 32; k++) p.prof[gw * 32 + k] = 0; unsigned sid; asm("mov.u32 %0, %smid;" : "=r"(sid)); p.prof[gw * 32 + 10] = sid; }
+  if (lane == 0) { for (int k = 0; k < 16; k++) p.prof[gw * 16 + k] = 0; unsigned sid; asm("mov.u32 %0, %smid;" : "=r"(sid)); p.prof[gw * 16 + 10] = sid; }
   PSET(0, gtime()); PSET(13, clock64());
 #endif
 #if TMA
@@ -350,8 +314,6 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 #endif
   if (tid < NLOC) sm->cnt[tid] = 0;
-  if (tid < 32) { sm->arr[tid >> 1][tid & 1] = 0; sm->cons[tid >> 1][tid & 1] = 0; }
-  if (tid < 128) sm->ids[tid >> 3][tid & 7] = ~0ull;
   __syncthreads();
   for (int i = tid; i < R; i += blockDim.x) { unsigned e = p.ids[i] - p.lo; lid[i] = e < NLOC ? e : 0xff; if (e < NLOC) atomicAdd(&sm->cnt[e], 1); }
   __syncthreads();
@@ -376,7 +338,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   C.ring = sbase + wid * S * STG; C.bars = sbase + WPC * S * STG + WPC * SCR + wid * S * 8; C.q = 0; C.wcyc = 0;
   C.pi = 0; C.pp = 0; C.ps = 0;
   const bool lead = C.gj == 0 && lane == 0;
-  if (lead) { sm->ids[C.gi][0] = (unsigned)atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = (1ull << 32) | (unsigned)atomicAdd(p.ctr + QI, 1); }
+  if (lead) { sm->ids[C.gi][0] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = atomicAdd(p.ctr + QI, 1); }
   __syncthreads();
 #ifdef PROF
   PSET(1, gtime());
@@ -394,11 +356,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     long long c0 = clock64();
 #endif
     if (g2) {
-#ifdef SPINDBG
-      if (lane == 0) { long long n = 0; while (ldacq(p.ctr + e) < T1E) { if (++n == 2000000) { printf("HANG dep blk %d w %d i %d e %d done %d\n", blockIdx.x, wid, i, e, p.ctr[e]); break; } } }
-#else
       if (lane == 0) while (ldacq(p.ctr + e) < T1E) __nanosleep(32);
-#endif
       __syncwarp();
 #ifdef PROF
       PADD(4, clock64() - c0); c0 = clock64();
@@ -406,7 +364,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     } else if (mt == 0 && C.gj == 0) {
       for (int k = lane; k < cnt; k += 32) p.ss[list[sm->off[e] + k]] = 0.f;
     }
-    if (lead) ((volatile unsigned long long*)sm->ids[C.gi])[(i + 2) & 7] = ((unsigned long long)(i + 2) << 32) | (unsigned)nxt;
+    if (lead) sm->ids[C.gi][(i + 2) & 3] = nxt;  // read 2 tiles later, after the group barrier (ks > 1) / syncwarp
     __syncwarp();
     const int span = SPT / ks, s0 = C.gj * span;
     bool fin = false;
@@ -415,14 +373,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       fin = g2 ? dispatch<1, S>(C, nt, e, mt, ps, i, s0, s0 + span) : dispatch<0, S>(C, nt, e, mt, ps, i, s0, s0 + span);
     }
     if (fin) {
-#ifdef PROF
-      long long cf = clock64();
-#endif
       fence_ar(); __syncwarp();
       if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
-#ifdef PROF
-      PADD(18, clock64() - cf); PADD(19, 1);
-#endif
     }
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
@@ -584,7 +536,7 @@ def _diag(state, weights):
     global _mod, _DBG
     keep, _mod, _DBG = (_mod, _DBG), None, _DBG + ["-DPROF"]
     ext = _ext()
-    state = dict(state, prof=torch.zeros((65536 * 32,), dtype=torch.int64, device="cuda"))
+    state = dict(state, prof=torch.zeros((65536 * 16,), dtype=torch.int64, device="cuda"))
     nw = torch.cuda.get_device_properties(0).multi_processor_count * (16 if _big() else 8)
     g = torch.Generator(device="cuda").manual_seed(7)
     for bs in (1, 8, 32, 256):
@@ -602,7 +554,7 @@ def _diag(state, weights):
             ext.moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
                     state["tcnt"], state["ws"], out, 0, state["prof"])
         torch.cuda.synchronize()
-        P = state["prof"].view(-1, 32)[:nw].cpu().tolist()
+        P = state["prof"].view(-1, 16)[:nw].cpu().tolist()
         t0 = min(r[0] for r in P)
         q = lambda v, f: sorted(v)[min(len(v) - 1, int(f * len(v)))]
         col = lambda k: [(r[k] - t0) / 1e3 for r in P]
@@ -611,8 +563,7 @@ def _diag(state, weights):
         print(f"DIAG bs {bs} na {P[0][11]} mode {P[0][12]} span {max(col(7)):.1f} routed {max(col(1)):.1f} "
               f"done p10/50/max {q(col(5), .1):.1f}/{q(col(5), .5):.1f}/{max(col(5)):.1f} comb {max(col(6)):.1f} mhz {q(mhz, .5):.0f} "
               f"g1 {q(cy(2), .5):.1f}/{max(cy(2)):.1f} g2 {q(cy(3), .5):.1f}/{max(cy(3)):.1f} dep {q(cy(4), .5):.1f}/{max(cy(4)):.1f} "
-              f"tma {q(cy(9), .5):.1f}/{max(cy(9)):.1f} epi {q(cy(15), .5):.1f}/{max(cy(15)):.1f} bar {q(cy(16), .5):.1f}/{max(cy(16)):.1f} "
-              f"bpro {q(cy(17), .5):.1f}/{max(cy(17)):.1f} fence {q(cy(18), .5):.1f}/{max(cy(18)):.1f} fins {max(r[19] for r in P)} tiles {max(r[8] for r in P)}", flush=True)
+              f"tma {q(cy(9), .5):.1f}/{max(cy(9)):.1f} segs {max(r[8] for r in P)}", flush=True)
     _mod, _DBG = keep
 
 
