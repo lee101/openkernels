@@ -5,3 +5,8 @@
 - FAKEDQ (no dequant ALU) only -12%; FAKEDQ+NOMMA bs32 still 181us, bs1 47us => not ALU-bound
 - 12 warps x 3 stages: slower. Full-stage B prefetch (D=7): no change.
 - interleaving G2(e) right after G1(e+1) in round-robin order: worse (same-round dependency waits)
+
+# check results log (H200, speedup vs SGLang)
+- v1 1.069 | v2 race fail | v2.1 1.203 | v3 smem split ks forced 1.144 | ks by balance 1.204 | stream-K 1.255
+- v4 dynamic queue + group barrier split-K + acq_rel 1.339 (bs1 1.47 bs16 1.36 bs32 1.14 bs8 1.41 bs128 1.46 bs256 1.24)
+- v5 async last-arriver reduction 1.147 (worse everywhere, even ks=1 shapes) -> reverted
