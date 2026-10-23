@@ -80,7 +80,7 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ int ldacq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p)); return v; }
+__device__ __forceinline__ int ldacq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ uint32_t rotl(uint32_t q, int d) { return __funnelshift_l(q, q, d); }
 __device__ __forceinline__ uint32_t sc2(uint32_t w, uint32_t sel) { return __byte_perm(w, 0, sel) * 16u + 0x77007700u; }
 #if TMA
@@ -103,9 +103,9 @@ struct Ctx {
   int q; unsigned long long wcyc;
   int pu, pp, ps, pe;  // producer: item, pass, stage, stage end
   __device__ __forceinline__ void item(int u, int& g2, int& e, int& mt, int& tile, int& sp) const {
-    const int ks = sm->ks;
-    if (u < N1) { g2 = 0; tile = u / ks; sp = u - tile * ks; e = sm->act[tile >> 9]; mt = tile & 511; }
-    else { int v = u - N1; g2 = 1; int t = v / ks; sp = v - t * ks; e = sm->act[t >> 8]; mt = t & 255; tile = N1 / ks + t; }
+    const int lk = __ffs(sm->ks) - 1;
+    if (u < N1) { g2 = 0; tile = u >> lk; sp = u & (sm->ks - 1); e = sm->act[tile >> 9]; mt = tile & 511; }
+    else { int v = u - N1; g2 = 1; int t = v >> lk; sp = v & (sm->ks - 1); e = sm->act[t >> 8]; mt = t & 255; tile = (N1 >> lk) + t; }
   }
   __device__ __forceinline__ void prod_begin(int u) {
     pu = u; pp = 0;
@@ -158,7 +158,10 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
   const int lane = C.lane, g = lane >> 2, t = lane & 3, ks = C.sm->ks;
   const int cnt = C.sm->cnt[e], off = C.sm->off[e];
   constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
-  constexpr int D = NT == 1 ? 3 : 1;  // B prefetch distance in chunks; (D + 1) divides 8 so slots stay static
+#ifndef BD1
+#define BD1 7
+#endif
+  constexpr int D = NT == 1 ? BD1 : (NT == 2 ? 3 : 1);  // B prefetch distance in chunks; (D + 1) divides 8 so slots stay static
   const uint4* rp[NT];
 #pragma unroll
   for (int n = 0; n < NT; n++) {
@@ -170,7 +173,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
 #pragma unroll
     for (int n = 0; n < NT; n++) {
       const uint4* q = rp[n] + s * 64 + c * 8;
-      if (G2) { b[n][0] = __ldcg(q); b[n][1] = __ldcg(q + 1); } else { b[n][0] = __ldg(q); b[n][1] = __ldg(q + 1); }
+      if (G2) { b[n][0] = __ldca(q); b[n][1] = __ldca(q + 1); } else { b[n][0] = __ldg(q); b[n][1] = __ldg(q + 1); }
     }
   };
   float acc[NT][CH][4];
@@ -196,14 +199,22 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int tile
 #pragma unroll
       for (int j = 0; j < 4; j++) {
         const uint32_t q = ww[j];
+#ifdef FAKEDQ
+        const uint32_t a0 = q ^ sA, a1 = q ^ sB, a2 = q + sA, a3 = q + sB;
+#else
         const uint32_t a0 = bmul(q & 0x81C081C0u, sA);
         const uint32_t a1 = bmul((rotl(q, 3) & 0x01C001C0u) | (rotl(q, 1) & 0x80008000u), sB);
         const uint32_t a2 = bmul(rotl(q, 6) & 0x81C081C0u, sA);
         const uint32_t a3 = bmul((rotl(q, 11) & 0x01C001C0u) | (rotl(q, 5) & 0x80008000u), sB);
+#endif
 #pragma unroll
         for (int n = 0; n < NT; n++) {
           const uint32_t* bb = (const uint32_t*)&bc[n][j >> 1];
+#ifdef NOMMA
+          acc[n][j % CH][0] += __uint_as_float(a0 ^ a1 ^ a2 ^ a3 ^ bb[(j & 1) * 2] ^ bb[(j & 1) * 2 + 1]);
+#else
           mma(acc[n][j % CH], a0, a1, a2, a3, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+#endif
         }
       }
     }
@@ -300,7 +311,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   const int gw = blockIdx.x * WPC + wid;
 #ifdef PROF
   if (lane == 0) { for (int k = 0; k < 16; k++) p.prof[gw * 16 + k] = 0; unsigned sid; asm("mov.u32 %0, %smid;" : "=r"(sid)); p.prof[gw * 16 + 10] = sid; }
-  PSET(0, gtime());
+  PSET(0, gtime()); PSET(13, clock64());
 #endif
 #if TMA
   if (lane < S) mb_init(sbase + WPC * S * STG + WPC * SCR + (wid * S + lane) * 8);
@@ -410,7 +421,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     *(uint4*)(p.out + (size_t)t * HD + col) = o;
   }
 #ifdef PROF
-  PSET(7, gtime());
+  PSET(7, gtime()); PSET(14, clock64());
 #endif
   __syncthreads();
   if (tid == 0) {
@@ -460,10 +471,12 @@ def _ext():
     if _mod is None:
         big = _big()
         wpc, stg = (16, 2) if big else (8, 2)
+        for d in _DBG:
+            if d.startswith("-DCFG="): wpc, stg = map(int, d[6:].split("x"))
         _mod = load_inline("moe_w4a16_v2_%d_%d%s" % (wpc, stg, "".join(_DBG).replace("-", "_").replace("=", "")),
                            cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                            cuda_sources=CUDA, functions=["moe"],
-                           extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + _DBG, verbose=False)
+                           extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + [d for d in _DBG if not d.startswith("-DCFG=")], verbose=False)
     return _mod
 
 
