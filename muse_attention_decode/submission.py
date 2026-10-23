@@ -679,7 +679,7 @@ def kernel_fn(data):
     if L == 1 and hkv == 2 and hq == 16:    # decode: a warp per (request, split), >= 64 keys each
         nsplit = max(1, min((span + 63) // 64, (132 * 8 + B - 1) // B))
     elif L == 8 and hkv == 2 and hq == 16:  # verify: a CTA per (request, split), ~2 CTAs per SM
-        nsplit = max(1, min((span + 63) // 64, (132 * 2 + B - 1) // B))
+        nsplit = max(1, min((span + 63) // 64, (132 * 2) // B))  # one wave: B * nsplit <= 2 CTAs per SM
     else:
         nsplit = max(1, min((span + 127) // 128, (132 * 8 + B * hkv - 1) // (B * hkv)))
     rows = L * (hq // hkv)
