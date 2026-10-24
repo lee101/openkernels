@@ -985,6 +985,7 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   const uint32_t sb = ((uint32_t)__cvta_generic_to_shared(smem) + 1023) & ~1023u;
   // Q (E4M3) as one 64-row x 128 B tile: warpgroup h's 64 B at byte 64 h, like the head halves of the raw K rows
   const uint32_t ring = sb, qs = sb + RSW * 16384, vf0 = qs + 8192 + h * (VDB ? 16384 : 8192);
+  const uint32_t ptr = qs + 8192 + 2 * (VDB ? 16384 : 8192);  // page-table ring: 4 segments x 4 steps x 64 entries
   if constexpr (!FUSE) {
 #pragma unroll
     for (int i = 0; i < 2; i++) {
@@ -1081,6 +1082,19 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     }
     asm volatile("cp.async.commit_group;\n");
   };
+  // page size 1: entries stream into the smem ring (segment = 4 steps), lookups are shared-memory reads
+  auto ptseg = [&](int sg) {
+    const int idx = ks + sg * 256 + tid;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(ptr + (sg & 3) * 1024 + tid * 4), "l"(ptb + (idx < ke ? idx : 0)), "r"(idx < ke ? 4 : 0));
+  };
+  auto rowr = [&](int kb, int i) -> int {
+    if (!PS1) return rowof(kb, i);
+    const int kp = kb + i * 16 + lr;
+    if (kp >= ke) return -1;
+    int v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(ptr + ((kp - ks) & 1023) * 4));
+    return v;
+  };
+  if (PS1) { ptseg(0); ptseg(1); ptseg(2); }  // joins the first KV group
   const int nb = (ke - ks + 63) >> 6;
   for (int j = 0; j < RSW - 1; j++) issue(j, rowof(ks + j * 64, 0), rowof(ks + j * 64, 1), rowof(ks + j * 64, 2), rowof(ks + j * 64, 3));
   // page-table rows looked up 3 steps before their issue: the lookups' latency stays off the issue path
@@ -1100,9 +1114,10 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   for (int bi = 0, kb = ks; bi < nb; bi++, kb += 64) {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(RSW - 2));
     __syncthreads();
+    if (PS1 && (bi & 3) == 0) ptseg((bi >> 2) + 3);  // joins this step's group; first read 6+ steps later
     issue((bi + RSW - 1) % RSW, rq[0][0], rq[0][1], rq[0][2], rq[0][3]);
 #pragma unroll
-    for (int i2 = 0; i2 < 4; i2++) { rq[0][i2] = rq[1][i2]; rq[1][i2] = rq[2][i2]; rq[2][i2] = rowof(kb + (RSW + 2) * 64, i2); }
+    for (int i2 = 0; i2 < 4; i2++) { rq[0][i2] = rq[1][i2]; rq[1][i2] = rq[2][i2]; rq[2][i2] = rowr(kb + (RSW + 2) * 64, i2); }
     if (PFD > 0 && tid < 128) {
 #if __CUDA_ARCH__ >= 900
       if (pr >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((tid < 64 ? a.kc : a.vc) + (size_t)pr * 128) : "memory");
@@ -1398,6 +1413,25 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     const int kp = kb + (lane & 15);
     return (kb < we && kp < we) ? (kp >= seq ? -2 : ptb[kp / p.ps] * p.ps + kp % p.ps) : -1;
   };
+  // page size 1: the warp's page-table entries stream into a 4-segment smem ring (8 blocks per segment), so the
+  // in-loop lookups are shared-memory reads instead of a chain of dependent global loads
+  const bool pt1 = p.ps == 1;
+  const uint32_t ptr = tab + 256 + w * 2048;
+  auto ptseg = [&](int sg) {  // entries ws + 128 sg .. + 127 -> ring slot sg & 3 (4 B copies: rows need not be aligned)
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int e = j * 32 + lane, idx = ws + sg * 128 + e;
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(ptr + (sg & 3) * 512 + e * 4), "l"(ptb + (idx < we ? idx : 0)), "r"(idx < we ? 4 : 0));
+    }
+  };
+  auto rowss = [&](int kb) -> int {  // rowsfor through the ring (valid for blocks within the 2 loaded segments ahead)
+    if (!pt1) return rowsfor(kb);
+    const int kp = kb + (lane & 15);
+    if (!(kb < we && kp < we)) return -1;
+    if (kp >= seq) return -2;
+    int v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(ptr + ((kp - ws) & 511) * 4));
+    return v;
+  };
   const int c = lane & 7;
   auto issue = [&](int slot, int rl, bool tabok) {  // the new token's row comes from the table once it is written
     const uint32_t d0 = ring + slot * 4096;
@@ -1429,6 +1463,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
 #pragma unroll
   for (int i = 0; i < RBF - 1; i++) rpro[i] = rowsfor(ws + i * 16);  // independent loads in flight together
   int rnext = rowsfor(ws + (RBF - 1) * 16), rn1 = rowsfor(ws + RBF * 16), rn2 = rowsfor(ws + (RBF + 1) * 16);  // 3 blocks ahead
+  if (pt1) { ptseg(0); ptseg(1); }  // joins the first KV group
 #pragma unroll
   for (int i = 0; i < RBF - 1; i++) issue(i, rpro[i], false);  // KV loads start before the query prologue
   if (w == 0) {  // new key: RMSNorm + RoPE, value as is; both quantized to E4M3
@@ -1519,8 +1554,9 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   for (int bi = 0, kb = ws; bi < nb; bi++, kb += 16) {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(RBF - 2));
     __syncwarp();
+    if (pt1 && (bi & 7) == 0) ptseg((bi >> 3) + 2);  // segment k + 2 while in segment k: first read 9 blocks later
     issue((bi + RBF - 1) % RBF, rnext, true);
-    rnext = rn1; rn1 = rn2; rn2 = rowsfor(kb + (RBF + 2) * 16);
+    rnext = rn1; rn1 = rn2; rn2 = rowss(kb + (RBF + 2) * 16);
     if (PFF > 0) {
 #if __CUDA_ARCH__ >= 900
       if (rpf >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((lane < 16 ? p.kc : p.vc) + (size_t)rpf * 128) : "memory");
@@ -1758,7 +1794,7 @@ void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Ten
   p.out = (__nv_bfloat16*)out.data_ptr(); p.B = seq.size(0); p.ps = ps; p.maxp = pt.size(1); p.window = window; p.NS = NS;
   p.theta = theta; p.qsc = qk_factor; p.qk = (float)(sm_scale * 1.4426950408889634); p.kinv = 1.f / kv_scale; p.vinv = 1.f / kv_scale; p.vscale = kv_scale;
   p.prof = prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr; p.invf = invf.data_ptr<float>();
-  const int sm = max(8 * RBF * 4096 + 256, (512 + 256 * D) * 4);  // ring+table, or the merge scratch
+  const int sm = max(8 * RBF * 4096 + 256 + 8 * 2048, (512 + 256 * D) * 4);  // ring + table + page-table rings, or the merge scratch
   static bool once = false;
   if (!once) {
     cudaFuncSetAttribute(fdec<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
@@ -1817,7 +1853,7 @@ void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor 
     if (!o8) { cudaFuncSetAttribute(attn9<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm8); cudaFuncSetAttribute(attn9<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm8); o8 = true; }
     if (Q8) {
       a.qk = (float)(sm_scale * 1.4426950408889634 * qk_factor);
-      const int smw = RSW * 16384 + 8192 + (VDB ? 32768 : 16384) + 1024;
+      const int smw = RSW * 16384 + 8192 + (VDB ? 32768 : 16384) + 4096 + 1024;
       static bool ow = false;
       if (!ow) {
         cudaFuncSetAttribute(attnw<true, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smw); cudaFuncSetAttribute(attnw<false, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smw);
@@ -1879,7 +1915,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v29_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v31_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
