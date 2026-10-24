@@ -1750,7 +1750,7 @@ void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Ten
     once = true;
   }
   static int major = 0; if (!major) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev); }
-  if (CLUS && major >= 9 && NS > 1 && NS <= 16 && (NS & (NS - 1)) == 0) {
+  if (CLUS && major >= 9 && NS > 1 && NS <= 16 && (NS & (NS - 1)) == 0 && p.B * NS <= 64) {  // clusters fragment GPCs: small grids only
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(p.B * NS); cfg.blockDim = dim3(256); cfg.dynamicSmemBytes = sm; cfg.stream = at::cuda::getCurrentCUDAStream();
     cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = NS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
@@ -1886,7 +1886,7 @@ def _diag(dev):
             qkv = torch.randn((B, 1, 2304), device=dev).bfloat16()
             span = min(mp, window + 1) if window else mp
             NS = max(1, min(132 // B, (span + _NSDIV - 1) // _NSDIV))
-            if NS <= 17: NS = 1 << (min(NS, 16).bit_length() - 1)
+            if NS <= 17 and B * min(NS, 16) <= 64: NS = 1 << (min(NS, 16).bit_length() - 1)
             wo = torch.empty((B * NS * 16 * 64,), device=dev); wml = torch.empty((B * NS * 32,), device=dev)
             cnt = torch.zeros((2 * B,), dtype=torch.int32, device=dev); out = torch.empty((B, 1, 1024), dtype=torch.bfloat16, device=dev)
             prof = torch.zeros((B * NS * 8 * 8,), dtype=torch.int64, device=dev)
@@ -1917,7 +1917,7 @@ def kernel_fn(data):
         maxkeys = data["page_table"].shape[1] * cfg["page_size"]
         span = min(maxkeys, cfg["window"] + 1) if cfg["window"] else maxkeys
         NS = max(1, min(132 // B, (span + _NSDIV - 1) // _NSDIV))  # keys per CTA >= _NSDIV, one wave
-        if _hopper() and NS <= 17:  # one cluster per request (power of two <= 16): split merge in distributed shared memory
+        if _hopper() and NS <= 17 and B * min(NS, 16) <= 64:  # one cluster per request: split merge in distributed smem
             NS = 1 << (min(NS, 16).bit_length() - 1)
         key = ("f", B, NS)
         if key not in _BUF:
