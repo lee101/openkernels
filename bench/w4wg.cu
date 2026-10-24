@@ -14,7 +14,7 @@
 #define STA 16384
 #define STW 4096
 #define STS 512
-#define STB (STA + STW + STS)
+#define STB 21504  // STA + STW + STS rounded up to 1 KB: each stage's A tile starts on a 128 B-swizzle atom
 __device__ __forceinline__ uint64_t gdesc(uint32_t a, uint32_t lbo, uint32_t sbo) {
   return (uint64_t)((a & 0x3FFFF) >> 4) | ((uint64_t)(lbo >> 4) << 16) | ((uint64_t)(sbo >> 4) << 32) | (1ull << 62);
 }

@@ -37,7 +37,7 @@ CUDA = r"""
 #define WPC 16
 #endif
 #ifndef V7
-#define V7 1
+#define V7 0
 #endif
 #ifndef RSN
 #define RSN 2
