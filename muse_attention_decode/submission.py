@@ -1328,31 +1328,35 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   }
   if constexpr (MRG) {
     // the last min(8, nsplit) arrivers of a request merge its 128 rows (rank, rank + nm, ...); everyone else has arrived
-    __threadfence();
+    // arrival: CTA barrier, then one acq_rel add (releases every thread's partial stores; no fence.sc)
     __syncthreads();
     __shared__ int rank_s;
-    if (tid == 0) rank_s = atomicAdd(f.cnt + bq, 1);
+    if (tid == 0) { int v; asm volatile("atom.add.acq_rel.gpu.global.s32 %0, [%1], 1;\n" : "=r"(v) : "l"(f.cnt + bq) : "memory"); rank_s = v; }
     __syncthreads();
     const int nmg = min(8, a.nsplit), rank = rank_s - (a.nsplit - nmg);
     if (rank < 0) return;
-    if (tid == 0) { volatile int* c = f.cnt + bq; while (*c < a.nsplit) __nanosleep(64); }
+    if (tid == 0) {
+      int v;
+      do { asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(f.cnt + bq) : "memory"); if (v < a.nsplit) __nanosleep(32); } while (v < a.nsplit);
+    }
     __syncthreads();
-    __threadfence();
     asm volatile("cp.async.wait_all;\n" ::: "memory");
     // 16 threads per row (4 dims each), 16 rows at a time; one online-softmax pass over the splits
     const int d4 = tid & 15;
     for (int rr = rank + nmg * (tid >> 4); rr < 128; rr += nmg * 16) {
       const int hh = rr >> 6, r = rr & 63, base = (bq * a.hkv + hh) * a.nsplit;
+      // two passes with independent loads: the splits' max first, then the weighted sum (no rescale chain)
       float Mr = -INFINITY, Lr = 0.f;
       float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll 4
+#pragma unroll 8
+      for (int k2 = 0; k2 < a.nsplit; k2++) Mr = fmaxf(Mr, __ldcg(a.wml + ((size_t)(base + k2) * 64 + r) * 2));
+#pragma unroll 8
       for (int k2 = 0; k2 < a.nsplit; k2++) {
         const float2 ml = __ldcg((const float2*)(a.wml + ((size_t)(base + k2) * 64 + r) * 2));
         const float4 v = __ldcg((const float4*)(a.wo + ((size_t)(base + k2) * 64 + r) * D) + d4);
-        if (ml.x == -INFINITY) continue;
-        const float nm2 = fmaxf(Mr, ml.x), c0 = ex2(Mr - nm2), c1 = ex2(ml.x - nm2);
-        Mr = nm2; Lr = Lr * c0 + ml.y * c1;
-        a4.x = a4.x * c0 + v.x * c1; a4.y = a4.y * c0 + v.y * c1; a4.z = a4.z * c0 + v.z * c1; a4.w = a4.w * c0 + v.w * c1;
+        const float c1 = ml.x == -INFINITY ? 0.f : ex2(ml.x - Mr);
+        Lr = fmaf(ml.y, c1, Lr);
+        a4.x = fmaf(v.x, c1, a4.x); a4.y = fmaf(v.y, c1, a4.y); a4.z = fmaf(v.z, c1, a4.z); a4.w = fmaf(v.w, c1, a4.w);
       }
       const float inv = f.vscale / Lr;
       a4.x *= inv; a4.y *= inv; a4.z *= inv; a4.w *= inv;
@@ -1885,8 +1889,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   if (rank < 0) return;
   if (tid == 0) { int v; do { asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.cnt + b) : "memory"); if (v < p.NS) __nanosleep(32); } while (v < p.NS); }
   __syncthreads();
-  PT(7);
-  __threadfence();
+  PT(7);  // the acquire spin + CTA barrier order the other splits' partials before the reads below (no fence.sc)
   asm volatile("cp.async.wait_all;\n" ::: "memory");
   float* xs = (float*)smem;  // [16 (rl, kg)][64] weighted O, [16] sums, [16] max
   const int d4 = tid & 15, kg = (tid >> 4) & (nmg - 1), rl = tid / (16 * nmg), slot = rl * nmg + kg;
@@ -2074,7 +2077,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v38_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v39_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
