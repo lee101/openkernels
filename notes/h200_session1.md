@@ -40,3 +40,6 @@
 - decode layer: v0 0.90 | v1 1.222
 - bf16_proj: v6 deep per-CTA ring GEMV 0.83 (worse than v5 0.94)
 - prefill: v0 failed on H200 (attnw partial layout rows; fixed), pod torch lacks _grouped_mm and mm(out_dtype) -> fallbacks
+- s15: attention v31 (page-table smem rings): decode full b16 148->117.5us, b32 277->206.5 (okb); verify full b32 340->323
+- s15: bf16_proj v7 (in-kernel finalize) slower than v5 at every shape -> off
+- s15: w4wg prototype correct after 1 KB stage alignment fix; 1.2 ms for 32 experts x 8192 x 4096 at ~20 tok/expert (latency-bound, 3-stage ring, serialized dequant/wgmma)
