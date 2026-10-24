@@ -36,6 +36,9 @@ CUDA = r"""
 #ifndef WPC
 #define WPC 16
 #endif
+#ifndef V7
+#define V7 1
+#endif
 #ifndef RSN
 #define RSN 2
 #endif
@@ -186,6 +189,24 @@ __global__ void __launch_bounds__(WPC * 32, 1) skinny(Q q) {
       if (tk < mrem) { atomicAdd(w + (size_t)tk * q.N + row0, f[0]); atomicAdd(w + (size_t)tk * q.N + row0 + 8, f[2]); }
       if (tk + 1 < mrem) { atomicAdd(w + (size_t)(tk + 1) * q.N + row0, f[1]); atomicAdd(w + (size_t)(tk + 1) * q.N + row0 + 8, f[3]); }
     }
+#if V7
+    {  // the last warp to add into this tile writes it out and clears ws (no finalize kernel)
+      auto wof = [&](long long uu) { return (int)(((uu + 1) * W - 1) / U); };  // warp streaming unit uu
+      const long long t0u = tile * KU, t1u = t0u + KU - 1;
+      const int nc = wof(t1u) - wof(t0u) + 1;
+      __syncwarp();
+      int last = 0;
+      if (lane == 0) { int v; asm volatile("atom.add.acq_rel.gpu.global.s32 %0, [%1], 1;\n" : "=r"(v) : "l"(q.cnt + tile) : "memory"); last = v == nc - 1; }
+      last = __shfl_sync(0xffffffffu, last, 0);
+      if (last) {
+        for (int e = lane; e < 16 * mrem; e += 32) {
+          const int tok = e >> 4, row = mt * 16 + (e & 15);
+          if (row < q.N) { float* wp = w + (size_t)tok * q.N + row; put(q, tb * 32 + tok, row, __ldcg(wp)); *wp = 0.f; }
+        }
+        if (lane == 0) q.cnt[tile] = 0;
+      }
+    }
+#endif
   }
 }
 
@@ -228,7 +249,7 @@ void run(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, 
   cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
   static int major = 0; if (!major) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev); }
   cfg.attrs = at; cfg.numAttrs = major >= 9 ? 1 : 0;
-  cudaLaunchKernelEx(&cfg, fin, q);
+  if (!V7) cudaLaunchKernelEx(&cfg, fin, q);
 }
 
 // ---------------------------------------------------------------- v6: deep per-CTA TMA ring (stream over 16 KB stages)
@@ -410,7 +431,7 @@ def _ext():
     global _mod
     if _mod is None:
         wpc = next((int(d[6:]) for d in _DBG if d.startswith("-DWPC=")), 16 if _big() else 8)
-        _mod = load_inline("skinny_v6_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("skinny_v7_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run2(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run", "run2"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + ([] if _big() else ["-DNSG=4"]) + [d for d in _DBG if not d.startswith("-DWPC=")],
                            verbose=False)
