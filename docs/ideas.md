@@ -403,3 +403,7 @@ shows 64 B rows and non-contiguous runs.
   - ncu unavailable in RunPod containers (ERR_NVGPUCTRPERM).
 - bf16_proj router m=256: one cuBLAS mm on [hi;lo]^T (N=512) + add: 11.4 vs 17.7 us (1.54x). Kept (RTRM=128).
 - attention verify b16 layer: 164 us; -DAW_NOLOAD 145, -DAW_NOMMA 154, both 139. ~85% is neither KV loads nor MMA: softmax/exp, page table, barriers, combine. b32: 313 / 277 / 294 / 264.
+- attention attnw verify (H200 clock64 per phase, bench/awprof.py, -DAWPROF): ~2850 cycles per 64-key step per warpgroup, shares wait 3% / issue 17% / V convert 16% / QK 11% / softmax 35% / PV 18%. Step loop ~840 SASS instrs; issue-bound with 4 WGs/SM (RSW=5 -> 1 CTA/SM: steps 2230 cycles but 260 vs 218 us). ex2.approx.f16x2 is emulated (2x MUFU.EX2.F16 + PRMT): no gain. Lazy rescale (FA4-style, threshold 2^8): -1..2%.
+- ptxas C7515 (wgmma serialized) in every attnw: zero-filled PV accumulators reaching the loop header. Fix: no o=0 init, first PV with runtime scale-d predicate (wg_rsz), zero o after loop if nb == 0. 6 -> 2 WARPGROUP.DEPBAR per step (no measurable time change: not the bottleneck).
+- attention split sweeps (bench/attn_sweep.py, OVR knobs): sliding B=1 time flat in nsplit/NS (fixed overheads dominate).
+- fdec timeline (sliding B=1): prologue 3.2 us (seq -> page table -> KV: 3 dependent DRAM trips), loop ~1 us, CTA merge 2.7 us of which 2.2 us was 16-way bank-conflicted scalar st.shared of the warps' partials (fixed in v35: float4 + padded swizzled rows), cross-CTA merge ~2 us.

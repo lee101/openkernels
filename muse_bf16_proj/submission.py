@@ -434,12 +434,9 @@ __global__ void __launch_bounds__(512, 1) rtr(Q q) {
   uint4 a[4], h[4], b[NT][2];
 #pragma unroll
   for (int j = 0; j < 4; j++) { a[j] = ldnc(ah + j * 512); h[j] = ldnc(al + j * 512); }
-  const int ntg = (q.M + 31) >> 5;  // 32-token groups (the A fragments stay in registers)
-  float* P = q.ws + RPART + (size_t)mt * KS * ntg * 512;
-  for (int tg = 0; tg < ntg; tg++) {
 #pragma unroll
   for (int n = 0; n < NT; n++) {
-    const uint4* xr = (const uint4*)(q.x + (size_t)min(tg * 32 + n * 8 + g, q.M - 1) * q.K + c * 64) + t * 2;
+    const uint4* xr = (const uint4*)(q.x + (size_t)min(n * 8 + g, q.M - 1) * q.K + c * 64) + t * 2;
     b[n][0] = __ldg(xr); b[n][1] = __ldg(xr + 1);
   }
   float acc[NT][4];
@@ -460,28 +457,23 @@ __global__ void __launch_bounds__(512, 1) rtr(Q q) {
     *(float2*)(r + 8 * 32) = make_float2(acc[n][2], acc[n][3]);
   }
   __syncthreads();
-  {
-    float s = 0.f;
-    if ((tid & 31) < NT * 8) {
+  const int row = tid >> 5, tok = tid & 31;  // this thread's output (row of the tile, token)
+  float s = 0.f;
+  if (tok < NT * 8) {
 #pragma unroll
-      for (int ww = 0; ww < 16; ww++) s += red[ww * 512 + tid];
-    }
-    P[((size_t)ks * ntg + tg) * 512 + tid] = s;
+    for (int ww = 0; ww < 16; ww++) s += red[ww * 512 + tid];
   }
-  __syncthreads();  // red is reused by the next group
-  }
-  const int row = tid >> 5, tok = tid & 31;  // this thread's output (row of the tile, token within a group)
+  float* P = q.ws + RPART + (size_t)mt * KS * 512;
+  P[ks * 512 + tid] = s;
   __threadfence();
   __syncthreads();
   if (tid == 0) last = atomicAdd(q.cnt + RCNT + mt, 1) == KS - 1;
   __syncthreads();
   if (!last) return;
   __threadfence();
-  for (int tg = 0; tg < ntg; tg++) {
-    float tot = 0.f;
-    for (int k2 = 0; k2 < KS; k2++) tot += __ldcg(P + ((size_t)k2 * ntg + tg) * 512 + tid);
-    if (tg * 32 + tok < q.M) ((float*)q.out)[(size_t)(tg * 32 + tok) * q.N + mt * 16 + row] = tot;
-  }
+  float tot = 0.f;
+  for (int k2 = 0; k2 < KS; k2++) tot += __ldcg(P + k2 * 512 + tid);
+  if (tok < q.M) ((float*)q.out)[(size_t)tok * q.N + mt * 16 + row] = tot;
   if (tid == 0) q.cnt[RCNT + mt] = 0;
 }
 void run3(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t N) {
@@ -491,7 +483,7 @@ void run3(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out,
   q.M = x.size(0); q.K = x.size(1); q.N = (int)N; q.MT = (int)(N / 16); q.KC = q.K / 64; q.TB = 1; q.f32 = 1;
   const dim3 grid(q.KC / 16, q.MT);
   auto st = at::cuda::getCurrentCUDAStream();
-  const int nt = q.M > 32 ? 4 : (q.M + 7) / 8;
+  const int nt = (q.M + 7) / 8;
   if (nt <= 1) rtr<1><<<grid, 512, 0, st>>>(q); else if (nt <= 2) rtr<2><<<grid, 512, 0, st>>>(q); else rtr<4><<<grid, 512, 0, st>>>(q);
 }
 """
@@ -512,7 +504,7 @@ def _ext():
     global _mod
     if _mod is None:
         wpc = next((int(d[6:]) for d in _DBG if d.startswith("-DWPC=")), 16 if _big() else 8)
-        _mod = load_inline("skinny_v9_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("skinny_v11_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run2(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run3(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run", "run2", "run3"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + ([] if _big() else ["-DNSG=4"]) + [d for d in _DBG if not d.startswith("-DWPC=")],
                            verbose=False)
@@ -535,6 +527,7 @@ def prepare(weights):
             hi = w.to(torch.bfloat16)
             lo = (w - hi.float()).to(torch.bfloat16)
             st[k] = (_pack(hi), _pack(lo))
+            st["router_hl_t"] = torch.cat((hi, lo)).t().contiguous()  # [K, 2N]: one cuBLAS mm for m > 32
         else:
             st[k] = (_pack(w), None)
         st[k + "_raw"] = w
@@ -553,9 +546,12 @@ def kernel_fn(data, state):
     m = x.shape[0]
     if layer != "router" and (m > 1 or layer == "o") and not (layer == "unpooler" and m == 1):
         return x @ state[layer + "_raw"][:n].T  # cuBLAS beats the skinny kernel here (judge v7: 0.45-0.9x)
+    if layer == "router" and m > 32:
+        a = torch.mm(x, state["router_hl_t"], out_dtype=torch.float32)
+        return a[:, :n] + a[:, n:]
     A, A2 = state[layer]
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
-    if layer == "router" and m <= 256 and RTR:
+    if layer == "router" and m <= 32 and RTR:
         _ext().run3(A, A2, x.contiguous(), out, state["ws"], state["cnt"], n)
         return out
     (_ext().run2 if V6 and m <= 32 else _ext().run)(A, A2 if A2 is not None else state["none"], x.contiguous(), out, state["ws"], state["cnt"], n)
