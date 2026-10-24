@@ -50,6 +50,9 @@ CUDA = r"""
 #define NTM 4
 #define SCR 1024
 #define KSM 4
+#ifndef KSF
+#define KSF 0
+#endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define TMA 1
 #else
@@ -327,7 +330,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     int mx = c;
 #pragma unroll
     for (int o = 16; o; o >>= 1) mx = max(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    if (lane == 0) { sm->na = __popc(m); sm->maxc = mx; sm->ks = (small && mx <= 16) ? 4 : 1; }
+    if (lane == 0) { sm->na = __popc(m); sm->maxc = mx; const int tw = __popc(m) * (T1E + T2E) / (int)(gridDim.x * WPC / 16);  // tiles per 16 warps
+      sm->ks = (small && mx <= 16) ? (KSF ? KSF : (tw < 32 ? 4 : (tw < 96 ? 2 : 1))) : 1; }
   }
   __syncthreads();
   for (int i = tid; i < R; i += blockDim.x) { unsigned e = lid[i]; if (e < NLOC) list[atomicAdd(&sm->fill[e], 1)] = i; }
