@@ -60,6 +60,9 @@ CUDA = r"""
 #ifndef EARLYREL
 #define EARLYREL 1
 #endif
+#ifndef LA3
+#define LA3 0
+#endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define TMA 1
 #else
@@ -124,7 +127,12 @@ struct Ctx {
   const P* p; Sm* sm; const uint16_t* list; uint32_t ring, bars; int lane, N1, N, gi, gj, ks;
   int q; unsigned long long wcyc; int ev, gw;
   int pi, pp, ps;  // producer: group tile index, pass, stage
-  __device__ __forceinline__ int tid_of(int i) const { return ((volatile int*)sm->ids[gi])[i & 3]; }
+  // tile of the group's i-th item; slots carry (i & 2047) << 20 so a reader never takes a stale tile
+  __device__ __forceinline__ int tid_of(int i) const {
+    int v;
+    do { v = ((volatile int*)sm->ids[gi])[i & 3]; } while ((v >> 20) != (i & 2047));
+    return v & 0xFFFFF;
+  }
   __device__ __forceinline__ void item(int u, int& g2, int& e, int& mt) const {
     if (u < N1) { g2 = 0; e = sm->act[u >> 9]; mt = u & 511; }
     else { int v = u - N1; g2 = 1; e = sm->act[v >> 8]; mt = v & 255; }
@@ -376,7 +384,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   const bool lead = C.gj == 0 && lane == 0;
   // the first 3 tiles of each group are static (no contended start-up atomics); the queue hands out the rest
   const int NG = gridDim.x * (WPC / ks), ggi = blockIdx.x * (WPC / ks) + C.gi;
-  if (lead) { sm->ids[C.gi][0] = ggi; sm->ids[C.gi][1] = NG + ggi; sm->ids[C.gi][2] = 2 * NG + ggi; }
+  if (lead) { sm->ids[C.gi][0] = ggi; sm->ids[C.gi][1] = (NG + ggi) | (1 << 20); sm->ids[C.gi][2] = -1; sm->ids[C.gi][3] = -1; }
   __syncthreads();
 #ifdef PROF
   PSET(1, gtime());
@@ -393,6 +401,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     // tile for i + 3 (minus 3 NG), consumed only after this tile. Plain asm: atomicAdd gets warp-aggregated into an
     // atomic + shfl, and the shfl would wait for the (contended) atomic right here.
     if (lead) asm volatile("atom.global.inc.u32 %0, [%1], 2147483647;\n" : "=r"(nxt) : "l"(p.ctr + QI) : "memory");
+
     int g2, e, mt; C.item(u, g2, e, mt);
     const int cnt = sm->cnt[e], np = (cnt + 8 * NTM - 1) / (8 * NTM);
     PEVC(p, gw, lane, C.ev, 11);
@@ -423,7 +432,8 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       __syncwarp();
       if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : 64 + e * 4 + mt / (T1E / 4))) : "memory");
     }
-    if (lead) ((volatile int*)sm->ids[C.gi])[(i + 3) & 3] = nxt + 3 * NG;  // volatile: stays after the tile (the atomic's latency hides behind it)
+    // tile for item i + 2, published after this tile: the atomic's latency hides behind it; readers check the tag
+    if (lead) ((volatile int*)sm->ids[C.gi])[(i + 2) & 3] = (nxt + 2 * NG) | (((i + 2) & 2047) << 20);
     __syncwarp();
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);

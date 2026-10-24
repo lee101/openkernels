@@ -1682,6 +1682,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   if (rank < 0) return;
   if (tid == 0) { int v; do { asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.cnt + b) : "memory"); if (v < p.NS) __nanosleep(32); } while (v < p.NS); }
   __syncthreads();
+  PT(7);
   __threadfence();
   asm volatile("cp.async.wait_all;\n" ::: "memory");
   float* xs = (float*)smem;  // [16 (rl, kg)][64] weighted O, [16] sums, [16] max
@@ -1899,8 +1900,8 @@ def _diag(dev):
             t0 = min(r[0] for r in P)
             col = lambda k: [(r[k] - t0) / 1e3 for r in P if r[k]]
             mx = lambda k: max(col(k)) if col(k) else -1
-            print("FDIAG win %d B %d NS %d: start max %.1f prolog %.1f sync %.1f loop-end p50 %.1f max %.1f merged %.1f last-end %.1f" % (
-                window, B, NS, mx(0), mx(1), mx(2), sorted(col(3))[len(col(3)) // 2], mx(3), mx(5), mx(6)), flush=True)
+            print("FDIAG win %d B %d NS %d: start max %.1f prolog %.1f sync %.1f loop-end p50 %.1f max %.1f cta-merge %.1f ranked %.1f all-in %.1f last-end %.1f" % (
+                window, B, NS, mx(0), mx(1), mx(2), sorted(col(3))[len(col(3)) // 2], mx(3), mx(4), mx(5), mx(7), mx(6)), flush=True)
     _mod, _DBG = keep
 
 
