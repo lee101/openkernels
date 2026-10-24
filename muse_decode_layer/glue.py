@@ -141,6 +141,7 @@ void rmsgain(torch::Tensor x, torch::Tensor g, torch::Tensor out) {
 }
 """
 _gmod = None
+MOE_SMALL_MAX = 2048 if torch.cuda.get_device_capability() == (9, 0) else 256  # above this many tokens: dequant + grouped GEMMs
 
 
 def _gext():
@@ -161,6 +162,7 @@ def prepare(weights):
     st = {k: weights[k] for k in ("qkv_gate", "o", "router", "router_bias", "pooler", "unpooler")}
     hi = weights["router"].to(torch.bfloat16)
     st["rA"], st["rA2"] = P__pack(hi), P__pack((weights["router"] - hi.float()).to(torch.bfloat16))
+    st["rhi"], st["rlo"] = hi.contiguous(), (weights["router"] - hi.float()).to(torch.bfloat16).contiguous()
     st["pws"] = torch.zeros((256 * 8192,), dtype=torch.float32, device=hi.device)
     st["pcnt"] = torch.zeros((8 * 512,), dtype=torch.int32, device=hi.device)
     st["router_bias"] = weights["router_bias"].float().contiguous()
@@ -170,9 +172,12 @@ def prepare(weights):
     st["a2"], st["b2"] = _coef(weights["ffn_residual_gate"])
     for k in ("pre_ffn_norm", "pre_expert_norm", "post_ffn_norm", "next_pre_attn_norm"):
         st["g_" + k] = (1.0 + weights[k].float()).contiguous()
+    for k in ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs"):  # raw NVFP4 for the prefill-sized MoE path
+        st["p" + k] = weights[k].contiguous() if k.endswith("gs") else weights[k]
+    st["g_post_expert_norm"] = (1.0 + weights["post_expert_norm"].float()).contiguous()
     st["moe"] = M_prepare({"w13": weights["w13"], "w13_sf": weights["w13_sf"], "w13_gs": weights["w13_gs"], "w2": weights["w2"],
                            "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"], "post_norm_w": weights["post_expert_norm"]})
-    _gext(); A__ext(); P__ext()
+    _gext(); A__ext(); P__ext(); M__ext(M_LARGE)
     torch.cuda.synchronize()
     if PFDIAG:
         _pfdiag(st)
@@ -231,6 +236,7 @@ def kernel_fn(data, st):
     s1 = torch.empty((T, 8192), dtype=torch.float32, device=dev)
     h = torch.empty((T, 8192), dtype=torch.bfloat16, device=dev)
     g.resid1(a, data["stream"], st["a1"], st["b1"], st["g_pre_ffn_norm"], s1, h)
+    big = T > MOE_SMALL_MAX
     lg = torch.empty((T, 256), dtype=torch.float32, device=dev)
     ids = torch.empty((T, 8), dtype=torch.int32, device=dev)
     loc = torch.empty_like(ids)
@@ -238,18 +244,29 @@ def kernel_fn(data, st):
     cur, side = torch.cuda.current_stream(), st["side"]
     side.wait_stream(cur)
     with torch.cuda.stream(side):  # router + routing overlap the pooler, as in SGLang
-        P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)
+        if T > 256:  # FP32 router as a BF16 hi + lo pair with FP32 accumulation
+            torch.mm(h, st["rhi"].T, out_dtype=torch.float32, out=lg)
+            lg += torch.mm(h, st["rlo"].T, out_dtype=torch.float32)
+        else:
+            P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)
         g.routing(lg, st["router_bias"], data["local_start"], ids, loc, tw)
     pr = h @ st["pooler"].T
     p = torch.empty_like(pr)
     g.rmsgain(pr, st["g_pre_expert_norm"], p)
     cur.wait_stream(side)
+    if big:
+        y = _moe_large(p, loc, tw, st)
+        f = y @ st["unpooler"].T
+        s2 = torch.empty_like(s1)
+        hid = torch.empty_like(h)
+        g.resid2(f, st["g_post_ffn_norm"], s1, st["a2"], st["b2"], st["g_next_pre_attn_norm"], s2, hid)
+        return hid, s2, ids
     ms = st["moe"]
     inter = torch.empty((T * 8, 4096), dtype=torch.bfloat16, device=dev)
     y2 = torch.empty((T * 8, 4096), dtype=torch.bfloat16, device=dev)
     ss = torch.empty((T * 8,), dtype=torch.float32, device=dev)
     y = torch.empty_like(p)
-    M__ext().moe(p, loc, tw, ms["w1"], ms["w2"], ms["g1"], ms["g2"], ms["nw"], inter, y2, ss, ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"])
+    M__ext(M_LARGE and T > 64).moe(p, loc, tw, ms["w1"], ms["w2"], ms["g1"], ms["g2"], ms["nw"], inter, y2, ss, ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"])
     f = y @ (st["unpool8"] if T <= 8 else st["unpooler"]).T
     s2 = torch.empty_like(s1)
     hid = torch.empty_like(h)
