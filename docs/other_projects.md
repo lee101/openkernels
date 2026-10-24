@@ -15,3 +15,18 @@
 - 9bc15ef h3-swap/control: boot-time preload thread
 - a758118 voice-enhancer: YuE weight hash warm-up overlaps job start (~27 s first render)
 - Next: keep YuE alive between batches; reuse ABC plan across seeds; fp8/vllm for YuE AR; cache text conditioning across chunks.
+
+## Kernel passes by main session (2026-10-24 evening, local 3090 Ti)
+
+### LLM decode — llama.cpp branch perf/decode-kernels (worktree ../llama.cpp-opt, base = llama.cpp-omni + its local patches)
+- gemma-4-E4B Q8_0 tg128: 120 (omni default) -> 128 (GGML_CUDA_GRAPH_OPT=1, env only) -> 131 t/s (+ commits below). Greedy output bit-identical (md5 over 200 tokens).
+- 81c1e4f06 rms_norm keeps rows <= 4*block in registers: fused norm 4.07->2.71 us, ~290 us/token.
+- e49c629b7 mmvq 2 rows/block at ncols_dst=1 (per-row sum order unchanged): fused FFN gate/up GEMV 73.4->63.0 us. 4 rows/block is worse.
+- Depth 4K/16K: +3% holds (125/119 vs 121/116). Attention is ~9% at 16K; decode is GEMV + launch-floor bound (~1235 kernels/token).
+- Next: fold quantize_q8_1 into the norm when it only feeds Q8 GEMVs; GRAPH_OPT into the prod drop-in after omniserve parity run.
+
+### Z-Image turbo DiT — stable-diffusion.cpp branch perf/dit-fusion (worktree ../sdcpp-opt, base = sd.cpp-prod incl. its uncommitted prod diffs)
+- DiT step 1024^2: 807 -> 758 (norm folds) -> 688 ms (rope_pe). 3-step sampling 2.61 -> 2.27 s (-13%). Image: rope_pe bit-identical; norm fold PSNR 36.7 dB vs prod (rounding only, visually identical).
+- z_image: (1+scale) and tanh(gate) folded into RMSNorm weights; ggml-cuda sinks RMS_NORM next to its MUL so RMS_NORM+MUL(+ADD) fuses (buffer-overlap guarded; GGML_CUDA_NO_NORM_SINK=1 disables).
+- ggml_rope_pe (GGML_OP_ROPE mode 128, CPU+CUDA): precomputed-table rope in one pass (SD_NO_ROPE_PE=1 disables). Qwen-Image uses the same Rope::attention, so ra2 gets it too.
+- Remaining per step: MMQ 359 ms (~47% of int8 peak), FA 181 ms (~60% of fp32-accum peak), elementwise ~150 ms (kv_scale scale/cast passes, silu-gate, quantize).
