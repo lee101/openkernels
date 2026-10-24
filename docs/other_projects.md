@@ -37,3 +37,9 @@
 - Flux::modulate = x*(1+scale)+shift; rope via ggml_rope_pe (shared with Z-Image); Wan VAE single-frame causal Conv3d -> Conv2d with last temporal tap (exact; also handles singleton-kt exports).
 - Remaining VAE: 2D im2col 0.92 s, cpy 0.6 s (DupUp3D permute conts), GEMM 0.36 s. omniserve has no env for conv-direct yet (OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT would need adding in backend_sd.c).
 - Note: sd.cpp-prod (Z-Image) and sd.cpp-master share one git repo; worktree branches must have unique names.
+
+### PROD DEPLOY 2026-10-24 09:18 UTC — ra2 (omniserve-native-qwen, 5090)
+- Lib: /nvme0n1-disk/models/omniserve-native/qwen-image-2.1/lib/libstable-diffusion-9bc7b35-cfgend-fusion.so (md5 b76bb585...), built from /nvme0n1-disk/code/sdcpp-ra2-fusion branch perf/ra2-fusion-20261024 (= live 9bc7b35-cfgend tree incl. its uncommitted cfgend/guidance + ggml local diffs, plus rope_pe, NORM fusion/sink, Flux modulate, Wan single-frame conv2d).
+- Validation on the 5090: sd-cli with live lib vs new lib, same seed: bit-identical PNGs (512^2 4 steps, 512^2 8 steps, 1024^2 8 steps). nsys kernel time 1024^2 8 steps: DiT 3959 -> 3517 ms, VAE 2396 -> 2047 ms (-12% total). Wall A/B too noisy under live load.
+- Drop-in /etc/systemd/system/omniserve-native-qwen.service.d/zzzzzzzzzz-fusion-20261024.conf. Rollback: delete it, daemon-reload, restart omniserve-native-qwen.
+- Post-deploy: active, process maps the fusion lib, /health 200, authenticated 512^2 generation 200 in 7.8 s.
