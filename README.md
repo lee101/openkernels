@@ -9,7 +9,7 @@ Kernel track closes 2026-11-04 23:59 PT. Scores are speedup over SGLang (geomean
 | muse_attention_decode | `submission_v32.py` | **1.502** | 2.37 | fdec (fused decode, per-warp cp.async rings, smem page-table rings) + attnw (wgmma verify/prefill) |
 | muse_moe_w4a16 | `submission_v9.py` | **1.371** (v12 1.360) | 2.33 | persistent kernel, NVFP4 dequant 11 ops/8 values, mma.sync, TMA rings, dynamic tile queue |
 | muse_decode_layer | `submission_v2.py` | **1.265** | 1.86 | composed from attention/moe/proj (`tools/build_dl.py`) + `glue.py` |
-| muse_bf16_proj | `submission_v9.py` | **1.116** (v8 1.079) | 1.45 | v8: cuBLAS for m 8-32 on qkv/o/pooler; v9 (working file): dedicated router kernel `rtr` |
+| muse_bf16_proj | `submission_v11.py` | **1.149** (v9 1.116) | 1.45 | v9 + router m>32 as one cuBLAS mm on [hi;lo]^T (N 512) + add (1.54x at m 128/256); `rtr` for m<=32 |
 | muse_prefill_layer | `submission_v1.py` | 0.80 | 1.70 | glue_pf.py; MoE at T~750 and 8-token-block attention dominate |
 
 `submission.py` in each directory is the working copy (may be ahead of the best judged file).
@@ -17,7 +17,7 @@ Kernel track closes 2026-11-04 23:59 PT. Scores are speedup over SGLang (geomean
 ## Per-shape weak spots (latest judge)
 - attention v31: verify full b16/b32 1.19x (172/326 µs vs decode full 117/210 µs on the same bytes) -> attnw step loop was CTA-barrier bound; working copy decouples the two KV-head warpgroups.
 - moe v12: bs1 48 µs vs SOL 11; bs256 455 µs (~1.2-1.7 TB/s). Ablations (H200): removing activation L2 traffic -20% at bs128/256, removing dequant -15%; both -35%. `moe_large` (CTA-shared activation tiles + wgmma RS) is correct but slower so far (WGL=False).
-- bf16_proj: our skinny kernel loses to cuBLAS at m 8-32 except router; router `rtr` kernel 13.3/14.9 -> 10.0/11.0 µs (m 16/32, pod incl. ~4 µs overhead).
+- bf16_proj: our skinny kernel loses to cuBLAS at m 8-32 except router (v10 `gv` smem-x + in-kernel reduction lost: x staging latency 2-5 us + reduction tail, see docs/ideas.md); router `rtr` kernel 13.3/14.9 -> 10.0/11.0 µs (m 16/32, pod incl. ~4 µs overhead).
 
 ## Layout
 - `muse_*/submission.py` working kernels (single-file, CUDA in Python strings); `submission_vN.py` judged snapshots; `profiles/` judge profiles (gitignored).

@@ -394,3 +394,12 @@ shows 64 B rows and non-contiguous runs.
 - w4wg2 (wgmma dequant-to-smem grouped GEMM) wrong (err 5.4) and 2x slower than v1; v1 is dequant-ALU bound (~1000 cycles/64-k step vs 270 memory budget). prmt-LUT dequant (DQL) written, untested.
 - RunPod pods also block GPU perf counters (ERR_NVGPUCTRPERM). daisy (sudo) is the only ncu box (sm_86).
 - Judge image ships DeepGEMM, CUTLASS, CuTe DSL, FlashInfer, TileLang, Triton: possible to launch a pod on lmsysorg/sglang:dev-muse-spark-open for exact env and to read their sm90 kernels.
+
+## 2026-10-25 H200 session (pod, ~27 min)
+- bf16_proj gv (submission_v10.py: x K-slice staged in smem, stream-K over (slice, tile, chunk), in-kernel reduction): judge 0.74-0.92, loses to skinny+fin. Globaltimer per-warp trace (bench/gvt.py, -DDBGT=1):
+  - x staging wait 2-5 us before first MMA (o m=1 xready p50 2.0, m=32 5.1) even with x bulk issued first and 160 KB/SM weight prefetch.
+  - in-kernel reduction tail: atomics (red.v4) or partial slots + last-arriver gather add 5-18 us (qkv m=32 end 36 vs streamend 19). fp32 L2 atomics at M=32 volume (S*M*N) dominate: no-atomic ablation o m=32 26.1 -> 11.5.
+  - pure stream (no atomics, no staging) ~= cuBLAS (pooler 25.2 vs 27.9 bench-us, qkv 16.0 vs 18.8).
+  - ncu unavailable in RunPod containers (ERR_NVGPUCTRPERM).
+- bf16_proj router m=256: one cuBLAS mm on [hi;lo]^T (N=512) + add: 11.4 vs 17.7 us (1.54x). Kept (RTRM=128).
+- attention verify b16 layer: 164 us; -DAW_NOLOAD 145, -DAW_NOMMA 154, both 139. ~85% is neither KV loads nor MMA: softmax/exp, page table, barriers, combine. b32: 313 / 277 / 294 / 264.
