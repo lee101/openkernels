@@ -385,3 +385,12 @@ shows 64 B rows and non-contiguous runs.
   `profiles/submission.<job>.json`.
 - If a change only wins the geomean but loses a high-weight load, it is not a
   win.
+
+## Status 2026-10-24 evening
+- Judge profiles (`<problem>/profiles/*.txt`) include a speed-of-light column. MoE v11/v12: bs1 41 µs vs SOL 11, bs256 452 vs SOL 109 → large-M path runs ~1.2-1.7 TB/s.
+- MoE large-M hypothesis: every 16-row tile re-reads its expert's activations from L2 each 64-k chunk → L2 traffic ≈ cnt/4 × weight bytes (≈3x at 13 tok/expert). Fix: share x across adjacent tiles (smem x ring per warp group, B via lds/ldmatrix; or wgmma RS with A = dequantized weights in registers, B = x in smem). Ablation macro NOBLD.
+- bf16_proj: cuBLAS beats our skinny kernel for m 8-32 on qkv/o/pooler/unpooler(m>8) → v8 dispatches those to torch. Router: dedicated `rtr` kernel (CTA = 16-row tile × 16 K-chunks, one-shot register loads, smem warp reduce, last-arriver across 8 K-splits; no atomics, no fin kernel).
+- torch fp32 matmul for the router is slow (35-55 µs at m 128/256): keep ours.
+- w4wg2 (wgmma dequant-to-smem grouped GEMM) wrong (err 5.4) and 2x slower than v1; v1 is dequant-ALU bound (~1000 cycles/64-k step vs 270 memory budget). prmt-LUT dequant (DQL) written, untested.
+- RunPod pods also block GPU perf counters (ERR_NVGPUCTRPERM). daisy (sudo) is the only ncu box (sm_86).
+- Judge image ships DeepGEMM, CUTLASS, CuTe DSL, FlashInfer, TileLang, Triton: possible to launch a pod on lmsysorg/sglang:dev-muse-spark-open for exact env and to read their sm90 kernels.

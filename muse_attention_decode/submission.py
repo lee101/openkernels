@@ -1064,15 +1064,16 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     __syncthreads();
   }
   const int* ptb = a.pt + (size_t)b * a.maxp;
-  const int lr = tid >> 4, part = (tid >> 3) & 1, c8 = tid & 7;  // copy: key i * 16 + lr, K or V, 16 B chunk
+  // each warpgroup streams only its head's halves (K and V, 4 x 16 B per row): no CTA-wide barrier in the loop
+  const int lr = wt >> 3, part = (wt >> 2) & 1, c8 = 4 * h + (wt & 3);  // copy: key i * 16 + lr, K or V, 16 B chunk
   auto rowof = [&](int kb, int i) -> int {
     const int kp = kb + i * 16 + lr, kc = min(kp, ke - 1);
     const int rr = PS1 ? __ldg(ptb + kc) : __ldg(ptb + kc / a.ps) * a.ps + kc % a.ps;
     return kp < ke ? rr : -1;
   };
-  auto issue = [&](int slot, int r0, int r1, int r2, int r3) {
+  auto issue = [&](int slot, int kbi, int r0, int r1, int r2, int r3) {
     const int rw[4] = {r0, r1, r2, r3};
-    if (__syncthreads_and(r0 == -1 && r1 == -1 && r2 == -1 && r3 == -1)) { asm volatile("cp.async.commit_group;\n"); return; }  // step past the range
+    if (kbi >= ke) { asm volatile("cp.async.commit_group;\n"); return; }  // step past the range
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       const int key = i * 16 + lr;
@@ -1082,27 +1083,26 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     }
     asm volatile("cp.async.commit_group;\n");
   };
-  // page size 1: entries stream into the smem ring (segment = 4 steps), lookups are shared-memory reads
-  auto ptseg = [&](int sg) {
-    const int idx = ks + sg * 256 + tid;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(ptr + (sg & 3) * 1024 + tid * 4), "l"(ptb + (idx < ke ? idx : 0)), "r"(idx < ke ? 4 : 0));
+  // page size 1: each warpgroup streams the entries of step x into slot x & 7 of its own ring (issued 7 steps ahead,
+  // read 4 ahead), so lookups are shared-memory reads
+  const uint32_t ptrh = ptr + h * 2048;
+  auto ptseg = [&](int x) {
+    const int idx = ks + x * 64 + wt;
+    if (wt < 64) asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(ptrh + (x & 7) * 256 + wt * 4), "l"(ptb + (idx < ke ? idx : 0)), "r"(idx < ke ? 4 : 0));
   };
   auto rowr = [&](int kb, int i) -> int {
     if (!PS1) return rowof(kb, i);
     const int kp = kb + i * 16 + lr;
     if (kp >= ke) return -1;
-    int v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(ptr + ((kp - ks) & 1023) * 4));
+    int v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(ptrh + ((kp - ks) & 511) * 4));
     return v;
   };
-  if (PS1) { ptseg(0); ptseg(1); ptseg(2); }  // joins the first KV group
+  if (PS1) for (int x = RSW; x < RSW + 3; x++) ptseg(x);  // joins the first KV group (read from step 0)
   const int nb = (ke - ks + 63) >> 6;
-  for (int j = 0; j < RSW - 1; j++) issue(j, rowof(ks + j * 64, 0), rowof(ks + j * 64, 1), rowof(ks + j * 64, 2), rowof(ks + j * 64, 3));
-  // page-table rows looked up 3 steps before their issue: the lookups' latency stays off the issue path
-  int rq[3][4];
+  for (int j = 0; j < RSW - 1; j++) issue(j, ks + j * 64, rowof(ks + j * 64, 0), rowof(ks + j * 64, 1), rowof(ks + j * 64, 2), rowof(ks + j * 64, 3));
+  int rq[4];  // rows of the next step to issue (RSW - 1 ahead), looked up a step early
 #pragma unroll
-  for (int d = 0; d < 3; d++)
-#pragma unroll
-    for (int i2 = 0; i2 < 4; i2++) rq[d][i2] = rowof(ks + (RSW - 1 + d) * 64, i2);
+  for (int i2 = 0; i2 < 4; i2++) rq[i2] = rowof(ks + (RSW - 1) * 64, i2);
   float o[32], mx[2] = {-INFINITY, -INFINITY}, ls[2] = {0.f, 0.f};
 #pragma unroll
   for (int i = 0; i < 32; i++) o[i] = 0.f;
@@ -1113,11 +1113,11 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   int pr = PFD > 0 && tid < 128 ? pfrow(ks + (RSW - 1 + PFD) * 64) : -1;
   for (int bi = 0, kb = ks; bi < nb; bi++, kb += 64) {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(RSW - 2));
-    __syncthreads();
-    if (PS1 && (bi & 3) == 0) ptseg((bi >> 2) + 3);  // joins this step's group; first read 6+ steps later
-    issue((bi + RSW - 1) % RSW, rq[0][0], rq[0][1], rq[0][2], rq[0][3]);
+    asm volatile("bar.sync %0, 128;\n" :: "r"(1 + h) : "memory");  // this warpgroup: step bi landed, slot of bi - 1 free
+    if (PS1) ptseg(bi + RSW + 3);  // joins this step's group (complete RSW - 1 steps later, read at step bi + 3)
+    issue((bi + RSW - 1) % RSW, kb + (RSW - 1) * 64, rq[0], rq[1], rq[2], rq[3]);
 #pragma unroll
-    for (int i2 = 0; i2 < 4; i2++) { rq[0][i2] = rq[1][i2]; rq[1][i2] = rq[2][i2]; rq[2][i2] = rowr(kb + (RSW + 2) * 64, i2); }
+    for (int i2 = 0; i2 < 4; i2++) rq[i2] = rowr(kb + RSW * 64, i2);
     if (PFD > 0 && tid < 128) {
 #if __CUDA_ARCH__ >= 900
       if (pr >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((tid < 64 ? a.kc : a.vc) + (size_t)pr * 128) : "memory");

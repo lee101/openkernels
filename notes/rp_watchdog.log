@@ -10,3 +10,6 @@ killat abmtz0309ahf7p [{"message": "pod not found to terminate", "path": ["podTe
 killat vc17ap07r328fy [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "vc17ap07r328fy"}}]
 killat osdsnhqavf6j0o [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "osdsnhqavf6j0o"}}]
 killat hgauqe18i2er3d [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "hgauqe18i2er3d"}}]
+killat fuvx2o8405rw99 [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "fuvx2o8405rw99"}}]
+killat 8oi06kgyo89zn3 [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "8oi06kgyo89zn3"}}]
+killat gw74ft9uqmx481 [{"message": "pod not found to terminate", "path": ["podTerminate"], "extensions": {"code": "POD_NOT_FOUND", "userId": "user_2guFlfwlNcGdXL1jgyklXL3Yv2a", "podId": "gw74ft9uqmx481"}}]

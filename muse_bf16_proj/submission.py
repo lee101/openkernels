@@ -414,10 +414,83 @@ void run2(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out,
   if (q.A2) { if (nt <= 1) go2<1, true>(q, st); else if (nt <= 2) go2<2, true>(q, st); else go2<4, true>(q, st); }
   else { if (nt <= 1) go2<1, false>(q, st); else if (nt <= 2) go2<2, false>(q, st); else go2<4, false>(q, st); }
 }
+// ---------------------------------------------------------------- router (N 256, K 8192, m <= 32)
+// CTA (ks, mt) owns row tile mt and 16 consecutive 64-wide K chunks, one per warp. Every warp loads its hi + lo A
+// fragments and its x chunk straight into registers in one round trip (64 KB per CTA in flight); the 16 warp partials
+// meet in smem and the last of the KS CTAs on a tile sums their partials (no atomics on the output, no second kernel).
+#define RPART (1 << 20)
+#define RCNT 2048
+__device__ __forceinline__ uint4 ldnc(const void* p) {
+  uint4 v; asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p)); return v;
+}
+template <int NT>
+__global__ void __launch_bounds__(512, 1) rtr(Q q) {
+  __shared__ float red[16 * 512];
+  __shared__ int last;
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
+  const int ks = blockIdx.x, mt = blockIdx.y, KS = gridDim.x, c = ks * 16 + w;
+  const uint8_t* ah = q.A + ((size_t)mt * q.KC + c) * 2048 + lane * 16;
+  const uint8_t* al = q.A2 + ((size_t)mt * q.KC + c) * 2048 + lane * 16;
+  uint4 a[4], h[4], b[NT][2];
+#pragma unroll
+  for (int j = 0; j < 4; j++) { a[j] = ldnc(ah + j * 512); h[j] = ldnc(al + j * 512); }
+#pragma unroll
+  for (int n = 0; n < NT; n++) {
+    const uint4* xr = (const uint4*)(q.x + (size_t)min(n * 8 + g, q.M - 1) * q.K + c * 64) + t * 2;
+    b[n][0] = __ldg(xr); b[n][1] = __ldg(xr + 1);
+  }
+  float acc[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; n++) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; j++)
+#pragma unroll
+    for (int n = 0; n < NT; n++) {
+      const uint32_t* bb = (const uint32_t*)&b[n][j >> 1];
+      mma(acc[n], a[j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+      mma(acc[n], h[j], bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+    }
+#pragma unroll
+  for (int n = 0; n < NT; n++) {
+    float* r = red + w * 512 + g * 32 + n * 8 + 2 * t;
+    *(float2*)r = make_float2(acc[n][0], acc[n][1]);
+    *(float2*)(r + 8 * 32) = make_float2(acc[n][2], acc[n][3]);
+  }
+  __syncthreads();
+  const int row = tid >> 5, tok = tid & 31;  // this thread's output (row of the tile, token)
+  float s = 0.f;
+  if (tok < NT * 8) {
+#pragma unroll
+    for (int ww = 0; ww < 16; ww++) s += red[ww * 512 + tid];
+  }
+  float* P = q.ws + RPART + (size_t)mt * KS * 512;
+  P[ks * 512 + tid] = s;
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) last = atomicAdd(q.cnt + RCNT + mt, 1) == KS - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  float tot = 0.f;
+  for (int k2 = 0; k2 < KS; k2++) tot += __ldcg(P + k2 * 512 + tid);
+  if (tok < q.M) ((float*)q.out)[(size_t)tok * q.N + mt * 16 + row] = tot;
+  if (tid == 0) q.cnt[RCNT + mt] = 0;
+}
+void run3(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t N) {
+  Q q;
+  q.A = (const uint8_t*)A.data_ptr(); q.A2 = (const uint8_t*)A2.data_ptr();
+  q.x = (const __nv_bfloat16*)x.data_ptr(); q.out = out.data_ptr(); q.ws = ws.data_ptr<float>(); q.cnt = cnt.data_ptr<int>();
+  q.M = x.size(0); q.K = x.size(1); q.N = (int)N; q.MT = (int)(N / 16); q.KC = q.K / 64; q.TB = 1; q.f32 = 1;
+  const dim3 grid(q.KC / 16, q.MT);
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int nt = (q.M + 7) / 8;
+  if (nt <= 1) rtr<1><<<grid, 512, 0, st>>>(q); else if (nt <= 2) rtr<2><<<grid, 512, 0, st>>>(q); else rtr<4><<<grid, 512, 0, st>>>(q);
+}
 """
 
 _mod = None
 _DBG = []
+RTR = True
 V6 = False  # deep per-CTA ring GEMV: slower than v5 on H200
 
 
@@ -431,9 +504,9 @@ def _ext():
     global _mod
     if _mod is None:
         wpc = next((int(d[6:]) for d in _DBG if d.startswith("-DWPC=")), 16 if _big() else 8)
-        _mod = load_inline("skinny_v7_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
-                           cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run2(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
-                           cuda_sources=CUDA, functions=["run", "run2"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + ([] if _big() else ["-DNSG=4"]) + [d for d in _DBG if not d.startswith("-DWPC=")],
+        _mod = load_inline("skinny_v9_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
+                           cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run2(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run3(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
+                           cuda_sources=CUDA, functions=["run", "run2", "run3"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + ([] if _big() else ["-DNSG=4"]) + [d for d in _DBG if not d.startswith("-DWPC=")],
                            verbose=False)
     return _mod
 
@@ -470,9 +543,12 @@ def kernel_fn(data, state):
     layer, n = cfg["layer"], cfg["n"]
     x = data["x"]
     m = x.shape[0]
-    if layer != "router" and m > 32:
-        return x @ state[layer + "_raw"][:n].T
+    if layer != "router" and (m > 1 or layer == "o") and not (layer == "unpooler" and m <= 8):
+        return x @ state[layer + "_raw"][:n].T  # cuBLAS beats the skinny kernel here (judge v7: 0.45-0.9x)
     A, A2 = state[layer]
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
+    if layer == "router" and m <= 32 and RTR:
+        _ext().run3(A, A2, x.contiguous(), out, state["ws"], state["cnt"], n)
+        return out
     (_ext().run2 if V6 and m <= 32 else _ext().run)(A, A2 if A2 is not None else state["none"], x.contiguous(), out, state["ws"], state["cnt"], n)
     return out

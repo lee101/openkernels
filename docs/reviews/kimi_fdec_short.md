@@ -1,0 +1,3 @@
+Only the fragment through `issue` is visible; compute/merge diagnoses are provisional.
+
+1. **Short-window skeleton: highest gain, medium effort.** The ablation attributes `10.0-4.9 = 5.1 µs` (~9,200 cycles) to setup, plus `14.5-12.8 = 1.7 µs` to merge. The critical chain is `seq = p.seq[b]` → `ws/we` → `ptseg`/`ptb[...]` → KV addresses: up to three cold round trips, roughly 0.5–0.8 µs each. Fuse planning into the preceding producer: calculate split bounds and supply initial page entries, removing one dependent stage. Overlap the seq/RoPE wait with independent Q RMSNorm. `qraw` anddi: OpenPathsStreamFailed
