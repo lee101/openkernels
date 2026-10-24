@@ -1172,10 +1172,10 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     l += __shfl_xor_sync(0xffffffffu, l, 1);
     l += __shfl_xor_sync(0xffffffffu, l, 2);
     const int row = 16 * w + g + 8 * hh;
-    float* wo = a.wo + (it * a.rows + row) * D;
+    float* wo = a.wo + (it * 64 + row) * D;  // 64 rows per (block, head, split)
 #pragma unroll
     for (int j = 0; j < 8; j++) *(float2*)(wo + 8 * j + 2 * t) = make_float2(o[4 * j + 2 * hh], o[4 * j + 2 * hh + 1]);
-    if (t == 0) { a.wml[(it * a.rows + row) * 2] = mx[hh]; a.wml[(it * a.rows + row) * 2 + 1] = l; }
+    if (t == 0) { a.wml[(it * 64 + row) * 2] = mx[hh]; a.wml[(it * 64 + row) * 2 + 1] = l; }
   }
   if constexpr (MRG) {
     // the last min(8, nsplit) arrivers of a request merge its 128 rows (rank, rank + nm, ...); everyone else has arrived
@@ -1344,6 +1344,11 @@ __device__ __forceinline__ unsigned long long gtm() { unsigned long long t; asm 
 #define RBF 5
 #endif
 // RoPE angle pos * inv_freq[pair] in fp32 (as the reference), cos/sin after an exact double-precision reduction
+__device__ __forceinline__ void rope_cs2(float invf, int pos, float& sn, float& cs) {  // invf: this pair's frequency
+  const float ang = (float)pos * invf;
+  const double a = (double)ang, k = rint(a * 0.15915494309189535);
+  __sincosf((float)(a - k * 6.283185307179586), &sn, &cs);
+}
 __device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, float& sn, float& cs) {
   const float ang = (float)pos * invf[pair];
   const double a = (double)ang, k = rint(a * 0.15915494309189535);
@@ -1359,6 +1364,10 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   uint4 qraw[2][2];
 #pragma unroll
   for (int h = 0; h < 2; h++) { const uint4* qp = (const uint4*)(row0 + (h * 8 + g) * D + t * 16); qraw[h][0] = qp[0]; qraw[h][1] = qp[1]; }
+  float ivq[8], ivk[2];  // RoPE inverse frequencies this lane needs, fetched before the KV loads queue up
+#pragma unroll
+  for (int j = 0; j < 8; j++) ivq[j] = __ldg(p.invf + t * 8 + j);
+  ivk[0] = __ldg(p.invf + (lane & 15) * 2); ivk[1] = __ldg(p.invf + (lane & 15) * 2 + 1);
   uint2 kraw = make_uint2(0, 0), vraw = make_uint2(0, 0);
   if (w == 0) {
     const int h = lane >> 4, d0 = (lane & 15) * 4;
@@ -1422,7 +1431,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     if (p.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 4; i += 2) {
-        float sn, cs2; rope_cs(p.invf, seq, (d0 + i) >> 1, sn, cs2);
+        float sn, cs2; rope_cs2(ivk[i >> 1], seq, sn, cs2);
         const float e = k[i], o = k[i + 1];
         k[i] = e * cs2 - o * sn; k[i + 1] = e * sn + o * cs2;
       }
@@ -1459,7 +1468,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     if (p.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 16; i += 2) {
-        float sn, cs2; rope_cs(p.invf, seq, (t * 16 + i) >> 1, sn, cs2);
+        float sn, cs2; rope_cs2(ivq[i >> 1], seq, sn, cs2);
         const float e = x[i], o = x[i + 1];
         x[i] = e * cs2 - o * sn; x[i + 1] = e * sn + o * cs2;
       }
@@ -1782,7 +1791,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v25_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v27_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod

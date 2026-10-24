@@ -183,6 +183,7 @@ def prepare(weights):
                            "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"], "post_norm_w": weights["post_expert_norm"]})
     _gext(); A__ext(); P__ext(); M__ext(M_LARGE)
     torch.cuda.synchronize()
+    print("env torch", torch.__version__, "grouped_mm", hasattr(torch, "_grouped_mm"), "cap", torch.cuda.get_device_capability(), flush=True)
     if PFDIAG:
         _pfdiag(st)
     return st
@@ -224,6 +225,14 @@ def _pfdiag(st):
         print(f"PFDIAG pf {mode} pooler {nb >> 20}MB grid {grid} spin {sp}us: o {o:.1f}us pooler+router {rest:.1f}us", flush=True)
 
 
+def _mm32(a, b):
+    """bf16 GEMM with FP32 output (torch >= 2.8); exact FP32 GEMM on older torch"""
+    try:
+        return torch.mm(a, b, out_dtype=torch.float32)
+    except TypeError:
+        return a.float() @ b.float()
+
+
 def _proj(x, st, name, n):
     """x @ W[:n].T: the deep-ring GEMV up to 32 tokens, cuBLAS above"""
     T = x.shape[0]
@@ -262,8 +271,7 @@ def kernel_fn(data, st):
     side.wait_stream(cur)
     with torch.cuda.stream(side):  # router + routing overlap the pooler, as in SGLang
         if T > 256:  # FP32 router as a BF16 hi + lo pair with FP32 accumulation
-            torch.mm(h, st["rhi"].T, out_dtype=torch.float32, out=lg)
-            lg += torch.mm(h, st["rlo"].T, out_dtype=torch.float32)
+            lg.copy_(_mm32(h, st["rhi"].T)); lg += _mm32(h, st["rlo"].T)
         else:
             P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)
         g.routing(lg, st["router_bias"], data["local_start"], ids, loc, tw)
