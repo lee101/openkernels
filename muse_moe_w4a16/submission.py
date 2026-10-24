@@ -47,11 +47,18 @@ CUDA = r"""
 #define SPT 8
 #define T1E 512
 #define T2E 256
+#ifndef NTM
 #define NTM 4
+#endif
+#ifndef SCR
 #define SCR 1024
+#endif
 #define KSM 4
 #ifndef KSF
 #define KSF 0
+#endif
+#ifndef EARLYREL
+#define EARLYREL 1
 #endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define TMA 1
@@ -149,9 +156,17 @@ struct Ctx {
 #ifdef PROF
     wcyc += clock64() - c0;
 #endif
+#if !EARLYREL
     issue((q + S - 1) % S);
+#endif
     q++;
     return ring + slot * STG + lane * 16;
+  }
+  __device__ __forceinline__ void release() {  // stage q - 1 consumed: refill its slot now, before any epilogue
+#if EARLYREL
+    __syncwarp();
+    issue((q - 1) % S);
+#endif
   }
 };
 
@@ -220,6 +235,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
         }
       }
     }
+    C.release();
   }
 #ifdef PROF
   const long long ce0 = clock64();
@@ -295,6 +311,9 @@ template <int G2, int S>
 __device__ __forceinline__ bool dispatch(Ctx<S>& C, int nt, int e, int mt, int pass, int ti, int s0, int s1) {
   if (nt <= 1) return run<1, G2, S>(C, e, mt, pass, ti, s0, s1);
   if (nt <= 2) return run<2, G2, S>(C, e, mt, pass, ti, s0, s1);
+#if NTM >= 8
+  if (nt > 4) return run<8, G2, S>(C, e, mt, pass, ti, s0, s1);
+#endif
   return run<4, G2, S>(C, e, mt, pass, ti, s0, s1);
 }
 
@@ -348,7 +367,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   PSET(1, gtime());
 #endif
 #pragma unroll
-  for (int i = 0; i < S - 1; i++) C.issue(i);
+  for (int i = 0; i < S - 1 + EARLYREL; i++) C.issue(i);
   for (int i = 0;; i++) {
     const int u = C.tid_of(i);
     if (u >= C.N) break;
@@ -462,18 +481,27 @@ def _big():
     return sm >= 180000 if sm else (pr.major, pr.minor) in ((9, 0), (10, 0))
 
 
-def _ext():
-    global _mod
-    if _mod is None:
+_mod8 = None
+LARGE = True  # M > 64: 8 warps per SM with 4-stage rings and up to 64 tokens per pass (one dequant per stage)
+
+
+def _ext(large=False):
+    global _mod, _mod8
+    if (_mod8 if large else _mod) is None:
         big = _big()
         wpc, stg = (16, 2) if big else (8, 2)
+        extra = []
+        if large:
+            wpc, stg, extra = 8, (4 if big else 2), ["-DNTM=8", "-DSCR=2048"]
         for d in _DBG:
-            if d.startswith("-DCFG="): wpc, stg = map(int, d[6:].split("x"))
-        _mod = load_inline("moe_w4a16_v2_%d_%d%s" % (wpc, stg, "".join(_DBG).replace("-", "_").replace("=", "")),
-                           cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
-                           cuda_sources=CUDA, functions=["moe"],
-                           extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + [d for d in _DBG if not d.startswith("-DCFG=")], verbose=False)
-    return _mod
+            if d.startswith("-DCFG=") and not large: wpc, stg = map(int, d[6:].split("x"))
+        m = load_inline("moe_w4a16_v3_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),
+                        cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
+                        cuda_sources=CUDA, functions=["moe"],
+                        extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + extra + [d for d in _DBG if not d.startswith("-DCFG=")], verbose=False)
+        if large: _mod8 = m
+        else: _mod = m
+    return _mod8 if large else _mod
 
 
 def _place(word, code, pair, hi):
@@ -520,7 +548,7 @@ def prepare(weights):
     for e in range(E):
         w1[e] = _repack(weights["w13"][e], weights["w13_sf"][e], perm1)
         w2[e] = _repack(weights["w2"][e], weights["w2_sf"][e], perm2)
-    _ext()
+    _ext(); _ext(LARGE)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     st = {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
@@ -580,6 +608,6 @@ def kernel_fn(data, state):
     y = torch.empty((M * 8, 4096), dtype=torch.bfloat16, device=x.device)
     ss = torch.empty((M * 8,), dtype=torch.float32, device=x.device)
     out = torch.empty_like(x)
-    _ext().moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
-               state["tcnt"], state["ws"], out, data["config"]["local_start"], state["prof"])
+    _ext(LARGE and M > 64).moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
+                               state["tcnt"], state["ws"], out, data["config"]["local_start"], state["prof"])
     return out
