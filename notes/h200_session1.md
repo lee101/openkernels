@@ -28,3 +28,15 @@
 - v5 0.68 | ex2.approx 0.72 | verify one-wave grid 0.81 | SB=4 steps 0.82
 - verify bottleneck: F2FP e4m3->f16 4x redundant per CTA (~376us at b32) > HMMA (~145us); plan: FP8 mma (Q,P e4m3) or convert once
 - sliding shapes need a single fused launch (prep+attn+combine+gate) to approach leader (2.37x)
+
+# 2026-10-24 sessions 4-13 (judge checks)
+- attention: v17 wgmma verify 1.334 | v21 fused verify launch 1.361 (sl decode b1 1.56, b16 1.53, b32 1.23; full ~1.33-1.47; verify sl 1.40-1.47, full 1.16)
+  - mma.sync e4m3 is emulated on sm_90 (F2FP+HMMA): no gain; wgmma FP8 QK from raw ring + f16 PV (V converted) works
+  - L2 bulk prefetch ahead of the ring hurts badly; random 128B gathers ~2.5TB/s ceiling
+  - fused decode timeline: prologue 3.5-9us (dependent seq->ptb->KV chain, cold code), merge 3-6us dominate b1/b32 sliding
+  - cluster DSMEM merge: small gain at b1, terrible for B*NS>64 (GPC fragmentation -> second wave)
+- moe: v7 adaptive ks 1.356 | v8 early slot refill 1.350 | v9 large-M build (8 warps x 4 stages, NT<=8) 1.371 | v10 lookahead-3 1.306 (balance loss)
+  - inner loop streams 3.9TB/s steady; losses: ptxas warp-aggregated atomicAdd + shfl stalls on the queue atomic (use atom.inc asm), G1->G2 deps (per-quarter counters), startup
+- decode layer: v0 0.90 | v1 1.222
+- bf16_proj: v6 deep per-CTA ring GEMV 0.83 (worse than v5 0.94)
+- prefill: v0 failed on H200 (attnw partial layout rows; fixed), pod torch lacks _grouped_mm and mm(out_dtype) -> fallbacks
