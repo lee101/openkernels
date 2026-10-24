@@ -43,3 +43,9 @@
 - Validation on the 5090: sd-cli with live lib vs new lib, same seed: bit-identical PNGs (512^2 4 steps, 512^2 8 steps, 1024^2 8 steps). nsys kernel time 1024^2 8 steps: DiT 3959 -> 3517 ms, VAE 2396 -> 2047 ms (-12% total). Wall A/B too noisy under live load.
 - Drop-in /etc/systemd/system/omniserve-native-qwen.service.d/zzzzzzzzzz-fusion-20261024.conf. Rollback: delete it, daemon-reload, restart omniserve-native-qwen.
 - Post-deploy: active, process maps the fusion lib, /health 200, authenticated 512^2 generation 200 in 7.8 s.
+
+### PROD DEPLOY 2026-10-24 09:38 UTC — omniserve-native main gateway (5090): Z-Image lib + LLM ggml libs
+- Drop-in /etc/systemd/system/omniserve-native.service.d/zzzzzzzzzzzz-fusion-20261024.conf: OMNISERVE_NATIVE_SD_LIB=/nvme0n1-disk/code/omniserve-native-deploy/sd-20261024-fusion/libstable-diffusion.so (md5 ba1573d6...), LD_LIBRARY_PATH=/sdb-disk/code/llama.cpp-omniserve-opt/build/bin. Rollback: delete it, daemon-reload, restart omniserve-native.
+- Z-Image source /nvme0n1-disk/code/sdcpp-zimage-fusion branch perf/zimage-fusion-20261024 = exact sd-20261022-fuse recipe (md5-verified base) + adaLN fold, rope_pe, kv-scale folded flash attention. 5090 A/B: PSNR 39 dB, elementwise kernels ~1.9 s -> 0.63 s per 8-step image, ~15% less DiT kernel time.
+- LLM source /sdb-disk/code/llama.cpp-omniserve-opt branch perf/decode-kernels-20261024: rms_norm register rows + mmvq 2 rows/block; bit-identical (md5) on the 5090; mmvq FFN 41.4->36.8 us, down 15.8->12.0 us, rms_norm 3.79->1.78 us.
+- Live after restart: health 200 in 5 s; background 1024^2 s=8 gen median ~4.5 s -> ~3.5 s (no LoRA) / ~4.1 s (LoRA), all ok=1; chat 200, coherent.
