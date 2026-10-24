@@ -1,0 +1,12 @@
+{"config": "Accel-Sim dev (1c9cc83) + gpgpu-sim accel-sim dev (c24e8858), SM90_H200 gpgpusim.config + trace.config, clock 1980 MHz; traces: NVBit 1.8 on RTX 3090 Ti (sm_86)",
+ "cases": [
+  {"name": "stream read 128 MB, 264 CTAs, LDG.128", "sim_us": 32.59, "sim_TBps": 3.93, "h200_TBps": 4.2, "h200_src": "notes/h200_session1.md cuk bw"},
+  {"name": "random 256 B rows, 64 MB-ish (60.6 MB), 264x8 warps, 4-slot cp.async ring", "sim_us": 17.92, "sim_TBps": 3.38, "h200_TBps": [3.2, 3.4], "h200_src": "bench/gather.cu (8-slot ring)"},
+  {"name": "random 128 B rows", "sim_us": 17.28, "sim_TBps": 3.50, "h200_TBps": [2.9, 3.1]},
+  {"name": "random 64 B rows", "sim_us": 17.69, "sim_TBps": 3.42, "h200_TBps": [2.1, 2.4]},
+  {"name": "mma.sync m16n8k16 bf16, 264x8 warps x 200 iters x 4", "sim_us": 9.17, "sim_TF": 755, "h200_TF": 645},
+  {"name": "fdec<false> decode B16 sliding v38 (sm_86 build), raw trace", "sim_us": 318.59, "h200_kernel_us": 10.7},
+  {"name": "same, spinlock fast-forward", "sim_us": 22.74, "h200_kernel_us": 10.7},
+  {"name": "fdec<false> decode B32 sliding, raw trace", "sim_us": 229.13, "h200_kernel_us": 14.7},
+  {"name": "fdec<false> decode B1 full, raw trace", "sim_us": 84.81, "h200_kernel_us": 18.8}
+ ]}

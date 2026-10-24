@@ -1,0 +1,5323 @@
+{
+ "muse_attention_decode": {
+  "submission_v33.03a99006e29c4d02": {
+   "speedup": 1.5167562497604425,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 1 page=1": {
+     "sglang": 20.67,
+     "yours": 10.7,
+     "sol": 0.11,
+     "kernels": [
+      [
+       "void fdec<true>(F)",
+       9.9,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 1 page=1": {
+     "sglang": 31.17,
+     "yours": 22.73,
+     "sol": 4.27,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       21.2,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 16 page=1 spread=agentic": {
+     "sglang": 27.09,
+     "yours": 14.5,
+     "sol": 1.65,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       12.6,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 16 page=1 spread=agentic": {
+     "sglang": 200.4,
+     "yours": 116.62,
+     "sol": 63.18,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       117.0,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 32 page=1 spread=agentic": {
+     "sglang": 31.38,
+     "yours": 18.72,
+     "sol": 3.29,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       16.5,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 32 page=1 spread=agentic": {
+     "sglang": 384.74,
+     "yours": 209.31,
+     "sol": 126.35,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       211.6,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 1 page=1 q_len=8": {
+     "sglang": 22.96,
+     "yours": 16.38,
+     "sol": 0.12,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       13.7,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 1 page=1 q_len=8": {
+     "sglang": 36.62,
+     "yours": 26.66,
+     "sol": 4.28,
+     "kernels": [
+      [
+       "void attnw<true, false, false>(A, WF)",
+       15.0,
+       1
+      ],
+      [
+       "comb2(A, __nv_bfloat16 const*, __nv_bfloat16*, float)",
+       6.4,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       1.6,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 29.5,
+     "yours": 21.83,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       19.6,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 206.02,
+     "yours": 165.31,
+     "sol": 63.39,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       169.3,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 34.34,
+     "yours": 25.26,
+     "sol": 3.72,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       23.0,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 389.97,
+     "yours": 310.09,
+     "sol": 126.78,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       308.5,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v35.ee5f76ee07a1472b": {
+   "speedup": 1.5977810282104996,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 1 page=1": {
+     "sglang": 20.9,
+     "yours": 8.59,
+     "sol": 0.11,
+     "kernels": [
+      [
+       "void fdec<true>(F)",
+       7.9,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 1 page=1": {
+     "sglang": 31.44,
+     "yours": 21.47,
+     "sol": 4.27,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       19.0,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 16 page=1 spread=agentic": {
+     "sglang": 26.88,
+     "yours": 12.45,
+     "sol": 1.65,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       10.8,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 16 page=1 spread=agentic": {
+     "sglang": 201.84,
+     "yours": 114.03,
+     "sol": 63.18,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       114.8,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 32 page=1 spread=agentic": {
+     "sglang": 31.41,
+     "yours": 17.04,
+     "sol": 3.29,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       14.6,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 32 page=1 spread=agentic": {
+     "sglang": 384.62,
+     "yours": 206.07,
+     "sol": 126.35,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       207.6,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 1 page=1 q_len=8": {
+     "sglang": 23.26,
+     "yours": 16.42,
+     "sol": 0.12,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       13.7,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 1 page=1 q_len=8": {
+     "sglang": 36.51,
+     "yours": 26.01,
+     "sol": 4.28,
+     "kernels": [
+      [
+       "void attnw<true, false, false>(A, WF)",
+       14.6,
+       1
+      ],
+      [
+       "comb2(A, __nv_bfloat16 const*, __nv_bfloat16*, float)",
+       6.3,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       1.5,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 29.17,
+     "yours": 21.42,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       19.7,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 205.98,
+     "yours": 160.81,
+     "sol": 63.39,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       159.7,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 34.48,
+     "yours": 24.65,
+     "sol": 3.72,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       23.1,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 391.42,
+     "yours": 302.15,
+     "sol": 126.78,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       303.6,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v38.0b4b0d23980e4d6f": {
+   "speedup": 1.5992992225262197,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 1 page=1": {
+     "sglang": 20.32,
+     "yours": 8.9,
+     "sol": 0.11,
+     "kernels": [
+      [
+       "void fdec<true>(F)",
+       7.7,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 1 page=1": {
+     "sglang": 31.63,
+     "yours": 21.01,
+     "sol": 4.27,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       18.8,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 16 page=1 spread=agentic": {
+     "sglang": 26.86,
+     "yours": 12.56,
+     "sol": 1.65,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       10.7,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 16 page=1 spread=agentic": {
+     "sglang": 200.35,
+     "yours": 113.03,
+     "sol": 63.18,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       115.0,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=decode 32 page=1 spread=agentic": {
+     "sglang": 31.02,
+     "yours": 16.96,
+     "sol": 3.29,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       14.7,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=decode 32 page=1 spread=agentic": {
+     "sglang": 384.11,
+     "yours": 205.54,
+     "sol": 126.35,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       204.1,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 1 page=1 q_len=8": {
+     "sglang": 23.12,
+     "yours": 16.21,
+     "sol": 0.12,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       13.3,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 1 page=1 q_len=8": {
+     "sglang": 36.26,
+     "yours": 26.02,
+     "sol": 4.28,
+     "kernels": [
+      [
+       "void attnw<true, false, false>(A, WF)",
+       14.3,
+       1
+      ],
+      [
+       "comb2(A, __nv_bfloat16 const*, __nv_bfloat16*, float)",
+       6.5,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       1.5,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 28.9,
+     "yours": 21.42,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       19.7,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 205.46,
+     "yours": 156.92,
+     "sol": 63.39,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       156.6,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft heads=tp8 layer=sliding load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 34.51,
+     "yours": 24.73,
+     "sol": 3.72,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       22.9,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=coherent heads=tp8 layer=full load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 389.1,
+     "yours": 293.75,
+     "sol": 126.78,
+     "kernels": [
+      [
+       "void attnw<true, true, true>(A, WF)",
+       295.9,
+       1
+      ]
+     ]
+    }
+   }
+  }
+ },
+ "muse_moe_w4a16": {
+  "submission_v14.8b334cd0f95d4032": {
+   "speedup": 1.4004285218774821,
+   "cases": {
+    "bs=1 load=decode 1 sharding=ep8": {
+     "sglang": 77.06,
+     "yours": 54.38,
+     "sol": 11.42,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       63.6,
+       1
+      ]
+     ]
+    },
+    "bs=16 load=decode 16 sharding=ep8": {
+     "sglang": 188.21,
+     "yours": 133.52,
+     "sol": 52.52,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       86.5,
+       1
+      ]
+     ]
+    },
+    "bs=32 load=decode 32 sharding=ep8": {
+     "sglang": 207.76,
+     "yours": 179.69,
+     "sol": 70.76,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       206.1,
+       1
+      ]
+     ]
+    },
+    "bs=8 load=verify 1 sharding=ep8": {
+     "sglang": 141.87,
+     "yours": 101.0,
+     "sol": 37.32,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       84.3,
+       1
+      ]
+     ]
+    },
+    "bs=128 load=verify 16 sharding=ep8": {
+     "sglang": 465.34,
+     "yours": 301.85,
+     "sol": 101.34,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       311.9,
+       1
+      ]
+     ]
+    },
+    "bs=256 load=verify 32 sharding=ep8": {
+     "sglang": 620.7,
+     "yours": 411.51,
+     "sol": 108.94,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       376.5,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v17.6dd423683ce347ae": {
+   "speedup": 1.4184227241634324,
+   "cases": {
+    "bs=1 load=decode 1 sharding=ep8": {
+     "sglang": 77.15,
+     "yours": 52.43,
+     "sol": 11.42,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       52.7,
+       1
+      ]
+     ]
+    },
+    "bs=16 load=decode 16 sharding=ep8": {
+     "sglang": 194.91,
+     "yours": 136.2,
+     "sol": 52.52,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       114.8,
+       1
+      ]
+     ]
+    },
+    "bs=32 load=decode 32 sharding=ep8": {
+     "sglang": 207.31,
+     "yours": 174.92,
+     "sol": 70.76,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       151.5,
+       1
+      ]
+     ]
+    },
+    "bs=8 load=verify 1 sharding=ep8": {
+     "sglang": 151.47,
+     "yours": 105.5,
+     "sol": 37.32,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       89.8,
+       1
+      ]
+     ]
+    },
+    "bs=128 load=verify 16 sharding=ep8": {
+     "sglang": 468.91,
+     "yours": 302.15,
+     "sol": 101.34,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       295.9,
+       1
+      ]
+     ]
+    },
+    "bs=256 load=verify 32 sharding=ep8": {
+     "sglang": 621.49,
+     "yours": 424.36,
+     "sol": 108.94,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       430.6,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v18.db59e50a5db54996": {
+   "speedup": 1.3723538093391041,
+   "cases": {
+    "bs=1 load=decode 1 sharding=ep8": {
+     "sglang": 77.12,
+     "yours": 50.98,
+     "sol": 11.42,
+     "kernels": [
+      [
+       "void moe_sk<1>(P)",
+       46.3,
+       1
+      ]
+     ]
+    },
+    "bs=16 load=decode 16 sharding=ep8": {
+     "sglang": 194.91,
+     "yours": 138.08,
+     "sol": 52.52,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       138.7,
+       1
+      ]
+     ]
+    },
+    "bs=32 load=decode 32 sharding=ep8": {
+     "sglang": 204.91,
+     "yours": 174.85,
+     "sol": 70.76,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       143.0,
+       1
+      ]
+     ]
+    },
+    "bs=8 load=verify 1 sharding=ep8": {
+     "sglang": 149.33,
+     "yours": 128.76,
+     "sol": 37.32,
+     "kernels": [
+      [
+       "void moe_sk<1>(P)",
+       131.4,
+       1
+      ]
+     ]
+    },
+    "bs=128 load=verify 16 sharding=ep8": {
+     "sglang": 472.85,
+     "yours": 304.33,
+     "sol": 101.34,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       303.8,
+       1
+      ]
+     ]
+    },
+    "bs=256 load=verify 32 sharding=ep8": {
+     "sglang": 637.95,
+     "yours": 430.64,
+     "sol": 108.94,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       602.8,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v20.b107851f0b2d44d1": {
+   "speedup": 1.3330951500320405,
+   "cases": {
+    "bs=1 load=decode 1 sharding=ep8": {
+     "sglang": 76.58,
+     "yours": 61.17,
+     "sol": 11.42,
+     "kernels": [
+      [
+       "void moe_sk<1>(P)",
+       66.7,
+       1
+      ]
+     ]
+    },
+    "bs=16 load=decode 16 sharding=ep8": {
+     "sglang": 188.19,
+     "yours": 134.32,
+     "sol": 52.52,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       150.4,
+       1
+      ]
+     ]
+    },
+    "bs=32 load=decode 32 sharding=ep8": {
+     "sglang": 209.73,
+     "yours": 176.95,
+     "sol": 70.76,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       183.5,
+       1
+      ]
+     ]
+    },
+    "bs=8 load=verify 1 sharding=ep8": {
+     "sglang": 150.7,
+     "yours": 129.2,
+     "sol": 37.32,
+     "kernels": [
+      [
+       "void moe_sk<1>(P)",
+       149.4,
+       1
+      ]
+     ]
+    },
+    "bs=128 load=verify 16 sharding=ep8": {
+     "sglang": 477.18,
+     "yours": 306.15,
+     "sol": 101.34,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       286.1,
+       1
+      ]
+     ]
+    },
+    "bs=256 load=verify 32 sharding=ep8": {
+     "sglang": 619.3,
+     "yours": 417.0,
+     "sol": 108.94,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       384.2,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v9.fc1f251f020e47e0": {
+   "speedup": 1.3711041617034434,
+   "cases": {
+    "bs=1 load=decode 1 sharding=ep8": {
+     "sglang": 77.49,
+     "yours": 54.4,
+     "sol": 11.42,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       54.7,
+       1
+      ]
+     ]
+    },
+    "bs=16 load=decode 16 sharding=ep8": {
+     "sglang": 186.22,
+     "yours": 132.41,
+     "sol": 52.52,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       136.4,
+       1
+      ]
+     ]
+    },
+    "bs=32 load=decode 32 sharding=ep8": {
+     "sglang": 206.42,
+     "yours": 172.51,
+     "sol": 70.76,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       134.9,
+       1
+      ]
+     ]
+    },
+    "bs=8 load=verify 1 sharding=ep8": {
+     "sglang": 142.5,
+     "yours": 100.1,
+     "sol": 37.32,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       115.9,
+       1
+      ]
+     ]
+    },
+    "bs=128 load=verify 16 sharding=ep8": {
+     "sglang": 456.1,
+     "yours": 310.9,
+     "sol": 101.34,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       335.5,
+       1
+      ]
+     ]
+    },
+    "bs=256 load=verify 32 sharding=ep8": {
+     "sglang": 617.07,
+     "yours": 464.96,
+     "sol": 108.94,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       594.0,
+       1
+      ]
+     ]
+    }
+   }
+  }
+ },
+ "muse_bf16_proj": {
+  "submission_v10.0ae4416705204aee": {
+   "speedup": 0.9243916449992431,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 14.3,
+     "yours": 15.01,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       10.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.98,
+     "yours": 10.22,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       7.5,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 21.25,
+     "yours": 21.53,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       21.1,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 6.94,
+     "yours": 6.85,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       5.6,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.8,
+     "yours": 6.2,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 14.02,
+     "yours": 20.43,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       15.5,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 6.98,
+     "yours": 16.3,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       11.0,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 21.63,
+     "yours": 25.35,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       25.8,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.56,
+     "yours": 25.21,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       24.8,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 14.82,
+     "yours": 6.19,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.2,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.02,
+     "yours": 25.9,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       21.3,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 7.1,
+     "yours": 18.56,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       14.8,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 21.81,
+     "yours": 33.92,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       33.5,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 18.99,
+     "yours": 35.46,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       34.4,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 15.33,
+     "yours": 7.29,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.7,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 14.3,
+     "yours": 17.18,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       12.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.62,
+     "yours": 12.68,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       8.9,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 21.28,
+     "yours": 22.57,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       23.1,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 6.85,
+     "yours": 9.28,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       8.4,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 25.81,
+     "yours": 5.39,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 17.52,
+     "yours": 17.35,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       13.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.1,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.65,
+     "yours": 7.74,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 24.66,
+     "yours": 25.07,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       24.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 19.81,
+     "yours": 20.0,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       20.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.1,
+     "yours": 15.42,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       14.9,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 20.29,
+     "yours": 19.99,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       19.9,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.3,
+     "yours": 9.3,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.1,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 30.94,
+     "yours": 30.92,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       30.6,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 24.22,
+     "yours": 24.11,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       24.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.47,
+     "yours": 11.33,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       2.0,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.7,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v10.674e7d8790ed46b2": {
+   "speedup": 0.7407726884505599,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 14.16,
+     "yours": 27.85,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       25.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.56,
+     "yours": 22.76,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       19.0,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 20.86,
+     "yours": 33.17,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       34.6,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 7.01,
+     "yours": 26.53,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       22.1,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.08,
+     "yours": 5.53,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.0,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 13.97,
+     "yours": 24.76,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       20.1,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 6.53,
+     "yours": 19.8,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       17.6,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 20.75,
+     "yours": 29.24,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       30.1,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.56,
+     "yours": 28.97,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       30.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 14.72,
+     "yours": 5.95,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.5,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.22,
+     "yours": 31.6,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       24.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 6.94,
+     "yours": 27.76,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       25.0,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 20.93,
+     "yours": 40.37,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       40.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 18.78,
+     "yours": 41.52,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       41.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 15.39,
+     "yours": 7.43,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.8,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 14.19,
+     "yours": 22.02,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       17.6,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.72,
+     "yours": 15.25,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       12.4,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 20.74,
+     "yours": 27.69,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       28.4,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 6.85,
+     "yours": 14.92,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       13.2,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 25.82,
+     "yours": 5.38,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.2,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 17.14,
+     "yours": 17.03,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       13.3,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.0,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.3,
+     "yours": 7.56,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       5.4,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 24.67,
+     "yours": 24.81,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.8,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 20.03,
+     "yours": 20.02,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       21.1,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.3,
+     "yours": 15.63,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       15.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 19.65,
+     "yours": 19.85,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       19.0,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.5,
+     "yours": 9.66,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.2,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 29.3,
+     "yours": 29.4,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       30.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 24.11,
+     "yours": 24.18,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       24.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.66,
+     "yours": 11.5,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       1.9,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.6,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v10.849b5511d0e74a36": {
+   "speedup": 0.7711598653806184,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 13.42,
+     "yours": 25.92,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       23.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.88,
+     "yours": 22.14,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       18.2,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 21.66,
+     "yours": 33.06,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       32.3,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 6.75,
+     "yours": 28.02,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       22.4,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.34,
+     "yours": 5.44,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.0,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 13.58,
+     "yours": 23.19,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       19.3,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 6.98,
+     "yours": 18.3,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       15.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 20.93,
+     "yours": 27.19,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       28.2,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.56,
+     "yours": 28.65,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       28.2,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 14.88,
+     "yours": 6.11,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.5,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.05,
+     "yours": 28.73,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       23.2,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 6.88,
+     "yours": 26.07,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       23.4,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 21.79,
+     "yours": 36.08,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       36.9,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 19.01,
+     "yours": 37.62,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       38.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 15.22,
+     "yours": 7.04,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.8,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 13.66,
+     "yours": 20.35,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       17.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.72,
+     "yours": 14.42,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       11.2,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 21.12,
+     "yours": 26.15,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       26.5,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 7.01,
+     "yours": 15.09,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       12.2,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 26.02,
+     "yours": 5.55,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 17.02,
+     "yours": 17.14,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       13.2,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.0,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.42,
+     "yours": 7.28,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       5.4,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 25.78,
+     "yours": 25.69,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.2,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 19.78,
+     "yours": 19.85,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       20.4,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.29,
+     "yours": 15.41,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       15.0,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 19.73,
+     "yours": 19.32,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       19.4,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.39,
+     "yours": 9.33,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.2,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 28.64,
+     "yours": 28.76,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       29.4,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 24.22,
+     "yours": 24.06,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       25.1,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.82,
+     "yours": 11.42,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.3,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       2.0,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.7,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v10.863bb5937d904c23": {
+   "speedup": 0.8982104652415932,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 14.0,
+     "yours": 14.38,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       10.2,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.8,
+     "yours": 9.57,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       7.5,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 21.31,
+     "yours": 21.19,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       20.4,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 6.67,
+     "yours": 6.58,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       5.6,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.56,
+     "yours": 5.93,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 13.74,
+     "yours": 20.85,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       16.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 6.53,
+     "yours": 16.06,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       11.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 21.54,
+     "yours": 25.03,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       25.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.46,
+     "yours": 24.87,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "void gv<2, 2, 2>(Q, int, int, int)",
+       26.0,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 14.48,
+     "yours": 5.83,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.6,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.18,
+     "yours": 30.24,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       24.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 6.78,
+     "yours": 23.43,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       17.6,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 21.81,
+     "yours": 42.5,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       43.3,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 18.82,
+     "yours": 42.67,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "void gv<4, 2, 2>(Q, int, int, int)",
+       41.0,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 14.98,
+     "yours": 7.04,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.8,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 13.89,
+     "yours": 16.75,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       13.5,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.56,
+     "yours": 12.3,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       9.7,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 21.2,
+     "yours": 22.29,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       23.3,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 6.91,
+     "yours": 9.25,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "void gv<1, 2, 2>(Q, int, int, int)",
+       8.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 26.08,
+     "yours": 5.58,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 17.07,
+     "yours": 16.98,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       13.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.0,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.23,
+     "yours": 7.24,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 24.7,
+     "yours": 25.06,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 19.65,
+     "yours": 19.81,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       20.1,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.06,
+     "yours": 15.45,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       14.8,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 19.7,
+     "yours": 19.76,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       19.6,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.17,
+     "yours": 9.17,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.0,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 30.88,
+     "yours": 30.75,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       31.3,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 24.19,
+     "yours": 24.24,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       25.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.5,
+     "yours": 11.24,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.2,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       2.0,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.7,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v11.b60ef1b01ae64080": {
+   "speedup": 1.1488047614391637,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 14.38,
+     "yours": 13.47,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       10.0,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.1,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.8,
+     "yours": 6.78,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       5.2,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 21.02,
+     "yours": 20.49,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       18.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       13.0,
+       1
+      ]
+     ],
+     "busy": 19.9
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 6.78,
+     "yours": 5.77,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       3.7,
+       1
+      ],
+      [
+       "fin(Q)",
+       0.9,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.4,
+     "yours": 5.48,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 14.24,
+     "yours": 13.87,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_4x1_v_bz_splitK_TNT",
+       8.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 7.04,
+     "yours": 6.9,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       4.5,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 21.57,
+     "yours": 21.3,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x16_64x11_4x1_v_bz_splitK_TNT",
+       19.5,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.8,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.5,
+     "yours": 18.34,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       18.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 15.12,
+     "yours": 5.99,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.34,
+     "yours": 13.99,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       9.2,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 6.78,
+     "yours": 6.78,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       4.8,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 22.19,
+     "yours": 22.07,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT",
+       20.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       2.0,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 18.51,
+     "yours": 18.53,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       18.6,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 15.49,
+     "yours": 6.93,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.1,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 14.11,
+     "yours": 14.15,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       9.6,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.9,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.82,
+     "yours": 6.89,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       4.1,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 21.23,
+     "yours": 21.38,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       19.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.7,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 6.94,
+     "yours": 7.07,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       4.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.6,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 26.11,
+     "yours": 5.66,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.2,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 16.96,
+     "yours": 17.31,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       12.6,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.0,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.54,
+     "yours": 7.66,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 24.82,
+     "yours": 24.86,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.1,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 19.84,
+     "yours": 19.99,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       20.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.59,
+     "yours": 10.66,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x32_64x16_1x2_h_bz_splitK_NNT",
+       5.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       1.6,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.6,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 19.55,
+     "yours": 19.6,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       19.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.76,
+     "yours": 9.87,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.5,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 30.9,
+     "yours": 30.72,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       29.1,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 23.94,
+     "yours": 24.14,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       24.9,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.6,
+     "yours": 11.43,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.3,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       2.0,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.6,
+       1
+      ]
+     ]
+    }
+   }
+  },
+  "submission_v12.961f63982741441d": {
+   "speedup": 1.1463194531153509,
+   "cases": {
+    "layer=qkv_gate load=decode 1 m=1": {
+     "sglang": 14.13,
+     "yours": 13.55,
+     "sol": 7.87,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       10.0,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.1,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 1 m=1": {
+     "sglang": 6.75,
+     "yours": 6.64,
+     "sol": 3.5,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       5.3,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 1 m=1": {
+     "sglang": 21.44,
+     "yours": 20.72,
+     "sol": 13.99,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       18.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       12.5,
+       1
+      ]
+     ],
+     "busy": 19.9
+    },
+    "layer=unpooler load=decode 1 m=1": {
+     "sglang": 7.04,
+     "yours": 6.16,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void skinny<1, false, 2, 2>(Q)",
+       3.5,
+       1
+      ],
+      [
+       "fin(Q)",
+       0.8,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 1 m=1": {
+     "sglang": 10.43,
+     "yours": 5.65,
+     "sol": 1.75,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.0,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 16 m=16": {
+     "sglang": 13.78,
+     "yours": 14.25,
+     "sol": 7.93,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x1_v_bz_splitK_TNN",
+       10.9,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.7,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 16 m=16": {
+     "sglang": 6.53,
+     "yours": 6.54,
+     "sol": 3.56,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       4.4,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 16 m=16": {
+     "sglang": 21.71,
+     "yours": 21.35,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT",
+       18.7,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.7,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 16 m=16": {
+     "sglang": 18.59,
+     "yours": 18.58,
+     "sol": 14.06,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       18.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 16 m=16": {
+     "sglang": 14.9,
+     "yours": 5.9,
+     "sol": 1.81,
+     "kernels": [
+      [
+       "void rtr<2>(Q)",
+       5.4,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=decode 32 m=32": {
+     "sglang": 14.19,
+     "yours": 14.3,
+     "sol": 8.0,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       9.8,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       2.1,
+       1
+      ]
+     ]
+    },
+    "layer=o load=decode 32 m=32": {
+     "sglang": 6.72,
+     "yours": 6.74,
+     "sol": 3.62,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       4.8,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=decode 32 m=32": {
+     "sglang": 21.5,
+     "yours": 20.9,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_splitK_TNT",
+       20.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.8,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=decode 32 m=32": {
+     "sglang": 18.75,
+     "yours": 18.87,
+     "sol": 14.14,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       19.2,
+       1
+      ]
+     ]
+    },
+    "layer=router load=decode 32 m=32": {
+     "sglang": 15.1,
+     "yours": 6.64,
+     "sol": 1.86,
+     "kernels": [
+      [
+       "void rtr<4>(Q)",
+       6.3,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 1 m=8": {
+     "sglang": 14.27,
+     "yours": 14.19,
+     "sol": 7.9,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       8.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.5,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 1 m=8": {
+     "sglang": 6.88,
+     "yours": 6.96,
+     "sol": 3.53,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       4.5,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 1 m=8": {
+     "sglang": 21.5,
+     "yours": 20.9,
+     "sol": 14.02,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+       18.5,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.6,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 1 m=8": {
+     "sglang": 7.23,
+     "yours": 7.26,
+     "sol": 1.76,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       4.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       1.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 1 m=8": {
+     "sglang": 26.02,
+     "yours": 5.34,
+     "sol": 1.78,
+     "kernels": [
+      [
+       "void rtr<1>(Q)",
+       5.2,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 16 m=128": {
+     "sglang": 17.02,
+     "yours": 16.72,
+     "sol": 8.42,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_96x128_64x7_4x1_v_bz_splitK_TNN",
+       12.9,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       2.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 16 m=128": {
+     "sglang": 7.55,
+     "yours": 7.97,
+     "sol": 3.99,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_160x64_64x7_4x2_h_bz_TNN",
+       6.1,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 16 m=128": {
+     "sglang": 24.93,
+     "yours": 25.18,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       24.3,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 16 m=128": {
+     "sglang": 19.98,
+     "yours": 20.11,
+     "sol": 14.64,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       20.5,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 16 m=128": {
+     "sglang": 16.37,
+     "yours": 10.81,
+     "sol": 2.21,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_4x2_h_bz_splitK_TNT",
+       5.1,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       2.1,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.6,
+       1
+      ]
+     ]
+    },
+    "layer=qkv_gate load=verify 32 m=256": {
+     "sglang": 19.52,
+     "yours": 20.02,
+     "sol": 9.77,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_144x128_64x6_1x2_h_bz_splitK_TNN",
+       17.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.8,
+       1
+      ]
+     ]
+    },
+    "layer=o load=verify 32 m=256": {
+     "sglang": 9.28,
+     "yours": 9.18,
+     "sol": 4.48,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       8.1,
+       1
+      ]
+     ]
+    },
+    "layer=pooler load=verify 32 m=256": {
+     "sglang": 31.02,
+     "yours": 31.19,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       31.9,
+       1
+      ]
+     ]
+    },
+    "layer=unpooler load=verify 32 m=256": {
+     "sglang": 24.58,
+     "yours": 24.47,
+     "sol": 17.37,
+     "kernels": [
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       25.3,
+       1
+      ]
+     ]
+    },
+    "layer=router load=verify 32 m=256": {
+     "sglang": 17.34,
+     "yours": 11.3,
+     "sol": 2.68,
+     "kernels": [
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT",
+       6.2,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       1.9,
+       1
+      ],
+      [
+       "void at::native::elementwise_kernel<128, 2, at::native::g...",
+       1.6,
+       1
+      ]
+     ]
+    }
+   }
+  }
+ },
+ "muse_decode_layer": {
+  "submission_v7.b2cd9db1bdef4771": {
+   "speedup": 1.3481651607099927,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1": {
+     "sglang": 171.55,
+     "yours": 126.47,
+     "sol": 40.02,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       53.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       31.8,
+       2
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.1,
+       2
+      ],
+      [
+       "void fdec<true>(F)",
+       8.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       7.2,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       6.1,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       5.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.1,
+       3
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.0,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.0,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1": {
+     "sglang": 183.63,
+     "yours": 140.39,
+     "sol": 44.18,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       52.1,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       32.5,
+       2
+      ],
+      [
+       "void fdec<false>(F)",
+       20.5,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.4,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       6.7,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       6.2,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       5.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.2,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.0,
+       3
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.0,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic": {
+     "sglang": 267.94,
+     "yours": 194.74,
+     "sol": 76.72,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       99.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       26.8,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x16_64x11_4x1_v_bz_splitK_TNT",
+       20.4,
+       1
+      ],
+      [
+       "void fdec<false>(F)",
+       12.4,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_4x1_v_bz_splitK_TNT",
+       12.3,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.9,
+       2
+      ],
+      [
+       "void skinny<2, true, 3, 1>(Q)",
+       8.0,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.9,
+       2
+      ],
+      [
+       "fin(Q)",
+       3.8,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.1,
+       1
+      ]
+     ],
+     "busy": 202.5
+    },
+    "batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic": {
+     "sglang": 444.69,
+     "yours": 295.57,
+     "sol": 137.46,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       120.6,
+       1
+      ],
+      [
+       "void fdec<false>(F)",
+       114.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       26.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x16_64x11_4x1_v_bz_splitK_TNT",
+       20.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_4x1_v_bz_splitK_TNT",
+       12.2,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.9,
+       2
+      ],
+      [
+       "void skinny<2, true, 3, 1>(Q)",
+       8.5,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "fin(Q)",
+       5.6,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.6,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.0,
+       1
+      ]
+     ],
+     "busy": 326.1
+    },
+    "batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic": {
+     "sglang": 261.22,
+     "yours": 239.92,
+     "sol": 84.51,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       127.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       26.4,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT",
+       20.4,
+       1
+      ],
+      [
+       "void fdec<false>(F)",
+       16.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       12.6,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       10.2,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       10.0,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       6.0,
+       1
+      ],
+      [
+       "fin(Q)",
+       5.5,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       4.0,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.2,
+       1
+      ]
+     ],
+     "busy": 238.1
+    },
+    "batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic": {
+     "sglang": 628.96,
+     "yours": 437.48,
+     "sol": 208.1,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       200.4,
+       1
+      ],
+      [
+       "moe_kernel(P)",
+       146.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       26.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT",
+       20.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       12.6,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       10.0,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.9,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       7.6,
+       1
+      ],
+      [
+       "fin(Q)",
+       6.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       4.2,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.4,
+       1
+      ]
+     ],
+     "busy": 440.3
+    },
+    "batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8": {
+     "sglang": 261.86,
+     "yours": 174.66,
+     "sol": 62.29,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       88.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       33.5,
+       2
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       16.3,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.7,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       6.9,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       6.0,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       6.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.4,
+       3
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.2,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.0,
+       1
+      ],
+      [
+       "fin(Q)",
+       2.0,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8": {
+     "sglang": 282.38,
+     "yours": 190.06,
+     "sol": 66.44,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       94.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       34.3,
+       2
+      ],
+      [
+       "void attnw<true, false, false>(A, WF)",
+       17.5,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.9,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       7.0,
+       1
+      ],
+      [
+       "comb2(A, __nv_bfloat16 const*, __nv_bfloat16*, float)",
+       6.7,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       6.2,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       6.0,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.4,
+       3
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.9,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 514.35,
+     "yours": 384.1,
+     "sol": 126.61,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       268.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       27.9,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       24.5,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       20.7,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       15.2,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       13.1,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       12.9,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.8,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       4.4,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 688.77,
+     "yours": 522.27,
+     "sol": 188.68,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       249.1,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       158.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       27.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       15.5,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       13.5,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       12.4,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.8,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       4.5,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 718.7,
+     "yours": 559.55,
+     "sol": 143.81,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       389.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       34.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       33.5,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       25.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       23.3,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       21.7,
+       2
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       19.7,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       7.4,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "fin(Q)",
+       5.4,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 1067.44,
+     "yours": 820.02,
+     "sol": 267.18,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       378.3,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       303.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       35.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       34.1,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       25.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       23.2,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       21.4,
+       2
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       21.2,
+       1
+      ],
+      [
+       "fin(Q)",
+       9.6,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       7.5,
+       1
+      ]
+     ],
+     "busy": 822.0
+    }
+   }
+  },
+  "submission_v9.12010740b1994c08": {
+   "speedup": 1.3349978783354046,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1": {
+     "sglang": 173.01,
+     "yours": 128.27,
+     "sol": 40.02,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       54.7,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       31.8,
+       2
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.0,
+       2
+      ],
+      [
+       "void fdec<true>(F)",
+       8.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       7.1,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       5.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.0,
+       3
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.0,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.8,
+       1
+      ],
+      [
+       "fin(Q)",
+       0.9,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1": {
+     "sglang": 182.27,
+     "yours": 141.65,
+     "sol": 44.18,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       51.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       32.0,
+       2
+      ],
+      [
+       "void fdec<false>(F)",
+       20.9,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       6.8,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       5.1,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.0,
+       3
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.8,
+       1
+      ],
+      [
+       "fin(Q)",
+       0.8,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic": {
+     "sglang": 259.07,
+     "yours": 191.53,
+     "sol": 76.72,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       94.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       27.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x16_64x11_4x1_v_bz_splitK_TNT",
+       19.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_4x1_v_bz_splitK_TNT",
+       12.4,
+       1
+      ],
+      [
+       "void fdec<false>(F)",
+       11.8,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.8,
+       2
+      ],
+      [
+       "void skinny<2, true, 3, 1>(Q)",
+       6.8,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.6,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.6,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       2.0,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic": {
+     "sglang": 442.05,
+     "yours": 293.56,
+     "sol": 137.46,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       112.1,
+       1
+      ],
+      [
+       "moe_kernel(P)",
+       93.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT",
+       26.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x16_64x11_4x1_v_bz_splitK_TNT",
+       19.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x16_64x16_4x1_v_bz_splitK_TNT",
+       12.1,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.8,
+       2
+      ],
+      [
+       "void skinny<2, true, 3, 1>(Q)",
+       6.9,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.6,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.9,
+       1
+      ],
+      [
+       "fin(Q)",
+       2.8,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic": {
+     "sglang": 270.69,
+     "yours": 259.65,
+     "sol": 84.51,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       162.4,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       26.7,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT",
+       21.3,
+       1
+      ],
+      [
+       "void fdec<false>(F)",
+       16.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       13.5,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       10.1,
+       2
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       8.7,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.8,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       4.0,
+       2
+      ],
+      [
+       "fin(Q)",
+       3.6,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic": {
+     "sglang": 627.34,
+     "yours": 449.47,
+     "sol": 208.1,
+     "kernels": [
+      [
+       "void fdec<false>(F)",
+       205.6,
+       1
+      ],
+      [
+       "moe_kernel(P)",
+       167.4,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT",
+       26.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT",
+       20.5,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT",
+       12.4,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       10.5,
+       2
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       8.7,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.8,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.8,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       4.1,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8": {
+     "sglang": 268.82,
+     "yours": 183.45,
+     "sol": 62.29,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       84.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       32.9,
+       2
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       14.8,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       6.9,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       6.3,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.5,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.3,
+       3
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.8,
+       1
+      ],
+      [
+       "fin(Q)",
+       1.8,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8": {
+     "sglang": 273.55,
+     "yours": 188.09,
+     "sol": 66.44,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       96.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_splitK_TNT",
+       34.4,
+       2
+      ],
+      [
+       "void attnw<true, false, false>(A, WF)",
+       16.9,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       9.7,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+       6.9,
+       1
+      ],
+      [
+       "comb2(A, __nv_bfloat16 const*, __nv_bfloat16*, float)",
+       6.7,
+       1
+      ],
+      [
+       "void skinny<1, true, 3, 1>(Q)",
+       6.3,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.6,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       5.3,
+       3
+      ],
+      [
+       "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT",
+       5.2,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       2.8,
+       1
+      ],
+      [
+       "fin(Q)",
+       2.1,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 507.95,
+     "yours": 378.89,
+     "sol": 126.61,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       242.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       28.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.0,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       20.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       15.3,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       12.9,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       12.6,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.8,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       4.7,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic": {
+     "sglang": 699.63,
+     "yours": 512.96,
+     "sol": 188.68,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       238.7,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       154.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       28.0,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT",
+       25.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN",
+       15.2,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       12.9,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       12.6,
+       2
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       4.5,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, __...",
+       3.2,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 698.72,
+     "yours": 538.53,
+     "sol": 143.81,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       402.1,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       34.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       32.2,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       23.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       23.2,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       21.6,
+       2
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       19.0,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       7.3,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.7,
+       1
+      ],
+      [
+       "fin(Q)",
+       4.6,
+       1
+      ]
+     ]
+    },
+    "batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic": {
+     "sglang": 1050.67,
+     "yours": 796.09,
+     "sol": 267.18,
+     "kernels": [
+      [
+       "moe_kernel(P)",
+       401.1,
+       1
+      ],
+      [
+       "void attnw<true, true, true>(A, WF)",
+       289.5,
+       1
+      ],
+      [
+       "void skinny<4, true, 3, 1>(Q)",
+       55.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT",
+       34.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+       34.3,
+       2
+      ],
+      [
+       "fin(Q)",
+       26.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN",
+       23.1,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       21.3,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       14.6,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       5.9,
+       1
+      ]
+     ],
+     "busy": 836.3
+    }
+   }
+  }
+ },
+ "muse_prefill_layer": {
+  "submission_v6.199ed1100c284c9d": {
+   "speedup": 1.0344013413863369,
+   "cases": {
+    "batch=1 ctx=80000 dist=soft layer=sliding load=turn 1 page=1 q_len=753": {
+     "sglang": 977.22,
+     "yours": 1017.11,
+     "sol": 256.95,
+     "kernels": [
+      [
+       "void sglang::device::marlin_moe::Marlin<__nv_bfloat16, 56...",
+       644.3,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN",
+       152.9,
+       3
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       62.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_112x128_64x7_1x2_h_bz_TNN",
+       38.5,
+       1
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       26.0,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x4_h_bz_splitK_TNT",
+       20.7,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       18.3,
+       1
+      ],
+      [
+       "void sglang::act_and_mul_kernel<__nv_bfloat16, (sglang::A...",
+       14.3,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       11.1,
+       1
+      ],
+      [
+       "_post_expert_norm_weighted_sum_kernel",
+       8.8,
+       1
+      ],
+      [
+       "void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...",
+       7.4,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       6.2,
+       1
+      ]
+     ]
+    },
+    "batch=1 ctx=80000 dist=soft layer=full load=turn 1 page=1 q_len=753": {
+     "sglang": 1397.62,
+     "yours": 1447.94,
+     "sol": 496.69,
+     "kernels": [
+      [
+       "void sglang::device::marlin_moe::Marlin<__nv_bfloat16, 56...",
+       642.9,
+       2
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       424.1,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN",
+       152.4,
+       3
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       62.1,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_112x128_64x7_1x2_h_bz_TNN",
+       39.6,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       25.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_64x64_64x13_2x4_h_bz_splitK_TNT",
+       22.2,
+       2
+      ],
+      [
+       "void sglang::act_and_mul_kernel<__nv_bfloat16, (sglang::A...",
+       14.0,
+       1
+      ],
+      [
+       "void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...",
+       11.4,
+       2
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       10.6,
+       1
+      ],
+      [
+       "_post_expert_norm_weighted_sum_kernel",
+       8.2,
+       1
+      ],
+      [
+       "void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...",
+       6.6,
+       1
+      ]
+     ],
+     "busy": 1453.1
+    },
+    "batch=4 ctx=80000 dist=soft layer=sliding load=turn 4 page=1 q_len=753": {
+     "sglang": 3282.64,
+     "yours": 3467.13,
+     "sol": 1036.28,
+     "kernels": [
+      [
+       "void sglang::device::marlin_moe::Marlin<__nv_bfloat16, 56...",
+       2093.4,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_256x152_64x4_1x2_h_bz_coopA_TNT",
+       321.8,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+       263.8,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       236.4,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x144_64x5_1x2_h_bz_coopB_TNT",
+       149.4,
+       1
+      ],
+      [
+       "route(float const*, float const*, int const*, int, int*, ...",
+       65.6,
+       1
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       64.1,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       61.1,
+       1
+      ],
+      [
+       "void sglang::act_and_mul_kernel<__nv_bfloat16, (sglang::A...",
+       52.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_64x104_64x10_4x2_h_bz_TNT",
+       50.4,
+       2
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       38.3,
+       1
+      ],
+      [
+       "_post_expert_norm_weighted_sum_kernel",
+       24.3,
+       1
+      ]
+     ],
+     "busy": 3444.8
+    },
+    "batch=4 ctx=80000 dist=soft layer=full load=turn 4 page=1 q_len=753": {
+     "sglang": 4877.04,
+     "yours": 5061.92,
+     "sol": 1992.42,
+     "kernels": [
+      [
+       "void sglang::device::marlin_moe::Marlin<__nv_bfloat16, 56...",
+       2327.4,
+       2
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       1636.7,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_256x152_64x4_1x2_h_bz_coopA_TNT",
+       319.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+       251.3,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       235.6,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x144_64x5_1x2_h_bz_coopB_TNT",
+       146.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_64x104_64x10_4x2_h_bz_TNT",
+       140.1,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       73.3,
+       1
+      ],
+      [
+       "void sglang::act_and_mul_kernel<__nv_bfloat16, (sglang::A...",
+       54.5,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       37.9,
+       1
+      ],
+      [
+       "_post_expert_norm_weighted_sum_kernel",
+       24.6,
+       1
+      ],
+      [
+       "void count_and_sort_expert_tokens_kernel<int>(int const*,...",
+       17.4,
+       1
+      ]
+     ],
+     "busy": 5252.7
+    },
+    "batch=1 ctx=0 dist=soft layer=full load=first turn page=1 q_len=16384": {
+     "sglang": 19046.32,
+     "yours": 15173.69,
+     "sol": 5518.43,
+     "kernels": [
+      [
+       "_ZN7cutlass13device_kernelIN2at4cuda6detail25enable_3x_ke...",
+       4841.4,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+       2481.6,
+       3
+      ],
+      [
+       "post(__nv_bfloat16 const*, int const*, int const*, float ...",
+       1735.1,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT",
+       1361.1,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       1279.4,
+       2
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       905.5,
+       1
+      ],
+      [
+       "deq(unsigned char const*, unsigned char const*, float con...",
+       739.8,
+       2
+      ],
+      [
+       "swiglu(__nv_bfloat16 const*, int const*, __nv_bfloat16*)",
+       402.1,
+       1
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       355.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_TNN",
+       285.9,
+       2
+      ],
+      [
+       "tobf(float const*, __nv_bfloat16*, long long)",
+       202.3,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       198.7,
+       1
+      ]
+     ],
+     "busy": 15318.1
+    },
+    "batch=1 ctx=32768 dist=soft layer=sliding load=first turn page=1 q_len=16384": {
+     "sglang": 16408.86,
+     "yours": 13524.31,
+     "sol": 5663.35,
+     "kernels": [
+      [
+       "_ZN7cutlass13device_kernelIN2at4cuda6detail25enable_3x_ke...",
+       4025.7,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+       2474.1,
+       3
+      ],
+      [
+       "post(__nv_bfloat16 const*, int const*, int const*, float ...",
+       1471.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT",
+       1459.4,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       1283.5,
+       2
+      ],
+      [
+       "deq(unsigned char const*, unsigned char const*, float con...",
+       657.7,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       365.6,
+       1
+      ],
+      [
+       "swiglu(__nv_bfloat16 const*, int const*, __nv_bfloat16*)",
+       350.5,
+       1
+      ],
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       312.6,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_TNN",
+       301.0,
+       2
+      ],
+      [
+       "tobf(float const*, __nv_bfloat16*, long long)",
+       201.3,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       199.1,
+       1
+      ]
+     ],
+     "busy": 13489.1
+    },
+    "batch=1 ctx=32768 dist=soft layer=full load=first turn page=1 q_len=16384": {
+     "sglang": 21944.19,
+     "yours": 18618.62,
+     "sol": 7710.0,
+     "kernels": [
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       4498.1,
+       1
+      ],
+      [
+       "_ZN7cutlass13device_kernelIN2at4cuda6detail25enable_3x_ke...",
+       4375.7,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+       2468.1,
+       3
+      ],
+      [
+       "post(__nv_bfloat16 const*, int const*, int const*, float ...",
+       1603.3,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT",
+       1463.0,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       1278.4,
+       2
+      ],
+      [
+       "deq(unsigned char const*, unsigned char const*, float con...",
+       743.9,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       374.3,
+       1
+      ],
+      [
+       "swiglu(__nv_bfloat16 const*, int const*, __nv_bfloat16*)",
+       373.9,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_TNN",
+       311.8,
+       2
+      ],
+      [
+       "tobf(float const*, __nv_bfloat16*, long long)",
+       201.9,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       198.9,
+       1
+      ]
+     ],
+     "busy": 18276.2
+    },
+    "batch=1 ctx=65536 dist=soft layer=full load=first turn page=1 q_len=16384": {
+     "sglang": 25730.02,
+     "yours": 21995.44,
+     "sol": 9847.68,
+     "kernels": [
+      [
+       "void cutlass::device_kernel<flash::enable_sm90_or_later<f...",
+       8080.4,
+       1
+      ],
+      [
+       "_ZN7cutlass13device_kernelIN2at4cuda6detail25enable_3x_ke...",
+       4091.5,
+       2
+      ],
+      [
+       "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+       2472.8,
+       3
+      ],
+      [
+       "post(__nv_bfloat16 const*, int const*, int const*, float ...",
+       1463.8,
+       1
+      ],
+      [
+       "nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT",
+       1463.1,
+       1
+      ],
+      [
+       "resid(__nv_bfloat16 const*, int, float const*, float cons...",
+       1262.9,
+       2
+      ],
+      [
+       "deq(unsigned char const*, unsigned char const*, float con...",
+       784.3,
+       2
+      ],
+      [
+       "rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)",
+       361.4,
+       1
+      ],
+      [
+       "swiglu(__nv_bfloat16 const*, int const*, __nv_bfloat16*)",
+       347.2,
+       1
+      ],
+      [
+       "nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_TNN",
+       282.1,
+       2
+      ],
+      [
+       "tobf(float const*, __nv_bfloat16*, long long)",
+       201.9,
+       1
+      ],
+      [
+       "prep(__nv_bfloat16 const*, long const*, long const*, unsi...",
+       198.9,
+       1
+      ]
+     ],
+     "busy": 21414.8
+    }
+   }
+  }
+ }
+}

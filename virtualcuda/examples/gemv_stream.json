@@ -1,0 +1,6 @@
+{"name": "bf16 GEMV pooler m=1 (67 MB weights, 132 CTAs x 16 warps, 2-stage TMA ring)",
+ "code": 1000, "wfix": 2000,
+ "phases": [
+  {"name": "stream", "hbm": 67.1e6, "inflight": 147456, "issue": 5.6e6, "wcyc": 17000},
+  {"name": "reduce", "l2": 32768, "l2chain": 1, "syncs": 1}
+ ]}
