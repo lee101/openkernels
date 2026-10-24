@@ -7,7 +7,7 @@ import torch
 ap = argparse.ArgumentParser()
 ap.add_argument("dir"); ap.add_argument("-s", "--sub", default="submission.py"); ap.add_argument("-b", "--base", default=None)
 ap.add_argument("--seeds", type=int, default=3); ap.add_argument("--no-time", action="store_true"); ap.add_argument("--no-check", action="store_true")
-ap.add_argument("--only", default=None); ap.add_argument("--experts", type=int, default=0); ap.add_argument("--reps", type=int, default=50); ap.add_argument("--stress", type=int, default=0)
+ap.add_argument("--only", default=None); ap.add_argument("--experts", type=int, default=0); ap.add_argument("--reps", type=int, default=50); ap.add_argument("--stress", type=int, default=0); ap.add_argument("--kprof", action="store_true")
 a = ap.parse_args()
 D = Path(a.dir).resolve(); sys.path.insert(0, str(D))
 
@@ -77,7 +77,7 @@ if a.stress:  # judge-style: capture once, refresh inputs in place, replay, chec
         for r in range(a.stress):
             kw = args_of(c); kw["seed"] = 100000 + 7919 * r; fresh = ref.generate_input(**kw); fill(data, fresh)
             g.replay(); torch.cuda.synchronize()
-            ok, msg = check(data, out.clone())
+            ok, msg = check(data, tuple(o.clone() for o in out) if isinstance(out, tuple) else out.clone())
             if not ok: fails += 1; print(f"  STRESS FAIL {c['load']} rep {r}: {msg}")
         bad += fails; print(f"stress {c['load']:10} {a.stress - fails}/{a.stress} ok")
         del g, data, out
@@ -111,6 +111,15 @@ for c in benches:
     if NB: line += f" {NB.nbytes(data) / ms / 1e3:7.1f}GB/s"
     if gb: line += f"  base {st.median(tb):9.1f}us  x{st.median(r):.3f}"
     print(line)
+    if a.kprof:
+        from torch.profiler import profile, ProfilerActivity
+        sink.copy_(flush.sum()); torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as pr:
+            gs.replay(); torch.cuda.synchronize()
+        evs = [e for e in pr.events() if e.device_type.name == "CUDA"]
+        evs.sort(key=lambda e: e.time_range.start)
+        t0 = evs[0].time_range.start if evs else 0
+        for e in evs: print(f"    {(e.time_range.start - t0):8.1f} +{e.time_range.elapsed_us():7.1f}us  {e.name[:90]}")
     L = loads.setdefault(c["load"], [0.0, 0.0]); L[0] += ms * c["weight"]; L[1] += (st.median(tb) if gb else 0) * c["weight"]
     del gs, gb, data; torch.cuda.empty_cache()
 if base:
