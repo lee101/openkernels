@@ -63,12 +63,12 @@ def reap():
         if not ttl or now > ttl: down(p["id"])
 
 
-def up(minutes, cloud, image):
+def up(minutes, cloud, image, gpu=GPU):
     budget(minutes)
     home = Path.home()
     pub = next((home / f".ssh/{k}.pub").read_text().strip() for k in ("id_ed25519", "id_rsa") if (home / f".ssh/{k}.pub").exists())
     ttl = int(time.time()) + minutes * 60
-    inp = {"name": f"{TAG}-{int(time.time())}", "imageName": image, "gpuTypeId": GPU, "cloudType": cloud, "gpuCount": 1,
+    inp = {"name": f"{TAG}-{int(time.time())}", "imageName": image, "gpuTypeId": gpu, "cloudType": cloud, "gpuCount": 1,
            "containerDiskInGb": 60, "volumeInGb": 0, "ports": "22/tcp", "startSsh": True,
            "env": [{"key": "PUBLIC_KEY", "value": pub}, {"key": "TTL_EPOCH", "value": str(ttl)}]}
     p = gql("mutation($i:PodFindAndDeployOnDemandInput){podFindAndDeployOnDemand(input:$i){id costPerHr}}", {"i": inp})["podFindAndDeployOnDemand"]
@@ -96,9 +96,9 @@ def killat(pid, ttl):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("cmd"); ap.add_argument("id", nargs="?"); ap.add_argument("--minutes", type=int, default=30)
-    ap.add_argument("--cloud", default="SECURE"); ap.add_argument("--image", default=IMAGE); ap.add_argument("ttl", nargs="?")
+    ap.add_argument("--cloud", default="SECURE"); ap.add_argument("--gpu", default=GPU); ap.add_argument("--image", default=IMAGE); ap.add_argument("ttl", nargs="?")
     a = ap.parse_args()
-    if a.cmd == "up": up(a.minutes, a.cloud, a.image)
+    if a.cmd == "up": up(a.minutes, a.cloud, a.image, a.gpu)
     elif a.cmd == "killat": killat(a.id, int(a.ttl))
     elif a.cmd == "ls": [print(p["id"], p["name"], p["desiredStatus"], p["costPerHr"], (p.get("runtime") or {}).get("uptimeInSeconds")) for p in pods()]
     elif a.cmd == "down": [down(p["id"]) for p in pods() if not a.id or p["id"] == a.id]

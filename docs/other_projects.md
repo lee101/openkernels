@@ -49,3 +49,8 @@
 - Z-Image source /nvme0n1-disk/code/sdcpp-zimage-fusion branch perf/zimage-fusion-20261024 = exact sd-20261022-fuse recipe (md5-verified base) + adaLN fold, rope_pe, kv-scale folded flash attention. 5090 A/B: PSNR 39 dB, elementwise kernels ~1.9 s -> 0.63 s per 8-step image, ~15% less DiT kernel time.
 - LLM source /sdb-disk/code/llama.cpp-omniserve-opt branch perf/decode-kernels-20261024: rms_norm register rows + mmvq 2 rows/block; bit-identical (md5) on the 5090; mmvq FFN 41.4->36.8 us, down 15.8->12.0 us, rms_norm 3.79->1.78 us.
 - Live after restart: health 200 in 5 s; background 1024^2 s=8 gen median ~4.5 s -> ~3.5 s (no LoRA) / ~4.1 s (LoRA), all ok=1; chat 200, coherent.
+
+## H3 video on sd.cpp vs the ComfyUI cog (2026-10-25)
+- Branch `perf/h3-20261025` (sdmaster-h3opt, ggml `perf/h3-fusion`): 25-29% faster per video at small sizes on the 3090 Ti (448x256x22, 640x352x39; DiT launches 8878 -> ~1400/step), bit-identical (or 55-58 dB with VAE flash attention).
+- Production setting on a RunPod RTX 5090 (same GPU class as the live `gpu-rtx5090` cog), 896x672x124 frames, 20 steps, res_multistep/simple, cfg 1, Q4_K_M DiT + Q4_K_M Qwen3-VL TE, --offload-to-cpu, --diffusion-fa: total 313 s (text encode 12.5 s, sampling 244 s = 12.2 s/step, VAE decode 54 s); with --cache-mode spectrum 207 s (sampling 141 s, decode 45 s).
+- Live ComfyUI cog (int8_convrot DiT, NVFP4 TE, Sol-Attn INT8 + Spectrum) on the 5090: 48-72 s generation (manifoldgen docs/old-anime-1920-results, same size/frames). sd.cpp is 3-5x slower at production size: attention-bound at ~73K tokens (ggml FA is fp16 mma; the cog uses INT8 attention + step caching), plus a 54 s VAE decode. Not deployed.
