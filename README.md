@@ -6,7 +6,7 @@ Kernel track closes 2026-11-04 23:59 PT. Scores are speedup over SGLang (geomean
 
 | problem | best file | speedup | leaderboard top | notes |
 |---|---|---|---|---|
-| muse_attention_decode | `submission_v35.py` | **1.598** (v33 1.517, v32 1.502) | 2.37 | v35: fdec CTA-merge partial stores conflict-free (-2 us every decode case); v33: attnw wgmma no longer serialized (runtime scale-d) |
+| muse_attention_decode | `submission_v38.py` | **1.599** (v35 1.598, v32 1.502) | 2.37 | v38: P row sums on the tensor core (ones wgmma); v35: fdec CTA-merge partial stores conflict-free (-2 us every decode case); v33: attnw wgmma no longer serialized (runtime scale-d) |
 | muse_moe_w4a16 | `submission_v17.py` | **1.418** (v14 1.400, v9 1.371) | 2.33 | v14: active experts heaviest-first in the tile queue; v17: red.release add instead of fence + atomic per tile; persistent kernel, NVFP4 dequant 11 ops/8 values, mma.sync, TMA rings, dynamic tile queue |
 | muse_decode_layer | `submission_v7.py` | **1.348** (v5 1.313, v2 1.265) | 1.86 | composed from attention v35 / moe working copy / proj v11 (`tools/build_dl.py`) + `glue.py` |
 | muse_bf16_proj | `submission_v11.py` | **1.149** (v9 1.116) | 1.45 | v9 + router m>32 as one cuBLAS mm on [hi;lo]^T (N 512) + add (1.54x at m 128/256); `rtr` for m<=32 |

@@ -914,6 +914,9 @@ __global__ void __launch_bounds__(128, MINB) attn9(A a) {
 #ifndef AW_Z
 #define AW_Z 1
 #endif
+#ifndef AW_MS
+#define AW_MS 1
+#endif
 #ifndef AW_LZ
 #define AW_LZ 1
 #endif
@@ -949,6 +952,13 @@ __device__ __forceinline__ void wg_rsz(float* d, uint32_t a0, uint32_t a1, uint3
 #if HAS_WG
   asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %37, 0;\nwgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 " WG_D ", {%32,%33,%34,%35}, %36, p, 1, 1, 1;\n}\n"
                : WG_S(d) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(db), "r"(sd));
+#endif
+}
+// row sums of P on the tensor core: P (registers, as for PV) x an all-ones B tile, m64n8k16 (every column = the sum)
+__device__ __forceinline__ void wg_rs8(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t db, int sd) {
+#if HAS_WG
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %9, 0;\nwgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(db), "r"(sd));
 #endif
 }
 __device__ __forceinline__ void wg_rs(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t db) {
@@ -1018,6 +1028,12 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   // Q (E4M3) as one 64-row x 128 B tile: warpgroup h's 64 B at byte 64 h, like the head halves of the raw K rows
   const uint32_t ring = sb, qs = sb + RSW * 16384, vf0 = qs + 8192 + h * (VDB ? 16384 : 8192);
   const uint32_t ptr = qs + 8192 + 2 * (VDB ? 16384 : 8192);  // page-table ring: 4 segments x 4 steps x 64 entries
+  const uint32_t ones = ptr + 4096;  // 1 KB of f16 1.0: B of the row-sum wgmma (any layout: every element is 1)
+#if AW_MS
+  for (int x = wt; x < 256; x += 128) asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(ones + x * 4), "r"(0x3C003C00u));
+  const uint64_t dOnes = (uint64_t)((ones & 0x3FFFF) >> 4) | ((uint64_t)(128 >> 4) << 16) | ((uint64_t)(256 >> 4) << 32);
+  float lacc[4];
+#endif
   if constexpr (!FUSE) {
 #pragma unroll
     for (int i = 0; i < 2; i++) {
@@ -1234,12 +1250,19 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
       const float2 sf = __half22float2(hs);
       ls[hh] = ls[hh] * scl[hh] + (sf.x + sf.y);
 #else
+#if AW_MS
+#pragma unroll
+      for (int j = 0; j < 8; j++)
+#pragma unroll
+        for (int e = 0; e < 2; e++) s[4 * j + 2 * hh + e] = ex2(fmaf(s[4 * j + 2 * hh + e], a.qk, -nmf));
+#else
       float sum = 0.f;
 #pragma unroll
       for (int j = 0; j < 8; j++)
 #pragma unroll
         for (int e = 0; e < 2; e++) { const float pv = ex2(fmaf(s[4 * j + 2 * hh + e], a.qk, -nmf)); s[4 * j + 2 * hh + e] = pv; sum += pv; }
       ls[hh] = ls[hh] * scl[hh] + sum;
+#endif
 #endif
     }
     const bool anyup = AW_LZ ? __any_sync(0xffffffffu, upd[0] | upd[1]) : true;
@@ -1248,6 +1271,9 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
       if (AW_LZ && !anyup) break;  // warp-uniform: no row of this warp moved its max
       o[4 * j] *= scl[0]; o[4 * j + 1] *= scl[0]; o[4 * j + 2] *= scl[1]; o[4 * j + 3] *= scl[1];
     }
+#if AW_MS
+    if (!AW_LZ || anyup) { lacc[0] *= scl[0]; lacc[1] *= scl[0]; lacc[2] *= scl[1]; lacc[3] *= scl[1]; }
+#endif
 #if !AW_H2
 #pragma unroll
     for (int i = 0; i < 16; i++) pa[i] = pk(s[2 * i], s[2 * i + 1]);
@@ -1263,6 +1289,9 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
 #else
       if (AW_Z && kc == 0) wg_rsz(o, pa[0], pa[1], pa[2], pa[3], gdesc(vf, WVL, WVS), bi > 0);
       else wg_rs(o, pa[4 * kc], pa[4 * kc + 1], pa[4 * kc + 2], pa[4 * kc + 3], gdesc(vf + kc * 2048, WVL, WVS));
+#if AW_MS
+      wg_rs8(lacc, pa[4 * kc], pa[4 * kc + 1], pa[4 * kc + 2], pa[4 * kc + 3], dOnes, kc > 0 || bi > 0);
+#endif
 #endif
     }
     wg_commit();
@@ -1278,12 +1307,19 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
 #pragma unroll
     for (int i = 0; i < 32; i++) o[i] = 0.f;
   }
+#if AW_MS
+  if (nb == 0) { lacc[0] = lacc[1] = lacc[2] = lacc[3] = 0.f; }
+#endif
   const size_t it = ((size_t)bq * a.hkv + h) * a.nsplit + sp;
 #pragma unroll
   for (int hh = 0; hh < 2; hh++) {
+#if AW_MS
+    const float l = lacc[2 * hh];  // full row sum (every column of the ones product)
+#else
     float l = ls[hh];
     l += __shfl_xor_sync(0xffffffffu, l, 1);
     l += __shfl_xor_sync(0xffffffffu, l, 2);
+#endif
     const int row = 16 * w + g + 8 * hh;
     float* wo = a.wo + (it * 64 + row) * D;  // 64 rows per (block, head, split)
 #pragma unroll
@@ -1975,7 +2011,7 @@ void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor 
     if (!o8) { cudaFuncSetAttribute(attn9<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm8); cudaFuncSetAttribute(attn9<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm8); o8 = true; }
     if (Q8) {
       a.qk = (float)(sm_scale * 1.4426950408889634 * qk_factor);
-      const int smw = RSW * 16384 + 8192 + (VDB ? 32768 : 16384) + 4096 + 1024;
+      const int smw = RSW * 16384 + 8192 + (VDB ? 32768 : 16384) + 4096 + 1024 + 1024;
       static bool ow = false;
       if (!ow) {
         cudaFuncSetAttribute(attnw<true, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smw); cudaFuncSetAttribute(attnw<false, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smw);
@@ -2038,7 +2074,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v36_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v38_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
