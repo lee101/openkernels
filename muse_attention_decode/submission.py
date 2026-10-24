@@ -1078,7 +1078,12 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   };
   const int nb = (ke - ks + 63) >> 6;
   for (int j = 0; j < RSW - 1; j++) issue(j, rowof(ks + j * 64, 0), rowof(ks + j * 64, 1), rowof(ks + j * 64, 2), rowof(ks + j * 64, 3));
-  int rn0 = rowof(ks + (RSW - 1) * 64, 0), rn1 = rowof(ks + (RSW - 1) * 64, 1), rn2 = rowof(ks + (RSW - 1) * 64, 2), rn3 = rowof(ks + (RSW - 1) * 64, 3);
+  // page-table rows looked up 3 steps before their issue: the lookups' latency stays off the issue path
+  int rq[3][4];
+#pragma unroll
+  for (int d = 0; d < 3; d++)
+#pragma unroll
+    for (int i2 = 0; i2 < 4; i2++) rq[d][i2] = rowof(ks + (RSW - 1 + d) * 64, i2);
   float o[32], mx[2] = {-INFINITY, -INFINITY}, ls[2] = {0.f, 0.f};
 #pragma unroll
   for (int i = 0; i < 32; i++) o[i] = 0.f;
@@ -1090,8 +1095,9 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   for (int bi = 0, kb = ks; bi < nb; bi++, kb += 64) {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(RSW - 2));
     __syncthreads();
-    issue((bi + RSW - 1) % RSW, rn0, rn1, rn2, rn3);
-    { const int nx = kb + RSW * 64; rn0 = rowof(nx, 0); rn1 = rowof(nx, 1); rn2 = rowof(nx, 2); rn3 = rowof(nx, 3); }
+    issue((bi + RSW - 1) % RSW, rq[0][0], rq[0][1], rq[0][2], rq[0][3]);
+#pragma unroll
+    for (int i2 = 0; i2 < 4; i2++) { rq[0][i2] = rq[1][i2]; rq[1][i2] = rq[2][i2]; rq[2][i2] = rowof(kb + (RSW + 2) * 64, i2); }
     if (PFD > 0 && tid < 128) {
 #if __CUDA_ARCH__ >= 900
       if (pr >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((tid < 64 ? a.kc : a.vc) + (size_t)pr * 128) : "memory");
@@ -1399,7 +1405,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   int rpro[RBF - 1];
 #pragma unroll
   for (int i = 0; i < RBF - 1; i++) rpro[i] = rowsfor(ws + i * 16);  // independent loads in flight together
-  int rnext = rowsfor(ws + (RBF - 1) * 16);
+  int rnext = rowsfor(ws + (RBF - 1) * 16), rn1 = rowsfor(ws + RBF * 16), rn2 = rowsfor(ws + (RBF + 1) * 16);  // 3 blocks ahead
 #pragma unroll
   for (int i = 0; i < RBF - 1; i++) issue(i, rpro[i], false);  // KV loads start before the query prologue
   if (w == 0) {  // new key: RMSNorm + RoPE, value as is; both quantized to E4M3
@@ -1490,9 +1496,8 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   for (int bi = 0, kb = ws; bi < nb; bi++, kb += 16) {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(RBF - 2));
     __syncwarp();
-    const int r2 = rowsfor(kb + RBF * 16);
     issue((bi + RBF - 1) % RBF, rnext, true);
-    rnext = r2;
+    rnext = rn1; rn1 = rn2; rn2 = rowsfor(kb + (RBF + 2) * 16);
     if (PFF > 0) {
 #if __CUDA_ARCH__ >= 900
       if (rpf >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((lane < 16 ? p.kc : p.vc) + (size_t)rpf * 128) : "memory");
@@ -1777,7 +1782,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v24_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v25_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
