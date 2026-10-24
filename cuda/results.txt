@@ -1,0 +1,52 @@
+# local 3090 Ti kerneless experiments
+# 2026-10-24T05:28:06Z
+NVIDIA GeForce RTX 3090 Ti, 8.6, 1860 MHz, 10501 MHz, 2 %, 108.12 W, 41
+
+gather R= 64 random  warps= 672   530.96 GB/s  (0.08 ms)
+gather R= 64 runs4   warps= 672   881.09 GB/s  (0.05 ms)
+gather R= 64 runs16  warps= 672   896.00 GB/s  (0.05 ms)
+gather R= 64 seq     warps= 672   814.83 GB/s  (0.05 ms)
+gather R=128 random  warps= 672   828.57 GB/s  (0.05 ms)
+gather R=128 runs4   warps= 672   877.71 GB/s  (0.05 ms)
+gather R=128 runs16  warps= 672   877.71 GB/s  (0.05 ms)
+gather R=128 seq     warps= 672   860.16 GB/s  (0.05 ms)
+gather R=256 random  warps= 672   864.48 GB/s  (0.05 ms)
+gather R=256 runs4   warps= 672   781.96 GB/s  (0.06 ms)
+gather R=256 runs16  warps= 672   796.44 GB/s  (0.06 ms)
+gather R=256 seq     warps= 672   796.91 GB/s  (0.06 ms)
+
+cvt mma        cp=0   2290.9 us   4805.97 Mops/s  (per warp-iter)
+cvt conv       cp=1  16444.3 us    669.54 Mops/s  (per warp-iter)
+cvt conv       cp=4  35594.2 us    309.32 Mops/s  (per warp-iter)
+cvt conv+mma   cp=1   5480.4 us   2008.97 Mops/s  (per warp-iter)
+cvt conv+mma   cp=2  12013.6 us    916.47 Mops/s  (per warp-iter)
+cvt conv+mma   cp=4  36511.7 us    301.55 Mops/s  (per warp-iter)
+
+reuse stream       0.06 ms  issued 151.0 MB  useful 37.7 MB
+reuse resident     0.04 ms  issued 37.7 MB  useful 37.7 MB
+speedup resident/stream 1.47x
+
+B=32, span=80K, total KV 327.7 MB
+split B=32 span=  80000 ns=  1 ctas=  32    0.355 ms    922.2 GB/s
+split B=32 span=  80000 ns=  2 ctas=  64    0.366 ms    896.4 GB/s
+split B=32 span=  80000 ns=  4 ctas= 128    0.376 ms    870.4 GB/s
+split B=32 span=  80000 ns=  8 ctas= 256    0.431 ms    760.1 GB/s
+split B=32 span=  80000 ns= 16 ctas= 512    0.413 ms    792.5 GB/s
+B=1, span=80K (10 MB)
+split B= 1 span=  80000 ns=  8 ctas=   8    0.045 ms    227.3 GB/s
+split B= 1 span=  80000 ns= 16 ctas=  16    0.026 ms    401.5 GB/s
+split B= 1 span=  80000 ns= 32 ctas=  32    0.017 ms    588.2 GB/s
+split B= 1 span=  80000 ns= 64 ctas=  64    0.017 ms    588.2 GB/s
+split B= 1 span=  80000 ns=132 ctas= 132    0.017 ms    592.6 GB/s
+B=1, span=2K (0.25 MB)
+split B= 1 span=   2048 ns=  2 ctas=   2    0.008 ms     32.0 GB/s
+split B= 1 span=   2048 ns=  4 ctas=   4    0.006 ms     42.7 GB/s
+split B= 1 span=   2048 ns=  8 ctas=   8    0.005 ms     51.2 GB/s
+split B= 1 span=   2048 ns= 16 ctas=  16    0.005 ms     51.2 GB/s
+split B= 1 span=   2048 ns= 32 ctas=  32    0.005 ms     53.9 GB/s
+B=1, span=1M (128 MB)
+split B= 1 span=1048576 ns=  8 ctas=   8    0.527 ms    254.7 GB/s
+split B= 1 span=1048576 ns= 16 ctas=  16    0.266 ms    504.2 GB/s
+split B= 1 span=1048576 ns= 32 ctas=  32    0.149 ms    898.3 GB/s
+split B= 1 span=1048576 ns= 64 ctas=  64    0.157 ms    856.7 GB/s
+split B= 1 span=1048576 ns=132 ctas= 132    0.153 ms    875.6 GB/s

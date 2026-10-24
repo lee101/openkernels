@@ -1,0 +1,256 @@
+You are reviewing a CUDA kernel for an H200 (sm_90a, 132 SMs, ~1.8 GHz, HBM3 ~4.3 TB/s achievable). Do NOT run tools; answer from the code. Be concrete, cite line fragments, and explain WHY each change would help, with rough cycle/µs math. Rank ideas by expected gain/effort. Say when you are unsure.
+
+Kernel: `fdec` = fused gated-attention decode for one new token per request (q_len 1). 16 query heads, 2 KV heads, head_dim 64, paged FP8 (e4m3) KV cache with page size 1 (every key row is a random 128 B row: both heads' 64 B; K and V in separate arrays). One CTA = (request, key split), 8 warps; each warp streams its own key range in 16-key blocks through a per-warp cp.async ring (RBF=5 x 4 KB), computes QK with mma.sync m16n8k16 f16 (K converted from e4m3 with cvt), online softmax, PV, then the 8 warps merge in smem, then splits merge across CTAs (cluster DSMEM for small grids, else last-arriver global merge) and apply RMSNorm x sigmoid(gate). Prologue does Q RMSNorm + RoPE, and the new token's K/V (norm, RoPE, quantize, write cache).
+
+Measured on H200 (CUDA-graph replay, cold L2; the harness subtracts ~4 µs launch overhead from both sides):
+- sliding window (2048 keys), batch 1: total ~14.5 µs graph (~10.5 net). Ablations: no KV loads 14.5 (memory is NOT the limiter), no compute 12.2, no merge 12.8, no loads+compute+merge 10.0, empty kernel 4.9. So ~5 µs is "skeleton": prologue (seq load -> page-table loads -> cp.async issue; Q norm/RoPE), CTA merge, finish.
+- full context 80K keys, batch 32: 277 µs (~2.4 TB/s of random 128 B rows); with loads+compute+merge removed it still took 98 µs: the per-block page-table lookups (dependent global loads 3 blocks ahead) were a latency chain. We just added an smem page-table ring (segments of 8 blocks) — review that too.
+- Facts: mma.sync with e4m3 operands is emulated on sm_90 (ptxas expands to F2FP + HMMA), so no FP8 mma.sync gain; wgmma needs a warpgroup. Random 128 B gathers top out ~2.5-3 TB/s. L2 prefetch (cp.async.bulk.prefetch) ahead of the ring made full shapes much slower.
+- The leader on this benchmark is ~2x faster overall than us; sliding-window shapes must be ~4x faster than SGLang (i.e. ~5 µs net for batch 1).
+
+Questions:
+1. What in the skeleton/prologue/merge path is likely costing the ~5 µs, and how would you restructure to cut it (fewer dependent round trips, less code, different split counts, PDL, etc.)?
+2. The per-block compute chain for one 16-key block appears to take ~2 µs at batch 1 — why, and how to shorten it?
+3. For full context, how to get closer to the gather ceiling?
+4. Any bugs, races, or hazards you see.
+
+Code:
+(Keep the answer under 900 words.)
+__global__ void __launch_bounds__(256, 1) fdec(F p) {
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
+#ifdef FD_EMPTY
+  if (tid == 0 && p.NS < 0) p.out[0] = __float2bfloat16(0.f);
+  return;
+#endif
+  PT(0);
+  const int b = blockIdx.x / p.NS, s = blockIdx.x % p.NS;
+  // raw query / new key / value loads first: they need nothing, and everything below waits on seq and the page table
+  const __nv_bfloat16* row0 = p.qkv + (size_t)b * (2 * 16 + 4) * D;
+  uint4 qraw[2][2];
+#pragma unroll
+  for (int h = 0; h < 2; h++) { const uint4* qp = (const uint4*)(row0 + (h * 8 + g) * D + t * 16); qraw[h][0] = qp[0]; qraw[h][1] = qp[1]; }
+  float ivq[8], ivk[2];  // RoPE inverse frequencies this lane needs, fetched before the KV loads queue up
+#pragma unroll
+  for (int j = 0; j < 8; j++) ivq[j] = __ldg(p.invf + t * 8 + j);
+  ivk[0] = __ldg(p.invf + (lane & 15) * 2); ivk[1] = __ldg(p.invf + (lane & 15) * 2 + 1);
+  uint2 kraw = make_uint2(0, 0), vraw = make_uint2(0, 0);
+  if (w == 0) {
+    const int h = lane >> 4, d0 = (lane & 15) * 4;
+    kraw = *(const uint2*)(row0 + 16 * D + h * D + d0); vraw = *(const uint2*)(row0 + 18 * D + h * D + d0);
+  }
+  const int seq = p.seq[b];
+  const int k0 = p.window ? max(0, seq - p.window + 1) : 0, span = seq + 1 - k0;
+  const int cs = k0 + (int)((long long)span * s / p.NS), ce = k0 + (int)((long long)span * (s + 1) / p.NS);
+  const int ws = cs + (int)((long long)(ce - cs) * w / 8), we = cs + (int)((long long)(ce - cs) * (w + 1) / 8);
+  const __nv_bfloat16* row = p.qkv + (size_t)b * (2 * 16 + 4) * D;
+  extern __shared__ __align__(16) uint8_t smem[];
+  const uint32_t sb = (uint32_t)__cvta_generic_to_shared(smem);
+  const uint32_t tab = sb + 8 * RBF * 4096;  // new token's K row (128 B) then V row (128 B)
+  const int* ptb = p.pt + (size_t)b * p.maxp;
+  const uint32_t ring = sb + w * RBF * 4096;
+  // cache row of key ws..: -1 past the range, -2 for the new token (taken from the table)
+  auto rowsfor = [&](int kb) -> int {
+    const int kp = kb + (lane & 15);
+    return (kb < we && kp < we) ? (kp >= seq ? -2 : ptb[kp / p.ps] * p.ps + kp % p.ps) : -1;
+  };
+  // page size 1: the warp's page-table entries stream into a 4-segment smem ring (8 blocks per segment), so the
+  // in-loop lookups are shared-memory reads instead of a chain of dependent global loads
+  const bool pt1 = p.ps == 1;
+  const uint32_t ptr = tab + 256 + w * 2048;
+  auto ptseg = [&](int sg) {  // entries ws + 128 sg .. + 127 -> ring slot sg & 3 (4 B copies: rows need not be aligned)
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int e = j * 32 + lane, idx = ws + sg * 128 + e;
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(ptr + (sg & 3) * 512 + e * 4), "l"(ptb + (idx < we ? idx : 0)), "r"(idx < we ? 4 : 0));
+    }
+  };
+  auto rowss = [&](int kb) -> int {  // rowsfor through the ring (valid for blocks within the 2 loaded segments ahead)
+    if (!pt1) return rowsfor(kb);
+    const int kp = kb + (lane & 15);
+    if (!(kb < we && kp < we)) return -1;
+    if (kp >= seq) return -2;
+    int v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(ptr + ((kp - ws) & 511) * 4));
+    return v;
+  };
+  const int c = lane & 7;
+  auto issue = [&](int slot, int rl, bool tabok) {  // the new token's row comes from the table once it is written
+    const uint32_t d0 = ring + slot * 4096;
+    if (__all_sync(0xffffffffu, rl == -1)) { asm volatile("cp.async.commit_group;\n"); return; }  // past the range: nothing to load
+#ifdef FD_NOLOAD
+    asm volatile("cp.async.commit_group;\n"); return;
+#endif
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const int r = i * 4 + (lane >> 3), rw = __shfl_sync(0xffffffffu, rl, r);
+      const uint32_t dd = d0 + r * 128 + ((c ^ (r & 7)) << 4);
+      if (rw == -2) {
+        if (!tabok) continue;
+        uint4 kv, vv;
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(kv.x), "=r"(kv.y), "=r"(kv.z), "=r"(kv.w) : "r"(tab + c * 16));
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(vv.x), "=r"(vv.y), "=r"(vv.z), "=r"(vv.w) : "r"(tab + 128 + c * 16));
+        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dd), "r"(kv.x), "r"(kv.y), "r"(kv.z), "r"(kv.w));
+        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dd + 2048), "r"(vv.x), "r"(vv.y), "r"(vv.z), "r"(vv.w));
+      } else {
+        const size_t off = (size_t)max(rw, 0) * 128 + c * 16;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dd), "l"(p.kc + off), "r"(rw >= 0 ? 16 : 0));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dd + 2048), "l"(p.vc + off), "r"(rw >= 0 ? 16 : 0));
+      }
+    }
+    asm volatile("cp.async.commit_group;\n");
+  };
+  const int nb = max(0, (we - ws + 15) >> 4);
+  int rpro[RBF - 1];
+#pragma unroll
+  for (int i = 0; i < RBF - 1; i++) rpro[i] = rowsfor(ws + i * 16);  // independent loads in flight together
+  int rnext = rowsfor(ws + (RBF - 1) * 16), rn1 = rowsfor(ws + RBF * 16), rn2 = rowsfor(ws + (RBF + 1) * 16);  // 3 blocks ahead
+  if (pt1) { ptseg(0); ptseg(1); }  // joins the first KV group
+#pragma unroll
+  for (int i = 0; i < RBF - 1; i++) issue(i, rpro[i], false);  // KV loads start before the query prologue
+  if (w == 0) {  // new key: RMSNorm + RoPE, value as is; both quantized to E4M3
+    const int h = lane >> 4, d0 = (lane & 15) * 4;
+    float k[4], v[4], ss = 0.f;
+#pragma unroll
+    const __nv_bfloat16* kr = (const __nv_bfloat16*)&kraw; const __nv_bfloat16* vr = (const __nv_bfloat16*)&vraw;
+    for (int i = 0; i < 4; i++) { k[i] = __bfloat162float(kr[i]); v[i] = __bfloat162float(vr[i]); ss += k[i] * k[i]; }
+#pragma unroll
+    for (int o = 1; o < 16; o <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    const float rn = rsqrtf(ss / D + 1e-5f);
+#pragma unroll
+    for (int i = 0; i < 4; i++) k[i] *= rn;
+    if (p.theta > 0.f) {
+#pragma unroll
+      for (int i = 0; i < 4; i += 2) {
+        float sn, cs2; rope_cs2(ivk[i >> 1], seq, sn, cs2);
+        const float e = k[i], o = k[i + 1];
+        k[i] = e * cs2 - o * sn; k[i + 1] = e * sn + o * cs2;
+      }
+    }
+    uint32_t kb4 = 0, vb4 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      __nv_fp8_e4m3 fk(k[i] * p.kinv), fv(v[i] * p.vinv);
+      kb4 |= (uint32_t)fk.__x << (8 * i); vb4 |= (uint32_t)fv.__x << (8 * i);
+    }
+    asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(tab + h * D + d0), "r"(kb4));
+    asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(tab + 128 + h * D + d0), "r"(vb4));
+    if (s == 0) {
+      *(uint32_t*)(p.kc + (size_t)p.loc[b] * 128 + h * D + d0) = kb4;
+      *(uint32_t*)(p.vc + (size_t)p.loc[b] * 128 + h * D + d0) = vb4;
+    }
+  }
+  // query fragments: lane (g, t) holds q[head h*8+g][16t .. 16t+16) as f16, normalized, scaled, rotated
+  uint32_t qa[2][4][4];
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const __nv_bfloat162* bb = (const __nv_bfloat162*)&qraw[h][0];
+    const __nv_bfloat162* bc = (const __nv_bfloat162*)&qraw[h][1];
+    float x[16], ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) { float2 f = __bfloat1622float2(bb[i]); x[2 * i] = f.x; x[2 * i + 1] = f.y; f = __bfloat1622float2(bc[i]); x[8 + 2 * i] = f.x; x[9 + 2 * i] = f.y; }
+#pragma unroll
+    for (int i = 0; i < 16; i++) ss += x[i] * x[i];
+    ss += __shfl_xor_sync(0xffffffffu, ss, 1);
+    ss += __shfl_xor_sync(0xffffffffu, ss, 2);
+    const float rn = rsqrtf(ss / D + 1e-5f) * p.qsc;
+#pragma unroll
+    for (int i = 0; i < 16; i++) x[i] *= rn;
+    if (p.theta > 0.f) {
+#pragma unroll
+      for (int i = 0; i < 16; i += 2) {
+        float sn, cs2; rope_cs2(ivq[i >> 1], seq, sn, cs2);
+        const float e = x[i], o = x[i + 1];
+        x[i] = e * cs2 - o * sn; x[i + 1] = e * sn + o * cs2;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) { qa[h][j][0] = pk(x[4 * j], x[4 * j + 1]); qa[h][j][2] = pk(x[4 * j + 2], x[4 * j + 3]); qa[h][j][1] = 0; qa[h][j][3] = 0; }
+  }
+  PT(1);
+  __syncthreads();  // table ready
+  if (__any_sync(0xffffffffu, (rpro[RBF - 2] == -2) | (rpro[0] == -2) | (RBF > 2 && rpro[RBF > 2 ? 1 : 0] == -2) | (RBF > 3 && rpro[RBF > 3 ? 2 : 0] == -2))) {
+#pragma unroll
+    for (int i = 0; i < RBF - 1; i++) {
+      const uint32_t d0 = ring + i * 4096;
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        const int r = q * 4 + (lane >> 3), rw = __shfl_sync(0xffffffffu, rpro[i], r);
+        if (rw != -2) continue;
+        const uint32_t dd = d0 + r * 128 + ((c ^ (r & 7)) << 4);
+        uint4 kv, vv;
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(kv.x), "=r"(kv.y), "=r"(kv.z), "=r"(kv.w) : "r"(tab + c * 16));
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(vv.x), "=r"(vv.y), "=r"(vv.z), "=r"(vv.w) : "r"(tab + 128 + c * 16));
+        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dd), "r"(kv.x), "r"(kv.y), "r"(kv.z), "r"(kv.w));
+        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dd + 2048), "r"(vv.x), "r"(vv.y), "r"(vv.z), "r"(vv.w));
+      }
+    }
+  }
+  PT(2);
+  float o[2][8][2], mx[2] = {-INFINITY, -INFINITY}, ls[2] = {0.f, 0.f};
+#pragma unroll
+  for (int h = 0; h < 2; h++)
+#pragma unroll
+    for (int n = 0; n < 8; n++) o[h][n][0] = o[h][n][1] = 0.f;
+  int rpf = PFF > 0 ? rowsfor(ws + (RBF - 1 + PFF) * 16) : -1;  // L2 prefetch PFF blocks past the ring: lane < 16 K, else V
+  for (int bi = 0, kb = ws; bi < nb; bi++, kb += 16) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(RBF - 2));
+    __syncwarp();
+    if (pt1 && (bi & 7) == 0) ptseg((bi >> 3) + 2);  // segment k + 2 while in segment k: first read 9 blocks later
+    issue((bi + RBF - 1) % RBF, rnext, true);
+    rnext = rn1; rn1 = rn2; rn2 = rowss(kb + (RBF + 2) * 16);
+    if (PFF > 0) {
+#if __CUDA_ARCH__ >= 900
+      if (rpf >= 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" :: "l"((lane < 16 ? p.kc : p.vc) + (size_t)rpf * 128) : "memory");
+#endif
+      rpf = rowsfor(kb + (RBF + PFF) * 16);
+    }
+    const uint32_t sl = ring + (bi % RBF) * 4096;
+#ifdef FD_NOCOMP
+    if (sl == 0xffffffffu)
+#endif
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      uint4 kw[2];
+      const uint32_t ck = ((h * 4 + t) ^ (g & 7)) << 4;
+#pragma unroll
+      for (int n = 0; n < 2; n++)
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(kw[n].x), "=r"(kw[n].y), "=r"(kw[n].z), "=r"(kw[n].w) : "r"(sl + (g + 8 * n) * 128 + ck));
+      uint2 vw[4];
+      const int rv[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];\n" : "=r"(vw[i].x), "=r"(vw[i].y)
+                     : "r"(sl + 2048 + rv[i] * 128 + (((h * 4 + (g >> 1)) ^ (rv[i] & 7)) << 4) + (g & 1) * 8));
+      float sc4[2][4];
+#pragma unroll
+      for (int n = 0; n < 2; n++) {
+        sc4[n][0] = sc4[n][1] = sc4[n][2] = sc4[n][3] = 0.f;
+        const uint32_t kk[4] = {kw[n].x, kw[n].y, kw[n].z, kw[n].w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) mma16(sc4[n], qa[h][j][0], qa[h][j][1], qa[h][j][2], qa[h][j][3], e2h(kk[j]), e2h(kk[j] >> 16));
+      }
+      float v[4];
+#pragma unroll
+      for (int n = 0; n < 2; n++)
+#pragma unroll
+        for (int e = 0; e < 2; e++) { const int kp = kb + n * 8 + 2 * t + e; v[n * 2 + e] = kp < we ? sc4[n][e] * p.qk : -INFINITY; }
+      float bm = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
+      bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 1));
+      bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 2));
+      const float nm = fmaxf(mx[h], bm), scl = ex2(mx[h] - nm);
+      mx[h] = nm;
+      const float p0 = ex2(v[0] - nm), p1 = ex2(v[1] - nm), p2 = ex2(v[2] - nm), p3 = ex2(v[3] - nm);
+      ls[h] = ls[h] * scl + (p0 + p1 + p2 + p3);
+      const uint32_t pa0 = pk(p0, p1), pa2 = pk(p2, p3);
+#pragma unroll
+      for (int n = 0; n < 8; n += 2) {
+        const int wi = n >> 2, sh = (n & 3) * 8;
+        const uint32_t x0 = wi ? vw[0].y : vw[0].x, x1 = wi ? vw[1].y : vw[1].x, x2 = wi ? vw[2].y : vw[2].x, x3 = wi ? vw[3].y : vw[3].x;
+        const uint32_t lo01 = __byte_perm(x0 >> sh, x1 >> sh, 0x5140), lo23 = __byte_perm(x2 >> sh, x3 >> sh, 0x5140);
+        float c0[4] = {o[h][n][0] * scl, o[h][n][1] * scl, 0.f, 0.f}, c1[4] = {o[h][n + 1][0] * scl, o[h][n + 1][1] * scl, 0.f, 0.f};
+        mma16(c0, pa0, 0u, pa2, 0u, e2h(lo01), e2h(lo23));
+        mma16(c1, pa0, 0u, pa2, 0u, e2h(lo01 >> 16), e2h(lo23 >> 16));
+        o[h][n][0] = c0[0]; o[h][n][1] = c0[1]; o[h][n + 1][0] = c1[0]; o[h][n + 1][1] = c1[1];
+      }
+    }
+  }
+  PT(3);

@@ -78,6 +78,7 @@ numbers: no TMA, no FP8 tensor cores, 6 MB L2, 100 KB shared.
 | A3 | split-count sweep, global merge | `kernel_fn`, `run_fdec` | med | low | med |
 | A5 | WGMMA only where the row count fits | `attn9`/`attnw` | med | low | high |
 | A6 | validate the page-table smem ring | `fdec`/`attnw` `ptseg` | low-med | low | low |
+| A7 | keep every decode on 128 B fused rows | `kernel_fn` dispatch | med | low | med |
 | M1 | full weight tile residency across token passes | `muse_moe_w4a16` `Ctx`/`run` | high for bs128/256 | high | med |
 | M2 | `NTM=16` / occupancy sweep | `muse_moe_w4a16` `_ext`, `dispatch` | high for large M | low-med | med |
 | M3 | precompute the local route list | moe routing prologue | med for bs256 | med | med |
@@ -131,6 +132,9 @@ Do:
 - Keep the 16 B path as the fallback for gaps.
 - Measure the actual run-length distribution in the scored distributions
   (`soft`, `coherent`, `agentic`, `mixed`). Do not assume.
+- For page size 64, a page is 64 contiguous 128 B rows; use 256/512 B bulk
+  copies instead of per-row 16 B copies. Local 256 B random rows hit 864 GB/s
+  vs 829 for 128 B.
 
 Local 3090 Ti: 128 B random 829 -> runs 878 GB/s (+6%); 64 B random 531 ->
 runs 896 GB/s (+69%). `fdec` already loads 128 B per token row, so A2 is
@@ -185,6 +189,16 @@ Do:
 
 Local 3090 Ti: not measured directly; the gather probe shows row bytes, not
 table lookups. Add a `ptable.cu` probe before deciding to keep the complexity.
+
+### A7. Keep every decode on 128 B fused rows
+
+`fdec` loads both KV heads as one 128 B token row. The non-fused `attn` path
+loads 64 B per head. Local gather: 64 B random 531 GB/s, 128 B random
+829 GB/s (+56%). If any decode case still dispatches to the per-head path,
+route it through `fdec` or coalesce the two heads into one 128 B copy.
+
+The scored shapes are hq=16/hkv=2 and already take the fused path; check the
+`heads dp` and other test shapes before changing dispatch.
 
 ---
 
