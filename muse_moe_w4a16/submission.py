@@ -75,10 +75,13 @@ struct P {
 #ifdef PROF
 __device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
 #define PSET(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] = (v); } while (0)
+// event log: warps gw < 64 keep up to 96 (type, time) pairs after the 65536 x 16 counters
+#define PEVC(pp, gww, lanee, evv, ty) do { if ((lanee) == 0 && (gww) < 64 && (evv) < 96) { (pp).prof[65536 * 16 + (gww) * 192 + 2 * (evv)] = (ty); (pp).prof[65536 * 16 + (gww) * 192 + 2 * (evv) + 1] = gtime(); } (evv)++; } while (0)
 #define PADD(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] += (v); } while (0)
 #else
 #define PSET(k, v)
 #define PADD(k, v)
+#define PEVC(pp, gww, lanee, evv, ty)
 #endif
 
 __device__ __forceinline__ void cp16(uint32_t s, const void* g) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(g)); }
@@ -115,7 +118,7 @@ struct Sm { int cnt[NLOC], off[NLOC], fill[NLOC], act[NLOC], na, ks, maxc; int i
 template <int S>
 struct Ctx {
   const P* p; Sm* sm; const uint16_t* list; uint32_t ring, bars; int lane, N1, N, gi, gj, ks;
-  int q; unsigned long long wcyc;
+  int q; unsigned long long wcyc; int ev, gw;
   int pi, pp, ps;  // producer: group tile index, pass, stage
   __device__ __forceinline__ int tid_of(int i) const { return ((volatile int*)sm->ids[gi])[i & 3]; }
   __device__ __forceinline__ void item(int u, int& g2, int& e, int& mt) const {
@@ -144,6 +147,7 @@ struct Ctx {
   }
   __device__ __forceinline__ uint32_t acquire() {  // wait for stage q, refill the slot freed last iteration
     const int slot = q % S;
+    PEVC(*p, gw, lane, ev, 1);
 #ifdef PROF
     long long c0 = clock64();
 #endif
@@ -156,6 +160,7 @@ struct Ctx {
 #ifdef PROF
     wcyc += clock64() - c0;
 #endif
+    PEVC(*p, gw, lane, ev, 2);
 #if !EARLYREL
     issue((q + S - 1) % S);
 #endif
@@ -163,6 +168,7 @@ struct Ctx {
     return ring + slot * STG + lane * 16;
   }
   __device__ __forceinline__ void release() {  // stage q - 1 consumed: refill its slot now, before any epilogue
+    PEVC(*p, gw, lane, ev, 3);
 #if EARLYREL
     __syncwarp();
     issue((q - 1) % S);
@@ -237,6 +243,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
     }
     C.release();
   }
+  PEVC(p, C.gw, lane, C.ev, 4);
 #ifdef PROF
   const long long ce0 = clock64();
   struct EpiT { long long c; int lane; unsigned long long* pf; int gw; __device__ ~EpiT() { if (lane == 0 && pf) pf[gw * 16 + 15] += clock64() - c; } } epit{ce0, lane, p.prof, (int)(blockIdx.x * WPC + (threadIdx.x >> 5))};
@@ -256,7 +263,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
 #pragma unroll
     for (int n = 0; n < NT; n++) red[(wid * 2 + n) * 32 + lane] = make_float4(f[n][0], f[n][1], f[n][2], f[n][3]);
     gbar(1 + C.gi, ks * 32);
-    if (C.gj != (ti & (ks - 1))) return false;
+    if (C.gj != (ti & (ks - 1))) { PEVC(p, C.gw, lane, C.ev, 6); return false; }
     for (int o = w0; o < w0 + ks; o++) {
       if (o == wid) continue;
 #pragma unroll
@@ -304,6 +311,7 @@ __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, 
     }
   }
   __syncwarp();
+  PEVC(p, C.gw, lane, C.ev, 5);
   return true;
 }
 
@@ -358,10 +366,10 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   Ctx<S> C;
   C.p = &p; C.sm = sm; C.list = list; C.lane = lane; C.ks = ks; C.gi = wid / ks; C.gj = wid % ks;
   C.N1 = na * T1E; C.N = C.N1 + na * T2E;
-  C.ring = sbase + wid * S * STG; C.bars = sbase + WPC * S * STG + WPC * SCR + wid * S * 8; C.q = 0; C.wcyc = 0;
+  C.ring = sbase + wid * S * STG; C.bars = sbase + WPC * S * STG + WPC * SCR + wid * S * 8; C.q = 0; C.wcyc = 0; C.ev = 0; C.gw = gw;
   C.pi = 0; C.pp = 0; C.ps = 0;
   const bool lead = C.gj == 0 && lane == 0;
-  if (lead) { sm->ids[C.gi][0] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = atomicAdd(p.ctr + QI, 1); }
+  if (lead) { sm->ids[C.gi][0] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][2] = atomicAdd(p.ctr + QI, 1); }
   __syncthreads();
 #ifdef PROF
   PSET(1, gtime());
@@ -372,7 +380,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     const int u = C.tid_of(i);
     if (u >= C.N) break;
     int nxt = 0;
-    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 2; latency hidden behind this tile
+    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 3: the result is stored after this tile
     int g2, e, mt; C.item(u, g2, e, mt);
     const int cnt = sm->cnt[e], np = (cnt + 8 * NTM - 1) / (8 * NTM);
 #ifdef PROF
@@ -387,7 +395,6 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     } else if (mt == 0 && C.gj == 0) {
       for (int k = lane; k < cnt; k += 32) p.ss[list[sm->off[e] + k]] = 0.f;
     }
-    if (lead) sm->ids[C.gi][(i + 2) & 3] = nxt;  // read 2 tiles later, after the group barrier (ks > 1) / syncwarp
     __syncwarp();
     const int span = SPT / ks, s0 = C.gj * span;
     bool fin = false;
@@ -395,10 +402,12 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       int nt = min(NTM, (cnt - ps * 8 * NTM + 7) >> 3);
       fin = g2 ? dispatch<1, S>(C, nt, e, mt, ps, i, s0, s0 + span) : dispatch<0, S>(C, nt, e, mt, ps, i, s0, s0 + span);
     }
-    if (fin) {
-      fence_ar(); __syncwarp();
-      if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
+    if (fin) {  // this tile's results are visible before its count (release)
+      __syncwarp();
+      if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : e)) : "memory");
     }
+    if (lead) sm->ids[C.gi][(i + 3) & 3] = nxt;  // read by the group's producers after the next tile's barrier
+    __syncwarp();
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
 #endif
@@ -554,7 +563,7 @@ def prepare(weights):
     st = {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
             "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(64, dtype=torch.int32, device=dev),
             "tcnt": torch.zeros(32 * 768, dtype=torch.int32, device=dev),
-            "prof": torch.zeros((65536 * 16 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
+            "prof": torch.zeros((65536 * 16 + 64 * 192 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
             "ws": torch.empty((32 * 768 * 8 * 64 * 4,), dtype=torch.float32, device=dev)}
     if DIAG:
         _diag(st, weights)

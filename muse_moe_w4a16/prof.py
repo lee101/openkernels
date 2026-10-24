@@ -36,3 +36,8 @@ for bs in bss:
     for nm, col in (("g1 busy", 2), ("g2 busy", 3), ("g2 dep-wait", 4), ("tma wait", 9), ("epilogue", 15)):
         v = [cyc(col)[i] for i in act]
         print(f"  {nm:12} per-warp us p10 {pct(v, .1):6.2f} p50 {pct(v, .5):6.2f} p90 {pct(v, .9):6.2f} max {max(v):6.2f}")
+    E = stt["prof"][65536 * 16:].view(64, 96, 2).cpu()
+    sym = {1: "a", 2: "A", 3: "r", 4: "e", 5: "E", 6: "x"}
+    for wv in (0, 1, 5, 17, 40):
+        ev = [(int(a), (int(b) - t0) / 1e3) for a, b in E[wv].tolist() if a]
+        print(f"  w{wv}: " + " ".join(f"{sym.get(a, a)}{t:.1f}" for a, t in ev[:60]))
