@@ -77,7 +77,11 @@ __device__ __forceinline__ unsigned long long gtime() { unsigned long long t; as
 #define PSET(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] = (v); } while (0)
 // event log: warps gw < 64 keep up to 96 (type, time) pairs after the 65536 x 16 counters
 #define PEVC(pp, gww, lanee, evv, ty) do { if ((lanee) == 0 && (gww) < 64 && (evv) < 96) { (pp).prof[65536 * 16 + (gww) * 192 + 2 * (evv)] = (ty); (pp).prof[65536 * 16 + (gww) * 192 + 2 * (evv) + 1] = gtime(); } (evv)++; } while (0)
+#ifdef EVONLY
+#define PADD(k, v)
+#else
 #define PADD(k, v) do { if (lane == 0) p.prof[gw * 16 + (k)] += (v); } while (0)
+#endif
 #else
 #define PSET(k, v)
 #define PADD(k, v)
@@ -180,6 +184,7 @@ template <int NT, int G2, int S>
 __device__ __forceinline__ bool run(Ctx<S>& C, int e, int mt, int pass, int ti, int s0, int s1) {
   const P& p = *C.p;
   const int lane = C.lane, g = lane >> 2, t = lane & 3;
+  PEVC(p, C.gw, lane, C.ev, 9);
   const int cnt = C.sm->cnt[e], off = C.sm->off[e];
   constexpr int CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
 #ifndef BD1
@@ -369,25 +374,32 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   C.ring = sbase + wid * S * STG; C.bars = sbase + WPC * S * STG + WPC * SCR + wid * S * 8; C.q = 0; C.wcyc = 0; C.ev = 0; C.gw = gw;
   C.pi = 0; C.pp = 0; C.ps = 0;
   const bool lead = C.gj == 0 && lane == 0;
-  if (lead) { sm->ids[C.gi][0] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][1] = atomicAdd(p.ctr + QI, 1); sm->ids[C.gi][2] = atomicAdd(p.ctr + QI, 1); }
+  // the first 3 tiles of each group are static (no contended start-up atomics); the queue hands out the rest
+  const int NG = gridDim.x * (WPC / ks), ggi = blockIdx.x * (WPC / ks) + C.gi;
+  if (lead) { sm->ids[C.gi][0] = ggi; sm->ids[C.gi][1] = NG + ggi; sm->ids[C.gi][2] = 2 * NG + ggi; }
   __syncthreads();
 #ifdef PROF
   PSET(1, gtime());
 #endif
+  PEVC(p, gw, lane, C.ev, 7);
 #pragma unroll
   for (int i = 0; i < S - 1 + EARLYREL; i++) C.issue(i);
+  PEVC(p, gw, lane, C.ev, 8);
   for (int i = 0;; i++) {
     const int u = C.tid_of(i);
     if (u >= C.N) break;
     int nxt = 0;
-    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 3: the result is stored after this tile
+    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 3 (minus 3 NG): consumed only after this tile
     int g2, e, mt; C.item(u, g2, e, mt);
     const int cnt = sm->cnt[e], np = (cnt + 8 * NTM - 1) / (8 * NTM);
 #ifdef PROF
     long long c0 = clock64();
 #endif
     if (g2) {
-      if (lane == 0) while (ldacq(p.ctr + e) < T1E) __nanosleep(32);
+      if (lane < 4) {  // this warp's K range needs only the G1 tiles of its inter-column quarters (128 tiles each)
+        const int sp2 = SPT / ks, q0 = (C.gj * sp2) >> 1, q1 = (C.gj * sp2 + sp2 - 1) >> 1;
+        if (lane >= q0 && lane <= q1) while (ldacq(p.ctr + 64 + e * 4 + lane) < T1E / 4) __nanosleep(32);
+      }
       __syncwarp();
 #ifdef PROF
       PADD(4, clock64() - c0); c0 = clock64();
@@ -404,9 +416,9 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     }
     if (fin) {  // this tile's results are visible before its count (release)
       __syncwarp();
-      if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : e)) : "memory");
+      if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : 64 + e * 4 + mt / (T1E / 4))) : "memory");
     }
-    if (lead) sm->ids[C.gi][(i + 3) & 3] = nxt;  // read by the group's producers after the next tile's barrier
+    if (lead) sm->ids[C.gi][(i + 3) & 3] = nxt + 3 * NG;  // read by the group's producers after the next tile's barrier
     __syncwarp();
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
@@ -452,6 +464,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     __threadfence();
     if (atomicAdd(p.ctr + NLOC + 1, 1) == (int)gridDim.x - 1) {
       for (int i = 0; i < NLOC + 3; i++) p.ctr[i] = 0;
+      for (int i = 64; i < 64 + NLOC * 4; i++) p.ctr[i] = 0;
       __threadfence();
     }
   }
@@ -561,7 +574,7 @@ def prepare(weights):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     st = {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
-            "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(64, dtype=torch.int32, device=dev),
+            "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(256, dtype=torch.int32, device=dev),
             "tcnt": torch.zeros(32 * 768, dtype=torch.int32, device=dev),
             "prof": torch.zeros((65536 * 16 + 64 * 192 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
             "ws": torch.empty((32 * 768 * 8 * 64 * 4,), dtype=torch.float32, device=dev)}

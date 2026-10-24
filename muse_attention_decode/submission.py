@@ -1348,6 +1348,16 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
   PT(0);
   const int b = blockIdx.x / p.NS, s = blockIdx.x % p.NS;
+  // raw query / new key / value loads first: they need nothing, and everything below waits on seq and the page table
+  const __nv_bfloat16* row0 = p.qkv + (size_t)b * (2 * 16 + 4) * D;
+  uint4 qraw[2][2];
+#pragma unroll
+  for (int h = 0; h < 2; h++) { const uint4* qp = (const uint4*)(row0 + (h * 8 + g) * D + t * 16); qraw[h][0] = qp[0]; qraw[h][1] = qp[1]; }
+  uint2 kraw = make_uint2(0, 0), vraw = make_uint2(0, 0);
+  if (w == 0) {
+    const int h = lane >> 4, d0 = (lane & 15) * 4;
+    kraw = *(const uint2*)(row0 + 16 * D + h * D + d0); vraw = *(const uint2*)(row0 + 18 * D + h * D + d0);
+  }
   const int seq = p.seq[b];
   const int k0 = p.window ? max(0, seq - p.window + 1) : 0, span = seq + 1 - k0;
   const int cs = k0 + (int)((long long)span * s / p.NS), ce = k0 + (int)((long long)span * (s + 1) / p.NS);
@@ -1396,7 +1406,8 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     const int h = lane >> 4, d0 = (lane & 15) * 4;
     float k[4], v[4], ss = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; i++) { k[i] = __bfloat162float(row[16 * D + h * D + d0 + i]); v[i] = __bfloat162float(row[18 * D + h * D + d0 + i]); ss += k[i] * k[i]; }
+    const __nv_bfloat16* kr = (const __nv_bfloat16*)&kraw; const __nv_bfloat16* vr = (const __nv_bfloat16*)&vraw;
+    for (int i = 0; i < 4; i++) { k[i] = __bfloat162float(kr[i]); v[i] = __bfloat162float(vr[i]); ss += k[i] * k[i]; }
 #pragma unroll
     for (int o = 1; o < 16; o <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     const float rn = rsqrtf(ss / D + 1e-5f);
@@ -1427,10 +1438,8 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   uint32_t qa[2][4][4];
 #pragma unroll
   for (int h = 0; h < 2; h++) {
-    const uint4* qp = (const uint4*)(row + (h * 8 + g) * D + t * 16);
-    const uint4 u0 = qp[0], u1 = qp[1];
-    const __nv_bfloat162* bb = (const __nv_bfloat162*)&u0;
-    const __nv_bfloat162* bc = (const __nv_bfloat162*)&u1;
+    const __nv_bfloat162* bb = (const __nv_bfloat162*)&qraw[h][0];
+    const __nv_bfloat162* bc = (const __nv_bfloat162*)&qraw[h][1];
     float x[16], ss = 0.f;
 #pragma unroll
     for (int i = 0; i < 4; i++) { float2 f = __bfloat1622float2(bb[i]); x[2 * i] = f.x; x[2 * i + 1] = f.y; f = __bfloat1622float2(bc[i]); x[8 + 2 * i] = f.x; x[9 + 2 * i] = f.y; }
@@ -1589,66 +1598,62 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   float* gwo = p.wo + ((size_t)(b * p.NS + s) * 16 + r) * D;
   ((float4*)gwo)[dv] = acc;
   if (dv == 0) { p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2] = M; p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2 + 1] = L; }
-  __threadfence();
   __syncthreads();
-  // the last min(16, NS) arrivers of a request each merge rows (q heads) rank, rank + nm, ...: everyone else has arrived
+  // the last nmg arrivers (a power of two <= min(16, NS)) of a request merge its 16 rows together, all rows at once:
+  // thread = (row rl of rp = 16 / nmg, split group kg of nmg, dims d4 * 4 .. + 3); everyone else has arrived
   __shared__ int rank_s;
-  if (tid == 0) rank_s = atomicAdd(p.cnt + b, 1);
+  if (tid == 0) { int v; asm volatile("atom.add.acq_rel.gpu.global.s32 %0, [%1], 1;\n" : "=r"(v) : "l"(p.cnt + b) : "memory"); rank_s = v; }
   __syncthreads();
   PT(5);
-  const int nmg = min(16, p.NS), rank = rank_s - (p.NS - nmg);
+  const int nmg = p.NS >= 16 ? 16 : (p.NS >= 8 ? 8 : (p.NS >= 4 ? 4 : (p.NS >= 2 ? 2 : 1))), rank = rank_s - (p.NS - nmg);
   if (rank < 0) return;
-  if (tid == 0) { volatile int* c = p.cnt + b; while (*c < p.NS) __nanosleep(64); }
+  if (tid == 0) { int v; do { asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.cnt + b) : "memory"); if (v < p.NS) __nanosleep(32); } while (v < p.NS); }
   __syncthreads();
   __threadfence();
   asm volatile("cp.async.wait_all;\n" ::: "memory");
-  float* xs = (float*)smem;  // [16 groups][64] weighted O, [16] sums, [16] max
-  const int kg = tid >> 4, d4 = tid & 15;
-  for (int hr = rank; hr < 16; hr += nmg) {
-    const float* ml = p.wml + ((size_t)b * p.NS * 16 + hr) * 2;
-    float Mg = -INFINITY;
-    for (int k = kg; k < p.NS; k += 16) Mg = fmaxf(Mg, __ldcg(ml + (size_t)k * 32));
-    if (d4 == 0) xs[1024 + 16 + kg] = Mg;
-    __syncthreads();
-    float Mr = -INFINITY;
-#pragma unroll
-    for (int k = 0; k < 16; k++) Mr = fmaxf(Mr, xs[1024 + 16 + k]);
-    float4 og = make_float4(0.f, 0.f, 0.f, 0.f);
-    float lg = 0.f;
-    for (int k = kg; k < p.NS; k += 16) {
-      const float m = __ldcg(ml + (size_t)k * 32);
-      if (m == -INFINITY) continue;
-      const float wt = ex2(m - Mr);
-      lg += wt * __ldcg(ml + (size_t)k * 32 + 1);
-      const float4 v = __ldcg((const float4*)(p.wo + (((size_t)b * p.NS + k) * 16 + hr) * D) + d4);
-      og.x += wt * v.x; og.y += wt * v.y; og.z += wt * v.z; og.w += wt * v.w;
+  float* xs = (float*)smem;  // [16 (rl, kg)][64] weighted O, [16] sums, [16] max
+  const int d4 = tid & 15, kg = (tid >> 4) & (nmg - 1), rl = tid / (16 * nmg), slot = rl * nmg + kg;
+  const int hr = rank + rl * nmg;
+  const float* mlp = p.wml + ((size_t)b * p.NS * 16 + hr) * 2;
+  float Mg = -INFINITY;
+  for (int k = kg; k < p.NS; k += nmg) Mg = fmaxf(Mg, __ldcg(mlp + (size_t)k * 32));
+  if (d4 == 0) xs[1024 + 16 + slot] = Mg;
+  __syncthreads();
+  float Mr = -INFINITY;
+  for (int k = 0; k < nmg; k++) Mr = fmaxf(Mr, xs[1024 + 16 + rl * nmg + k]);
+  float4 og = make_float4(0.f, 0.f, 0.f, 0.f);
+  float lg = 0.f;
+  for (int k = kg; k < p.NS; k += nmg) {
+    const float2 mlv = __ldcg((const float2*)(mlp + (size_t)k * 32));
+    const float4 v = __ldcg((const float4*)(p.wo + (((size_t)b * p.NS + k) * 16 + hr) * D) + d4);
+    if (mlv.x == -INFINITY) continue;
+    const float wt = ex2(mlv.x - Mr);
+    lg += wt * mlv.y;
+    og.x += wt * v.x; og.y += wt * v.y; og.z += wt * v.z; og.w += wt * v.w;
+  }
+  ((float4*)(xs + slot * 64))[d4] = og;
+  if (d4 == 0) xs[1024 + slot] = lg;
+  __syncthreads();
+  if (kg == 0) {
+    float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float Lr = 0.f;
+    for (int k = 0; k < nmg; k++) {
+      const float4 v = ((const float4*)(xs + (rl * nmg + k) * 64))[d4];
+      a4.x += v.x; a4.y += v.y; a4.z += v.z; a4.w += v.w;
+      Lr += xs[1024 + rl * nmg + k];
     }
-    ((float4*)(xs + kg * 64))[d4] = og;
-    if (d4 == 0) xs[1024 + kg] = lg;
-    __syncthreads();
-    if (tid < 16) {
-      float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
-      float Lr = 0.f;
+    const float inv = p.vscale / Lr;
+    a4.x *= inv; a4.y *= inv; a4.z *= inv; a4.w *= inv;
+    float ss = a4.x * a4.x + a4.y * a4.y + a4.z * a4.z + a4.w * a4.w;
 #pragma unroll
-      for (int k = 0; k < 16; k++) {
-        const float4 v = ((const float4*)(xs + k * 64))[tid];
-        a4.x += v.x; a4.y += v.y; a4.z += v.z; a4.w += v.w;
-        Lr += xs[1024 + k];
-      }
-      const float inv = p.vscale / Lr;
-      a4.x *= inv; a4.y *= inv; a4.z *= inv; a4.w *= inv;
-      float ss = a4.x * a4.x + a4.y * a4.y + a4.z * a4.z + a4.w * a4.w;
+    for (int x = 1; x < 16; x <<= 1) ss += __shfl_xor_sync(0xffffu << (lane & 16), ss, x);
+    const float rn = rsqrtf(ss / D + 1e-5f);
+    const __nv_bfloat16* gt = row + 20 * D + hr * D + d4 * 4;
+    const float vals[4] = {a4.x, a4.y, a4.z, a4.w};
+    __nv_bfloat16 ob[4];
 #pragma unroll
-      for (int x = 1; x < 16; x <<= 1) ss += __shfl_xor_sync(0xffffu, ss, x);
-      const float rn = rsqrtf(ss / D + 1e-5f);
-      const __nv_bfloat16* gt = row + 20 * D + hr * D + tid * 4;
-      const float vals[4] = {a4.x, a4.y, a4.z, a4.w};
-      __nv_bfloat16 ob[4];
-#pragma unroll
-      for (int i = 0; i < 4; i++) ob[i] = __float2bfloat16(vals[i] * rn / (1.f + expf(-__bfloat162float(gt[i]))));
-      *(uint2*)(p.out + (size_t)b * 16 * D + hr * D + tid * 4) = *(uint2*)ob;
-    }
-    __syncthreads();
+    for (int i = 0; i < 4; i++) ob[i] = __float2bfloat16(vals[i] * rn / (1.f + expf(-__bfloat162float(gt[i]))));
+    *(uint2*)(p.out + (size_t)b * 16 * D + hr * D + d4 * 4) = *(uint2*)ob;
   }
   PT(6);
   if (tid == 0 && atomicAdd(p.cnt + p.B + b, 1) == nmg - 1) { p.cnt[b] = 0; p.cnt[p.B + b] = 0; }
@@ -1772,7 +1777,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v23_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v24_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod

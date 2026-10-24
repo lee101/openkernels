@@ -164,6 +164,10 @@ def prepare(weights):
     st["rA"], st["rA2"] = P__pack(hi), P__pack((weights["router"] - hi.float()).to(torch.bfloat16))
     st["rhi"], st["rlo"] = hi.contiguous(), (weights["router"] - hi.float()).to(torch.bfloat16).contiguous()
     st["pws"] = torch.zeros((256 * 8192,), dtype=torch.float32, device=hi.device)
+    st["pk"] = {k: P__pack(weights[k]) for k in ("qkv_gate", "o", "pooler", "unpooler")}  # mma A-fragment order for the GEMV
+    st["gws"] = torch.zeros((32 * 8192,), dtype=torch.float32, device=hi.device)
+    st["gcnt"] = torch.zeros((8 * 512,), dtype=torch.int32, device=hi.device)
+    st["none"] = torch.empty(0, dtype=torch.bfloat16, device=hi.device)
     st["pcnt"] = torch.zeros((8 * 512,), dtype=torch.int32, device=hi.device)
     st["router_bias"] = weights["router_bias"].float().contiguous()
     st["side"] = torch.cuda.Stream()
@@ -220,18 +224,31 @@ def _pfdiag(st):
         print(f"PFDIAG pf {mode} pooler {nb >> 20}MB grid {grid} spin {sp}us: o {o:.1f}us pooler+router {rest:.1f}us", flush=True)
 
 
+def _proj(x, st, name, n):
+    """x @ W[:n].T: the deep-ring GEMV up to 32 tokens, cuBLAS above"""
+    T = x.shape[0]
+    if T > 32 or not GEMV:
+        return x @ (st["unpool8"] if name == "unpooler" and n == 1024 else st[name]).T
+    out = torch.empty((T, n), dtype=torch.bfloat16, device=x.device)
+    P__ext().run2(st["pk"][name], st["none"], x.contiguous(), out, st["gws"], st["gcnt"], n)
+    return out
+
+
+GEMV = False
+
+
 def kernel_fn(data, st):
     cfg = data["config"]
     B, L, T = cfg["batch"], cfg["q_len"], cfg["tokens"]
     x = data["attn_input"]
     dev = x.device
-    qkv = (x @ st["qkv_gate"].T).view(B, L, -1)
+    qkv = _proj(x, st, "qkv_gate", 2304).view(B, L, -1)
     ad = {k: data[k] for k in ("positions", "cache_loc", "k_cache", "v_cache", "k_scale", "v_scale", "page_table", "seq_lens")}
     ad["qkv"] = qkv
     ad["config"] = {k: cfg[k] for k in ("batch", "q_len", "num_q_heads", "num_kv_heads", "head_dim", "page_size", "window",
                                          "rope_theta", "qk_scale_factor", "sm_scale", "kv_scale")}
     att = A_kernel_fn(ad).view(T, -1)
-    a = att @ st["o"].T
+    a = _proj(att, st, "o", 8192)
     g = _gext()
     s1 = torch.empty((T, 8192), dtype=torch.float32, device=dev)
     h = torch.empty((T, 8192), dtype=torch.bfloat16, device=dev)
@@ -250,7 +267,7 @@ def kernel_fn(data, st):
         else:
             P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)
         g.routing(lg, st["router_bias"], data["local_start"], ids, loc, tw)
-    pr = h @ st["pooler"].T
+    pr = _proj(h, st, "pooler", 4096)
     p = torch.empty_like(pr)
     g.rmsgain(pr, st["g_pre_expert_norm"], p)
     cur.wait_stream(side)
@@ -267,7 +284,7 @@ def kernel_fn(data, st):
     ss = torch.empty((T * 8,), dtype=torch.float32, device=dev)
     y = torch.empty_like(p)
     M__ext(M_LARGE and T > 64).moe(p, loc, tw, ms["w1"], ms["w2"], ms["g1"], ms["g2"], ms["nw"], inter, y2, ss, ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"])
-    f = y @ (st["unpool8"] if T <= 8 else st["unpooler"]).T
+    f = _proj(y, st, "unpooler", 1024 if T <= 8 else 8192)
     s2 = torch.empty_like(s1)
     hid = torch.empty_like(h)
     g.resid2(f, st["g_post_ffn_norm"], s1, st["a2"], st["b2"], st["g_next_pre_attn_norm"], s2, hid)

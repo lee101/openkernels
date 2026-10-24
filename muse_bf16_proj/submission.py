@@ -397,7 +397,7 @@ void run2(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out,
 
 _mod = None
 _DBG = []
-V6 = True  # deep per-CTA ring GEMV
+V6 = False  # deep per-CTA ring GEMV: slower than v5 on H200
 
 
 def _big():

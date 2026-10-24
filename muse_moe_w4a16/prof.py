@@ -29,6 +29,7 @@ for bs in bss:
     items = P[:, 8].tolist()
     act = [i for i in range(len(items)) if items[i] > 0]
     print(f"bs {bs}: event {e0.elapsed_time(e1) * 1e3:.1f}us  span {max(us(7)):.1f}us  na {int(P[0, 11])} ks {int(P[0, 12])} warps {len(items)} active {len(act)} items/warp max {max(items)}")
+    if not act: act = list(range(len(items)))
     mhz = [(int(P[i, 14]) - int(P[i, 13])) / max(1, int(P[i, 7]) - int(P[i, 0])) * 1e3 for i in act]
     print(f"  sm clock MHz p10 {pct(mhz, .1):.0f} p50 {pct(mhz, .5):.0f}")
     print(f"  start  p50 {pct(us(0), .5):.1f} p99 {pct(us(0), .99):.1f} | routed p50 {pct(us(1), .5):.1f} max {max(us(1)):.1f}")
@@ -37,7 +38,7 @@ for bs in bss:
         v = [cyc(col)[i] for i in act]
         print(f"  {nm:12} per-warp us p10 {pct(v, .1):6.2f} p50 {pct(v, .5):6.2f} p90 {pct(v, .9):6.2f} max {max(v):6.2f}")
     E = stt["prof"][65536 * 16:].view(64, 96, 2).cpu()
-    sym = {1: "a", 2: "A", 3: "r", 4: "e", 5: "E", 6: "x"}
+    sym = {1: "a", 2: "A", 3: "r", 4: "e", 5: "E", 6: "x", 7: "R", 8: "I", 9: "N"}
     for wv in (0, 1, 5, 17, 40):
         ev = [(int(a), (int(b) - t0) / 1e3) for a, b in E[wv].tolist() if a]
         print(f"  w{wv}: " + " ".join(f"{sym.get(a, a)}{t:.1f}" for a, t in ev[:60]))
