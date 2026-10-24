@@ -158,6 +158,70 @@ def _coef(gate):
     return torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3)).contiguous(), beta.contiguous()
 
 
+MARLIN_MIN = 512  # prefill-sized batches (decode layers stop at 256): SGLang's Marlin W4A16 MoE, called exactly as the baseline calls it
+_MAR = []
+
+
+def _marlin_mods():
+    if not _MAR:
+        try:
+            from sglang.kernels.ops.activation.activation import silu_and_mul
+            from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+            from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import fused_post_expert_norm_weighted_sum
+            from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+            from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+            from sglang.srt.layers.quantization.marlin_utils_fp4 import prepare_moe_nvfp4_layer_for_marlin
+            from sgl_kernel.scalar_type import scalar_types
+            _MAR.append(dict(silu_and_mul=silu_and_mul, gemm=moe_wna16_marlin_gemm, post=fused_post_expert_norm_weighted_sum,
+                             align=moe_align_block_size, ws=marlin_make_workspace, prep=prepare_moe_nvfp4_layer_for_marlin,
+                             fp4=scalar_types.float4_e2m1f))
+        except Exception:
+            _MAR.append(None)
+    return _MAR[0]
+
+
+def _marlin_bank(weights, mm):
+    import types
+    dev = weights["w13"].device
+    layer = types.SimpleNamespace(
+        quant_config=types.SimpleNamespace(group_size=16), moe_runner_config=types.SimpleNamespace(is_gated=True),
+        intermediate_size_per_partition=weights["w13"].shape[1] // 2, params_dtype=torch.bfloat16,
+        w13_weight=weights["w13"].contiguous(), w2_weight=weights["w2"].contiguous(),
+        w13_weight_scale=weights["w13_sf"].contiguous(), w2_weight_scale=weights["w2_sf"].contiguous(),
+        w13_weight_scale_2=weights["w13_gs"].contiguous(), w2_weight_scale_2=weights["w2_gs"].contiguous())
+    mm["prep"](layer)
+    em = torch.full((256,), -1, dtype=torch.int32, device=dev)
+    em[:32] = torch.arange(32, dtype=torch.int32, device=dev)
+    return {"w13": layer.w13_weight.data, "w13_s": layer.w13_weight_scale.data, "w13_gs": layer.w13_weight_scale_2.data,
+            "w2": layer.w2_weight.data, "w2_s": layer.w2_weight_scale.data, "w2_gs": layer.w2_weight_scale_2.data,
+            "expert_map": em, "size_n": layer.intermediate_size_per_partition, "workspace": mm["ws"](dev, max_blocks_per_sm=4),
+            "post_w": (1.0 + weights["post_expert_norm"].float()).to(torch.bfloat16)}
+
+
+def _marlin_experts(x, tw, loc, bank, mm):
+    T, K = x.shape
+    N = bank["size_n"]
+    lid = bank["expert_map"][loc.long()].contiguous()
+    tw = tw.to(torch.float32).contiguous()
+    for bm in (8, 16, 32, 48, 64):
+        if T * 8 / 32 / bm < 0.9:
+            break
+    sid, bexp, npad = mm["align"](lid, bm, 256)
+    c2 = torch.empty((T * 8, N), device=x.device, dtype=x.dtype)
+    c13 = torch.empty((T * 8 * max(2 * N, K),), device=x.device, dtype=x.dtype)
+    c1 = c13[: T * 8 * 2 * N].view(-1, 2 * N)
+    c3 = c13[: T * 8 * K].view(-1, K)
+    com = dict(moe_block_size=bm, mul_topk_weights=False, is_ep=True, b_q_type=mm["fp4"], is_k_full=True, use_atomic_add=False,
+               use_fp32_reduce=True, is_zp_float=False)
+    ws = bank["workspace"]
+    c1 = mm["gemm"](x, c1, bank["w13"], None, bank["w13_s"], bank["w13_gs"], None, None, None, ws, sid, bexp, npad, tw, top_k=8,
+                    size_m=T, size_n=2 * N, size_k=K, **com)
+    mm["silu_and_mul"](c1.view(-1, 2 * N), c2, expert_ids=lid.view(-1), expert_step=1)
+    y = mm["gemm"](c2, c3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws, sid, bexp, npad, tw, top_k=1,
+                   size_m=T * 8, size_n=K, size_k=N, **com).view(T, 8, K)
+    return mm["post"](y, tw, norm_weight=bank["post_w"], eps=1e-8, weight_first=True, slot_expert_ids=lid)
+
+
 def prepare(weights):
     st = {k: weights[k] for k in ("qkv_gate", "o", "router", "router_bias", "pooler", "unpooler")}
     hi = weights["router"].to(torch.bfloat16)
@@ -181,6 +245,8 @@ def prepare(weights):
     st["g_post_expert_norm"] = (1.0 + weights["post_expert_norm"].float()).contiguous()
     st["moe"] = M_prepare({"w13": weights["w13"], "w13_sf": weights["w13_sf"], "w13_gs": weights["w13_gs"], "w2": weights["w2"],
                            "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"], "post_norm_w": weights["post_expert_norm"]})
+    mm = _marlin_mods()
+    st["bank"] = _marlin_bank(weights, mm) if (mm is not None and MARLIN_MIN > 0) else None
     _gext(); A__ext(); P__ext(); M__ext(M_LARGE)
     torch.cuda.synchronize()
     print("env torch", torch.__version__, "grouped_mm", hasattr(torch, "_grouped_mm"), "cap", torch.cuda.get_device_capability(), flush=True)
@@ -253,6 +319,7 @@ def kernel_fn(data, st):
     dev = x.device
     qkv = _proj(x, st, "qkv_gate", 2304).view(B, L, -1)
     ad = {k: data[k] for k in ("positions", "cache_loc", "k_cache", "v_cache", "k_scale", "v_scale", "page_table", "seq_lens")}
+    ad.update({k: data[k] for k in ("cache_seqlens", "cu_seqlens_q", "scheduler_metadata") if k in data})
     ad["qkv"] = qkv
     ad["config"] = {k: cfg[k] for k in ("batch", "q_len", "num_q_heads", "num_kv_heads", "head_dim", "page_size", "window",
                                          "rope_theta", "qk_scale_factor", "sm_scale", "kv_scale")}
@@ -279,6 +346,13 @@ def kernel_fn(data, st):
     p = torch.empty_like(pr)
     g.rmsgain(pr, st["g_pre_expert_norm"], p)
     cur.wait_stream(side)
+    if T > MARLIN_MIN and st.get("bank") is not None:
+        y = _marlin_experts(p, tw, loc, st["bank"], _marlin_mods())
+        f = _proj(y, st, "unpooler", 8192)
+        s2 = torch.empty_like(s1)
+        hid = torch.empty_like(h)
+        g.resid2(f, st["g_post_ffn_norm"], s1, st["a2"], st["b2"], st["g_next_pre_attn_norm"], s2, hid)
+        return hid, s2, ids
     if big:
         y = _moe_large(p, loc, tw, st)
         f = y @ st["unpooler"].T

@@ -1900,6 +1900,13 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   if (tid == 0 && atomicAdd(p.cnt + p.B + b, 1) == nmg - 1) { p.cnt[b] = 0; p.cnt[p.B + b] = 0; }
 }
 
+void prep_only(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc, torch::Tensor ksc,
+               torch::Tensor vsc, torch::Tensor q8, int64_t hq, int64_t hkv, double theta, double qk_factor, torch::Tensor invf) {
+  const int toks = qkv.size(0) * qkv.size(1);
+  prep<<<dim3(toks, hq + 2 * hkv), D, 0, at::cuda::getCurrentCUDAStream()>>>((const __nv_bfloat16*)qkv.data_ptr(), pos.data_ptr<int64_t>(),
+      loc.data_ptr<int64_t>(), (uint8_t*)kc.data_ptr(), (uint8_t*)vc.data_ptr(), ksc.data_ptr<float>(), vsc.data_ptr<float>(), nullptr,
+      (uint8_t*)q8.data_ptr(), (int)hq, (int)hkv, (float)theta, (float)qk_factor, invf.data_ptr<float>());
+}
 void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc, torch::Tensor pt, torch::Tensor seq,
               torch::Tensor wo, torch::Tensor wml, torch::Tensor cnt, torch::Tensor out, int64_t ps, int64_t window, double theta,
               double qk_factor, double sm_scale, double kv_scale, int64_t NS, torch::Tensor prof, torch::Tensor invf) {
@@ -2031,9 +2038,9 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v35_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
-                           cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
-                           cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
+        _mod = load_inline("attn_v36_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+                           cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
+                           cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
 
 
@@ -2073,6 +2080,46 @@ def _diag(dev):
     _mod, _DBG = keep
 
 
+FA3PF = True
+_FA3 = []
+
+
+def _fa3():
+    if not _FA3:
+        try:
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache
+            _FA3.append(flash_attn_with_kvcache)
+        except Exception:
+            _FA3.append(None)
+    return _FA3[0]
+
+
+def _prefill_fa3(data, cfg, B, L, hq, hkv, qkv, dev):
+    q8 = torch.empty((B * L, hq, 64), dtype=torch.uint8, device=dev)
+    _ext().prep_only(qkv, data["positions"], data["cache_loc"], data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"], q8,
+                     hq, hkv, cfg["rope_theta"], cfg["qk_scale_factor"], _invf(cfg["rope_theta"], dev))
+    seq = data["seq_lens"].to(torch.int32)
+    csl = data.get("cache_seqlens")
+    if csl is None:
+        csl = (seq + L).to(torch.int32)
+    cuq = data.get("cu_seqlens_q")
+    if cuq is None:
+        cuq = torch.arange(0, B * L + 1, L, dtype=torch.int32, device=dev)
+    desc = {}
+    if float(cfg["kv_scale"]) != 1.0:
+        desc = dict(k_descale=data["k_scale"].reshape(1, 1).expand(B, hkv), v_descale=data["v_scale"].reshape(1, 1).expand(B, hkv))
+    win = cfg["window"]
+    o = _fa3()(q=q8.view(torch.float8_e4m3fn), k_cache=data["k_cache"], v_cache=data["v_cache"], page_table=data["page_table"],
+               cache_seqlens=csl, cu_seqlens_q=cuq, max_seqlen_q=L, softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
+               window_size=(win - 1, 0) if win else (-1, -1), scheduler_metadata=data.get("scheduler_metadata"), **desc)
+    if isinstance(o, tuple):
+        o = o[0]
+    x = o.float().view(B * L, hq, 64)
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5)
+    g = qkv.reshape(B * L, -1)[:, (hq + 2 * hkv) * 64:].float().view(B * L, hq, 64)
+    return (x * torch.sigmoid(g)).to(torch.bfloat16).view(B, L, hq * 64)
+
+
 def kernel_fn(data):
     global DIAG
     if DIAG:
@@ -2101,6 +2148,8 @@ def kernel_fn(data):
                         out, cfg["page_size"], cfg["window"], cfg["rope_theta"], cfg["qk_scale_factor"], cfg["sm_scale"] * ks, ks, NS,
                         torch.empty(0, device=dev), _invf(cfg["rope_theta"], dev))
         return out
+    if L > 8 and FA3PF and _fa3() is not None and _hopper():  # prefill: our prologue (norm, RoPE, cache store), FA3, our norm + gate
+        return _prefill_fa3(data, cfg, B, L, hq, hkv, qkv, dev)
     ps = cfg["page_size"]
     maxkeys = data["page_table"].shape[1] * ps
     span = min(maxkeys, cfg["window"] + L) if cfg["window"] else maxkeys
