@@ -30,3 +30,10 @@
 - z_image: (1+scale) and tanh(gate) folded into RMSNorm weights; ggml-cuda sinks RMS_NORM next to its MUL so RMS_NORM+MUL(+ADD) fuses (buffer-overlap guarded; GGML_CUDA_NO_NORM_SINK=1 disables).
 - ggml_rope_pe (GGML_OP_ROPE mode 128, CPU+CUDA): precomputed-table rope in one pass (SD_NO_ROPE_PE=1 disables). Qwen-Image uses the same Rope::attention, so ra2 gets it too.
 - Remaining per step: MMQ 359 ms (~47% of int8 peak), FA 181 ms (~60% of fp32-accum peak), elementwise ~150 ms (kv_scale scale/cast passes, silu-gate, quantize).
+
+### Qwen-Image 2.1 (ra2 path) — stable-diffusion.cpp-master branch perf/master-dit-fusion (worktree ../sdmaster-opt, ggml branch perf/fusion)
+- 1024^2, 6 steps, 3090 Ti: total 12.2 -> 10.7 s (bit-identical image); DiT window 1934 -> 1786 ms; VAE decode 3.75 -> 2.83 s (2.44 s with --vae-conv-direct, PSNR 58.7 dB).
+- ggml-cuda: NORM+MUL(+ADD) fusion (adaLN modulate in one pass), NORM sink; concat in one launch when contiguous (Wan VAE decode issued 181k concat launches, one per channel slice).
+- Flux::modulate = x*(1+scale)+shift; rope via ggml_rope_pe (shared with Z-Image); Wan VAE single-frame causal Conv3d -> Conv2d with last temporal tap (exact; also handles singleton-kt exports).
+- Remaining VAE: 2D im2col 0.92 s, cpy 0.6 s (DupUp3D permute conts), GEMM 0.36 s. omniserve has no env for conv-direct yet (OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT would need adding in backend_sd.c).
+- Note: sd.cpp-prod (Z-Image) and sd.cpp-master share one git repo; worktree branches must have unique names.
