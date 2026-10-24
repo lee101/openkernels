@@ -1071,6 +1071,7 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   };
   auto issue = [&](int slot, int r0, int r1, int r2, int r3) {
     const int rw[4] = {r0, r1, r2, r3};
+    if (__syncthreads_and(r0 == -1 && r1 == -1 && r2 == -1 && r3 == -1)) { asm volatile("cp.async.commit_group;\n"); return; }  // step past the range
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       const int key = i * 16 + lr;
@@ -1396,6 +1397,7 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   const int c = lane & 7;
   auto issue = [&](int slot, int rl, bool tabok) {  // the new token's row comes from the table once it is written
     const uint32_t d0 = ring + slot * 4096;
+    if (__all_sync(0xffffffffu, rl == -1)) { asm volatile("cp.async.commit_group;\n"); return; }  // past the range: nothing to load
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       const int r = i * 4 + (lane >> 3), rw = __shfl_sync(0xffffffffu, rl, r);
@@ -1863,7 +1865,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v28_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v29_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
