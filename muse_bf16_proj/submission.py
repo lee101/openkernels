@@ -230,10 +230,174 @@ void run(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, 
   cfg.attrs = at; cfg.numAttrs = major >= 9 ? 1 : 0;
   cudaLaunchKernelEx(&cfg, fin, q);
 }
+
+// ---------------------------------------------------------------- v6: deep per-CTA TMA ring (stream over 16 KB stages)
+// A stage is 8 consecutive 2 KB units (one 16-row tile, 8 K chunks); CTA c streams stages [ST c / G, ST (c + 1) / G)
+// through an NS-deep ring filled by a producer warp, so most of a CTA's bytes are in flight at once. Consumer warp w
+// takes unit w of every stage; at a tile's end the 8 partials meet in smem, and a tile shared by CTAs is summed in
+// ws with fp32 atomics, the last arriver writing the output.
+#ifndef NSG
+#define NSG 12
+#endif
+__device__ __forceinline__ void mbarrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(b) : "memory"); }
+template <int NT, bool HL>
+__global__ void __launch_bounds__(288, 1) gemv(Q q) {
+  constexpr int SB = (HL ? 2 : 1) * 16384, NS = HL ? NSG / 2 : NSG, CH = NT == 1 ? 4 : (NT == 2 ? 2 : 1);
+  extern __shared__ __align__(128) uint8_t smem[];
+  const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+  const uint32_t base = (uint32_t)__cvta_generic_to_shared(smem);
+  const uint32_t full = base + NS * SB, empty = full + NS * 8;
+  float* red = (float*)(smem + NS * SB + NS * 16);
+  if (threadIdx.x < NS) { mbinit(full + threadIdx.x * 8, TMA ? 1 : 32); mbinit(empty + threadIdx.x * 8, 8); }
+#if TMA
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+#endif
+  __syncthreads();
+  const int SPT = q.KC / 8;  // stages per tile
+  const int ST = q.MT * SPT, G = gridDim.x, c = blockIdx.x;
+  const int s0 = (int)((long long)ST * c / G), s1 = (int)((long long)ST * (c + 1) / G);
+  if (wid == 8) {  // producer
+#if !TMA
+    for (int i = s0; i < s1; i++) {
+      const int k = i - s0, slot = k % NS;
+      if (k >= NS) mbwait(empty + slot * 8, ((k / NS) - 1) & 1);
+      for (int o = lane * 16; o < 16384; o += 512) {
+        cp16(base + slot * SB + o, q.A + (size_t)i * 16384 + o);
+        if (HL) cp16(base + slot * SB + 16384 + o, q.A2 + (size_t)i * 16384 + o);
+      }
+      asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(full + slot * 8) : "memory");
+    }
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+#endif
+    if (lane == 0) {
+      for (int i = s0; i < s1 && TMA; i++) {
+        const int k = i - s0, slot = k % NS;
+        if (k >= NS) mbwait(empty + slot * 8, ((k / NS) - 1) & 1);
+#if TMA
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(full + slot * 8), "n"(SB) : "memory");
+        asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" :: "r"(base + slot * SB), "l"(q.A + (size_t)i * 16384), "n"(16384), "r"(full + slot * 8) : "memory");
+        if (HL) asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" :: "r"(base + slot * SB + 16384), "l"(q.A2 + (size_t)i * 16384), "n"(16384), "r"(full + slot * 8) : "memory");
+#endif
+      }
+    }
+    return;
+  }
+  const int tb = 0;
+  float acc[NT][CH][4];
+#pragma unroll
+  for (int n = 0; n < NT; n++)
+#pragma unroll
+    for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
+  uint4 b0[NT][2];
+  auto ldb = [&](int i, uint4 (&b)[NT][2]) {
+    const int ch = (i % SPT) * 8 + wid;
+#pragma unroll
+    for (int n = 0; n < NT; n++) {
+      const int tok = min(tb * 32 + n * 8 + g, q.M - 1);
+      const uint4* xr = (const uint4*)(q.x + (size_t)tok * q.K) + t * 2 + ch * 8;
+      b[n][0] = __ldg(xr); b[n][1] = __ldg(xr + 1);
+    }
+  };
+  if (s0 < s1) ldb(s0, b0);
+  for (int i = s0; i < s1; i++) {
+    const int k = i - s0, slot = k % NS;
+    uint4 b1[NT][2];
+    if (i + 1 < s1) ldb(i + 1, b1);
+    mbwait(full + slot * 8, (k / NS) & 1);
+    const uint32_t sa = base + slot * SB + wid * 2048 + lane * 16;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint4 a = lds(sa + j * 512);
+      uint4 h; if (HL) h = lds(sa + 16384 + j * 512);
+#pragma unroll
+      for (int n = 0; n < NT; n++) {
+        const uint32_t* bb = (const uint32_t*)&b0[n][j >> 1];
+        mma(acc[n][j % CH], a, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+        if (HL) mma(acc[n][(j + 1) % CH], h, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+      }
+    }
+    __syncwarp();
+    if (lane == 0) mbarrive(empty + slot * 8);
+#pragma unroll
+    for (int n = 0; n < NT; n++) { b0[n][0] = b1[n][0]; b0[n][1] = b1[n][1]; }
+    const int tile = i / SPT;
+    if (i + 1 == s1 || (i + 1) % SPT == 0) {  // tile ends here (for this CTA): reduce the 8 warps' partials
+#pragma unroll
+      for (int n = 0; n < NT; n++) {
+        float f[4];
+#pragma unroll
+        for (int i2 = 0; i2 < 4; i2++) { f[i2] = 0.f;
+#pragma unroll
+          for (int h = 0; h < CH; h++) f[i2] += acc[n][h][i2]; }
+        ((float4*)red)[(n * 8 + wid) * 32 + lane] = make_float4(f[0], f[1], f[2], f[3]);
+#pragma unroll
+        for (int h = 0; h < CH; h++) acc[n][h][0] = acc[n][h][1] = acc[n][h][2] = acc[n][h][3] = 0.f;
+      }
+      asm volatile("bar.sync 1, 256;\n" ::: "memory");
+      const int t0s = tile * SPT, t1s = t0s + SPT;
+      const bool own = t0s >= s0 && t1s <= s1;
+      const int row0 = tile * 16 + g;
+      for (int n = wid; n < NT; n += 8) {
+        float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int w2 = 0; w2 < 8; w2++) { const float4 v = ((float4*)red)[(n * 8 + w2) * 32 + lane]; sum.x += v.x; sum.y += v.y; sum.z += v.z; sum.w += v.w; }
+        const int tk = n * 8 + 2 * t;
+        const float fv[4] = {sum.x, sum.y, sum.z, sum.w};
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          const int tok = tk + (e & 1), row = row0 + (e >> 1) * 8;
+          if (tok >= q.M || row >= q.N) continue;
+          if (own) put(q, tok, row, fv[e]);
+          else atomicAdd(q.ws + (size_t)tok * q.N + row, fv[e]);
+        }
+      }
+      if (!own) {
+        __threadfence();
+        asm volatile("bar.sync 1, 256;\n" ::: "memory");
+        __shared__ int lastf;
+        if (threadIdx.x == 0) {
+          auto cta = [&](int st2) { return (int)(((long long)(st2 + 1) * G - 1) / ST); };  // CTA streaming stage st2
+          const int nc = cta(t1s - 1) - cta(t0s) + 1;
+          lastf = atomicAdd(q.cnt + tile, 1) == nc - 1;
+        }
+        asm volatile("bar.sync 1, 256;\n" ::: "memory");
+        if (lastf) {
+          __threadfence();
+          for (int e = threadIdx.x; e < 16 * q.M; e += 256) {
+            const int tok = e >> 4, row = tile * 16 + (e & 15);
+            if (row < q.N) { float* wp = q.ws + (size_t)tok * q.N + row; put(q, tok, row, __ldcg(wp)); *wp = 0.f; }
+          }
+          if (threadIdx.x == 0) q.cnt[tile] = 0;
+        }
+      }
+      asm volatile("bar.sync 1, 256;\n" ::: "memory");
+    }
+  }
+}
+template <int NT, bool HL> static void go2(const Q& q, cudaStream_t st) {
+  constexpr int NS = HL ? NSG / 2 : NSG;
+  const size_t sm = (size_t)NS * (HL ? 32768 : 16384) + NS * 16 + 8 * 32 * 16 * NT;
+  static bool once = false;
+  if (!once) { cudaFuncSetAttribute(gemv<NT, HL>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); once = true; }
+  gemv<NT, HL><<<g_grid, 288, sm, st>>>(q);
+}
+void run2(torch::Tensor A, torch::Tensor A2, torch::Tensor x, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t N) {
+  if (!g_grid) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&g_grid, cudaDevAttrMultiProcessorCount, dev); }
+  Q q;
+  q.A = (const uint8_t*)A.data_ptr(); q.A2 = A2.numel() ? (const uint8_t*)A2.data_ptr() : nullptr;
+  q.x = (const __nv_bfloat16*)x.data_ptr(); q.out = out.data_ptr(); q.ws = ws.data_ptr<float>(); q.cnt = cnt.data_ptr<int>();
+  q.M = x.size(0); q.K = x.size(1); q.N = (int)N; q.MT = (int)((N + 15) / 16); q.KC = q.K / 64; q.TB = 1;
+  q.f32 = out.scalar_type() == torch::kFloat32;
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int nt = (q.M + 7) / 8;
+  if (q.A2) { if (nt <= 1) go2<1, true>(q, st); else if (nt <= 2) go2<2, true>(q, st); else go2<4, true>(q, st); }
+  else { if (nt <= 1) go2<1, false>(q, st); else if (nt <= 2) go2<2, false>(q, st); else go2<4, false>(q, st); }
+}
 """
 
 _mod = None
 _DBG = []
+V6 = True  # deep per-CTA ring GEMV
 
 
 def _big():
@@ -246,9 +410,9 @@ def _ext():
     global _mod
     if _mod is None:
         wpc = next((int(d[6:]) for d in _DBG if d.startswith("-DWPC=")), 16 if _big() else 8)
-        _mod = load_inline("skinny_v5_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
-                           cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
-                           cuda_sources=CUDA, functions=["run"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + [d for d in _DBG if not d.startswith("-DWPC=")],
+        _mod = load_inline("skinny_v6_%d" % wpc + "".join(_DBG).replace("-", "_").replace("=", ""),
+                           cpp_sources="void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t); void run2(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
+                           cuda_sources=CUDA, functions=["run", "run2"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc] + ([] if _big() else ["-DNSG=4"]) + [d for d in _DBG if not d.startswith("-DWPC=")],
                            verbose=False)
     return _mod
 
@@ -289,5 +453,5 @@ def kernel_fn(data, state):
         return x @ state[layer + "_raw"][:n].T
     A, A2 = state[layer]
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
-    _ext().run(A, A2 if A2 is not None else state["none"], x.contiguous(), out, state["ws"], state["cnt"], n)
+    (_ext().run2 if V6 and m <= 32 else _ext().run)(A, A2 if A2 is not None else state["none"], x.contiguous(), out, state["ws"], state["cnt"], n)
     return out
