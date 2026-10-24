@@ -6,10 +6,10 @@ Kernel track closes 2026-11-04 23:59 PT. Scores are speedup over SGLang (geomean
 
 | problem | best file | speedup | leaderboard top | notes |
 |---|---|---|---|---|
-| muse_attention_decode | `submission_v31.py` | **1.498** | 2.37 | fdec (fused decode, per-warp cp.async rings, smem page-table rings) + attnw (wgmma verify/prefill) |
+| muse_attention_decode | `submission_v32.py` | **1.502** | 2.37 | fdec (fused decode, per-warp cp.async rings, smem page-table rings) + attnw (wgmma verify/prefill) |
 | muse_moe_w4a16 | `submission_v9.py` | **1.371** (v12 1.360) | 2.33 | persistent kernel, NVFP4 dequant 11 ops/8 values, mma.sync, TMA rings, dynamic tile queue |
 | muse_decode_layer | `submission_v2.py` | **1.265** | 1.86 | composed from attention/moe/proj (`tools/build_dl.py`) + `glue.py` |
-| muse_bf16_proj | `submission_v5.py` | 0.94 (v8 pending) | 1.45 | v8: cuBLAS for m 8-32 on qkv/o/pooler; v9 (working file): dedicated router kernel `rtr` |
+| muse_bf16_proj | `submission_v9.py` | **1.116** (v8 1.079) | 1.45 | v8: cuBLAS for m 8-32 on qkv/o/pooler; v9 (working file): dedicated router kernel `rtr` |
 | muse_prefill_layer | `submission_v1.py` | 0.80 | 1.70 | glue_pf.py; MoE at T~750 and 8-token-block attention dominate |
 
 `submission.py` in each directory is the working copy (may be ahead of the best judged file).
