@@ -22,12 +22,12 @@
   },
   "mode": "check",
   "output": {
-    "log": "/vfast/data/code/openkernels/muse_moe_w4a16/profiles/submission.f19acaa3016d497e.log"
+    "log": "muse_moe_w4a16/profiles/submission.f19acaa3016d497e.log"
   },
   "payload_ref": "muse_moe_w4a16/ba510fe87972287001365348c613a4a77e71e7e16d78dd401f9efaf31b229b87.py",
   "profile": {
-    "json": "/vfast/data/code/openkernels/muse_moe_w4a16/profiles/submission.f19acaa3016d497e.json",
-    "text": "/vfast/data/code/openkernels/muse_moe_w4a16/profiles/submission.f19acaa3016d497e.txt"
+    "json": "muse_moe_w4a16/profiles/submission.f19acaa3016d497e.json",
+    "text": "muse_moe_w4a16/profiles/submission.f19acaa3016d497e.txt"
   },
   "result": {
     "baseline_us": 13448.5,

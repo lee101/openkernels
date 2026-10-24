@@ -1,0 +1,4 @@
+# gitleaks config: inherit the upstream default ruleset (see `gitleaks generate config`).
+# No allowlists by design: everything tracked must pass the scan.
+[extend]
+useDefault = true

@@ -934,6 +934,7 @@ __device__ __forceinline__ void wg_rs(float* d, uint32_t a0, uint32_t a1, uint32
                : WG_S(d) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(db));
 #endif
 }
+__device__ __forceinline__ uint32_t lds32a(uint32_t a) { uint32_t v; asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(a)); return v; }
 __device__ __forceinline__ void wg_fence() {
 #if HAS_WG
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -1073,6 +1074,9 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
   };
   auto issue = [&](int slot, int kbi, int r0, int r1, int r2, int r3) {
     const int rw[4] = {r0, r1, r2, r3};
+#ifdef AW_NOLOAD
+    if (kbi >= ks + (RSW - 1) * 64 || kbi >= ke) { asm volatile("cp.async.commit_group;\n"); return; }  // ablation: only the prologue steps load
+#endif
     if (kbi >= ke) { asm volatile("cp.async.commit_group;\n"); return; }  // step past the range
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -1144,8 +1148,13 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     asm volatile("bar.sync %0, 128;\n" :: "r"(1 + h) : "memory");
     float s[32];
     wg_fence();
+#ifdef AW_NOMMA
+#pragma unroll
+    for (int i = 0; i < 32; i++) s[i] = __int_as_float(lds32a(raw + 4 * (i + wt)) & 0x3f7fffff);
+#else
     wg_ss8<0>(s, gdesc(qs + 64 * h, 16, 1024), gdesc(raw + 64 * h, 16, 1024));
     wg_ss8<1>(s, gdesc(qs + 64 * h + 32, 16, 1024), gdesc(raw + 64 * h + 32, 16, 1024));
+#endif
     wg_commit(); wg_wait0();  // also retires the previous step's PV
     const bool full = kb + 64 <= ke && kb + 64 <= seq + t0 + 1 && kb >= lomax && lt == 8;
     float scl[2];
@@ -1181,7 +1190,13 @@ __global__ void __launch_bounds__(256, 2) attnw(A a, WF f) {
     for (int i = 0; i < 16; i++) pa[i] = pk(s[2 * i], s[2 * i + 1]);
     wg_fence();
 #pragma unroll
-    for (int kc = 0; kc < 4; kc++) wg_rs(o, pa[4 * kc], pa[4 * kc + 1], pa[4 * kc + 2], pa[4 * kc + 3], gdesc(vf + kc * 2048, WVL, WVS));
+    for (int kc = 0; kc < 4; kc++) {
+#ifdef AW_NOMMA
+      o[kc] += __uint_as_float(pa[4 * kc] ^ pa[4 * kc + 3]);
+#else
+      wg_rs(o, pa[4 * kc], pa[4 * kc + 1], pa[4 * kc + 2], pa[4 * kc + 3], gdesc(vf + kc * 2048, WVL, WVS));
+#endif
+    }
     wg_commit();
   }
   wg_wait0();

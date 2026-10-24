@@ -2,3 +2,15 @@ __pycache__/
 profiles/
 *.so
 *.bak
+
+# local secrets/state
+.env
+notes/rp_watchdog.log
+notes/rp_budget.json
+
+# build artifacts (sources in build/*.cu stay tracked)
+build/*.o
+build/*.dis
+build/*.sass
+build/*.cubin
+build/*.ptx

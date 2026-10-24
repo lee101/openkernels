@@ -27,3 +27,20 @@ Kernel track closes 2026-11-04 23:59 PT. Scores are speedup over SGLang (geomean
 
 ## Workflow
 Local RTX 3090 Ti = correctness only (shared GPU). H200 timing via short RunPod pods (no perf counters there either). Judge: `okc check <problem> file.py --json` (10-20/day). Never `okc submit` until confident of #1.
+
+## Security and secrets
+
+`RUNPOD_API_KEY` and `RUNPOD_ACCOUNT_ID` live in a gitignored `.env` at the repo root; real environment variables take precedence and no key is tracked. `notes/rp_watchdog.log` (pod ids) and `notes/rp_budget.json` (spend state) are local-only and gitignored.
+
+Secret scanning uses [gitleaks](https://github.com/gitleaks/gitleaks) with the default ruleset (`.gitleaks.toml`):
+
+```sh
+gitleaks git --redact --verbose    # full history
+pre-commit install                 # scan staged changes on every commit
+```
+
+CI runs the same full-history scan on every push and pull request (`.github/workflows/gitleaks.yml`).
+
+## License
+
+Apache-2.0 (see `LICENSE`). Copyright 2026 Lee Penkman.

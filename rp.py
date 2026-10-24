@@ -13,11 +13,21 @@ BUDGET = Path(__file__).with_name("notes") / "rp_budget.json"
 CAP_MIN = 120  # per-day GPU-minute cap; raise deliberately
 
 
+def load_env(p=Path(__file__).with_name(".env")):
+    if not p.exists(): return
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+load_env()
+
+
 def key():
     k = os.environ.get("RUNPOD_API_KEY", "").strip()
     if k: return k
-    for l in open("/vfast/data/code/app-site/.env"):
-        if l.startswith("RUNPOD_API_KEY="): return l.split("=", 1)[1].strip().strip('"')
     sys.exit("no RUNPOD_API_KEY")
 
 

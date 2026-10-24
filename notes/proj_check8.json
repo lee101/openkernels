@@ -22,12 +22,12 @@
   },
   "mode": "check",
   "output": {
-    "log": "/vfast/data/code/openkernels/muse_bf16_proj/profiles/submission.b36534aba2b847db.log"
+    "log": "muse_bf16_proj/profiles/submission.b36534aba2b847db.log"
   },
   "payload_ref": "muse_bf16_proj/6fd11afce8062ee21665e9d742b502ce91ae7c665bb00c1cab1f12de40eddd42.py",
   "profile": {
-    "json": "/vfast/data/code/openkernels/muse_bf16_proj/profiles/submission.b36534aba2b847db.json",
-    "text": "/vfast/data/code/openkernels/muse_bf16_proj/profiles/submission.b36534aba2b847db.txt"
+    "json": "muse_bf16_proj/profiles/submission.b36534aba2b847db.json",
+    "text": "muse_bf16_proj/profiles/submission.b36534aba2b847db.txt"
   },
   "result": {
     "baseline_us": 4830.8,

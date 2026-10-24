@@ -22,7 +22,7 @@
   },
   "mode": "check",
   "output": {
-    "log": "/vfast/data/code/openkernels/muse_moe_w4a16/profiles/diag_check.b619ecb12db04d96.log"
+    "log": "muse_moe_w4a16/profiles/diag_check.b619ecb12db04d96.log"
   },
   "payload_ref": "muse_moe_w4a16/125f969b839ef04a3d5b114c0be905ce7315d61556235419acbc25af5d437f6a.py",
   "result": {

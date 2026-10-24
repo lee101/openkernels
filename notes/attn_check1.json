@@ -10,12 +10,12 @@
   "id": "a195867eb27a4dfe",
   "mode": "check",
   "output": {
-    "log": "/vfast/data/code/openkernels/muse_attention_decode/profiles/submission.a195867eb27a4dfe.log"
+    "log": "muse_attention_decode/profiles/submission.a195867eb27a4dfe.log"
   },
   "payload_ref": "muse_attention_decode/3591e1570602360733ab8e3a8aa66afbffe4c9b7d9fb9171a5da49b536b3dfa0.py",
   "profile": {
-    "json": "/vfast/data/code/openkernels/muse_attention_decode/profiles/submission.a195867eb27a4dfe.json",
-    "text": "/vfast/data/code/openkernels/muse_attention_decode/profiles/submission.a195867eb27a4dfe.txt"
+    "json": "muse_attention_decode/profiles/submission.a195867eb27a4dfe.json",
+    "text": "muse_attention_decode/profiles/submission.a195867eb27a4dfe.txt"
   },
   "result": {
     "baseline_us": 3766.3,

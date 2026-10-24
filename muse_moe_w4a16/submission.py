@@ -640,7 +640,14 @@ __device__ __forceinline__ void lstage(float* acc, uint32_t ws, uint32_t xs, int
 // (2 jh + jl)*16 + hi*8 + 2t + lo. Pair pi = jl*2 + hi of 16 B piece pc (t = (pc&7)>>1, jh = pc&1) -> logical offset:
 __device__ __forceinline__ int lperm(int pc, int pi) { return (2 * (pc & 1) + (pi >> 1)) * 16 + (pi & 1) * 8 + 2 * ((pc & 7) >> 1); }
 
+#ifdef LPROF
+// per warp: cycles in [top barrier + x issue], [weight wait], [dequant + wgmma], [epilogue]
+#define LPT(k) do { const long long _t = clock64(); if (C.lane == 0 && C.p->prof && (k) > 0) C.p->prof[(blockIdx.x * LW + C.wid) * 8 + (k) - 1] += _t - C.lt; C.lt = _t; } while (0)
+#else
+#define LPT(k)
+#endif
 struct LC {
+  long long lt;
   const P* p; LSm* sm; const uint16_t* list; uint8_t* sg; uint32_t sb, wring, xring, bars; int tid, lane, wid, pend; bool xpok;
   // G2 activations depend on G1 quarters; a prefetch never blocks on them (the CTA's own previous block may be one of
   // them, published only at its next item): tid 0 checks without waiting, and a stage that was not ready is loaded at
@@ -695,6 +702,7 @@ __device__ __forceinline__ int litem(LC& C, int q, int g2, int e, int ps, int rb
   for (int i = 0; i < N / 2; i++) acc[i] = 0.f;
   int rel = -1;
   for (int s = 0; s < SPT; s++, q++) {
+    LPT(0);
     if (C.pend == q) {  // CTA-uniform: x(q) was not ready at prefetch time
       if (C.tid == 0) C.dep(q, true);
       __syncthreads();
@@ -709,8 +717,11 @@ __device__ __forceinline__ int litem(LC& C, int q, int g2, int e, int ps, int rb
     __syncthreads();  // x(q) visible to all warps; every warp is done with x(q - 1) and weight slot (q - 1) % LS_ (refilled with stage q + LS_ - 1)
     if (C.sm->flag[q & 1]) C.issue_x(q + 1); else { C.pend = q + 1; cpc(); }
     C.issue_w(q + LS_ - 1);
+    LPT(1);
     lmb_wait(C.bars + (wid * LS_ + q % LS_) * 8, (q / LS_) & 1);
+    LPT(2);
     lstage<N>(acc, C.wring + (q % LS_) * STG, C.xring + (q & 1) * LXS, lane);
+    LPT(3);
   }
   // epilogue: scratch in this warp's weight slot of the last stage (refilled only at the next stage's top)
   __nv_bfloat16* scr = (__nv_bfloat16*)(C.sg + (C.wring + ((q - 1) % LS_) * STG - C.sb));
@@ -758,6 +769,7 @@ __device__ __forceinline__ int litem(LC& C, int q, int g2, int e, int ps, int rb
     rel = NLOC;
   }
   __threadfence();
+  LPT(4);
   return rel;
 }
 
@@ -818,7 +830,7 @@ __global__ void __launch_bounds__(LW * 32, 1) moe_large(P p) {
     }
   }
   __syncthreads();
-  LC C{&p, sm, list, sg, sb, wring, xring, bars, tid, lane, wid, 0, false};  // pend = 0: x(0) loads at stage 0's top
+  LC C{0, &p, sm, list, sg, sb, wring, xring, bars, tid, lane, wid, 0, false};  // pend = 0: x(0) loads at stage 0's top
   for (int i = 0; i < LS_ - 1; i++) C.issue_w(i);
   int q = 0, nxt = 0, rel = -1;
   for (int k = 0;; k++) {
@@ -878,7 +890,7 @@ __global__ void __launch_bounds__(LW * 32, 1) moe_large(P p) {
 static size_t lsmem(int M) { return 1024 + (size_t)LW * LS_ * STG + 2 * LXS + LW * LS_ * 8 + sizeof(LSm) + (size_t)M * 8 * 3; }
 void moel(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1, torch::Tensor w2, torch::Tensor g1,
           torch::Tensor g2, torch::Tensor nw, torch::Tensor inter, torch::Tensor y, torch::Tensor ss, torch::Tensor ctr,
-          torch::Tensor xp, torch::Tensor out, int64_t lo) {
+          torch::Tensor xp, torch::Tensor out, int64_t lo, torch::Tensor prof) {
   const int M = x.size(0);
   static int grid = 0;
   if (!grid) {
@@ -889,7 +901,7 @@ void moel(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1
   P p{w1.data_ptr<uint8_t>(), w2.data_ptr<uint8_t>(), g1.data_ptr<float>(), g2.data_ptr<float>(),
       (const __nv_bfloat16*)x.data_ptr(), ids.data_ptr<int>(), tw.data_ptr<float>(), nw.data_ptr<float>(),
       (__nv_bfloat16*)inter.data_ptr(), (__nv_bfloat16*)y.data_ptr(), ss.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
-      ctr.data_ptr<int>(), nullptr, nullptr, M, (int)lo, nullptr, (__nv_bfloat16*)xp.data_ptr()};
+      ctr.data_ptr<int>(), nullptr, nullptr, M, (int)lo, prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr, (__nv_bfloat16*)xp.data_ptr()};
   moe_large<<<grid, LW * 32, lsmem(M), at::cuda::getCurrentCUDAStream()>>>(p);
 }
 """
@@ -927,7 +939,7 @@ def _ext(large=False):
         for d in _DBG:
             if d.startswith("-DCFG=") and not large: wpc, stg = map(int, d[6:].split("x"))
         m = load_inline("moe_w4a16_v13_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),
-                        cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor); void moel(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t);",
+                        cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor); void moel(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                         cuda_sources=CUDA, functions=["moe", "moel"],
                         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + extra + _arch() + [d for d in _DBG if not d.startswith("-DCFG=")], verbose=False)
         if large: _mod8 = m
@@ -985,7 +997,7 @@ def prepare(weights):
     st = {"w1": w1, "w2": w2, "g1": weights["w13_gs"].float() * 256.0, "g2": weights["w2_gs"].float() * 256.0,
             "nw": 1.0 + weights["post_norm_w"].float(), "ctr": torch.zeros(256, dtype=torch.int32, device=dev),
             "tcnt": torch.zeros(32 * 768, dtype=torch.int32, device=dev),
-            "prof": torch.zeros((65536 * 16 + 64 * 192 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
+            "prof": torch.zeros((65536 * 16 + 64 * 192 if "-DPROF" in _DBG or "-DLPROF" in _DBG else 0,), dtype=torch.int64, device=dev),
             "ws": torch.empty((32 * 768 * 8 * 64 * 4,), dtype=torch.float32, device=dev)}
     if DIAG:
         _diag(st, weights)
@@ -1042,7 +1054,7 @@ def kernel_fn(data, state):
     if WGL and 64 < M <= 512 and "-DNOWGL" not in _DBG:
         xp = torch.empty_like(x)
         _ext(True).moel(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
-                        xp, out, data["config"]["local_start"])
+                        xp, out, data["config"]["local_start"], state["prof"])
         return out
     _ext(LARGE and M > 64).moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], inter, y, ss, state["ctr"],
                                state["tcnt"], state["ws"], out, data["config"]["local_start"], state["prof"])
