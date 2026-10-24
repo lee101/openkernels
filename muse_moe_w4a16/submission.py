@@ -407,9 +407,9 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       int nt = min(NTM, (cnt - ps * 8 * NTM + 7) >> 3);
       fin = g2 ? dispatch<1, S>(C, nt, e, mt, ps, i, s0, s0 + span) : dispatch<0, S>(C, nt, e, mt, ps, i, s0, s0 + span);
     }
-    if (fin) {
-      fence_ar(); __syncwarp();
-      if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
+    if (fin) {  // release this tile's stores to the dependent phase (no full fence: the release add orders them)
+      __syncwarp();
+      if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : e)) : "memory");
     }
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
@@ -507,7 +507,7 @@ def _ext(large=False):
             wpc, stg, extra = 8, (4 if big else 2), ["-DNTM=8", "-DSCR=2048"]
         for d in _DBG:
             if d.startswith("-DCFG=") and not large: wpc, stg = map(int, d[6:].split("x"))
-        m = load_inline("moe_w4a16_v14_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),
+        m = load_inline("moe_w4a16_v17_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),
                         cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                         cuda_sources=CUDA, functions=["moe"],
                         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + extra + [d for d in _DBG if not d.startswith("-DCFG=")], verbose=False)

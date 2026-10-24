@@ -2594,9 +2594,9 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       int nt = min(NTM, (cnt - ps * 8 * NTM + 7) >> 3);
       fin = g2 ? dispatch<1, S>(C, nt, e, mt, ps, i, s0, s0 + span) : dispatch<0, S>(C, nt, e, mt, ps, i, s0, s0 + span);
     }
-    if (fin) {
-      fence_ar(); __syncwarp();
-      if (lane == 0) atomicAdd(p.ctr + (g2 ? NLOC : e), 1);
+    if (fin) {  // release this tile's stores to the dependent phase (no full fence: the release add orders them)
+      __syncwarp();
+      if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : e)) : "memory");
     }
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
@@ -2694,7 +2694,7 @@ def M__ext(large=False):
             wpc, stg, extra = 8, (4 if big else 2), ["-DNTM=8", "-DSCR=2048"]
         for d in M__DBG:
             if d.startswith("-DCFG=") and not large: wpc, stg = map(int, d[6:].split("x"))
-        m = load_inline("moe_w4a16_v14_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(M__DBG).replace("-", "_").replace("=", "")),
+        m = load_inline("moe_w4a16_v17_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(M__DBG).replace("-", "_").replace("=", "")),
                         cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                         cuda_sources=M_CUDA, functions=["moe"],
                         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-DWPC=%d" % wpc, "-DNSTG=%d" % stg] + extra + [d for d in M__DBG if not d.startswith("-DCFG=")], verbose=False)
@@ -3660,6 +3660,7 @@ def prepare(weights):
     hi = weights["router"].to(torch.bfloat16)
     st["rA"], st["rA2"] = P__pack(hi), P__pack((weights["router"] - hi.float()).to(torch.bfloat16))
     st["rhi"], st["rlo"] = hi.contiguous(), (weights["router"] - hi.float()).to(torch.bfloat16).contiguous()
+    st["rhl_t"] = torch.cat((st["rhi"], st["rlo"])).t().contiguous()
     st["pws"] = torch.zeros((256 * 8192,), dtype=torch.float32, device=hi.device)
     st["pk"] = {k: P__pack(weights[k]) for k in ("qkv_gate", "o", "pooler", "unpooler")}  # mma A-fragment order for the GEMV
     st["gws"] = torch.zeros((32 * 8192,), dtype=torch.float32, device=hi.device)
@@ -3770,8 +3771,8 @@ def kernel_fn(data, st):
     cur, side = torch.cuda.current_stream(), st["side"]
     side.wait_stream(cur)
     with torch.cuda.stream(side):  # router + routing overlap the pooler, as in SGLang
-        if T > 256:  # FP32 router as a BF16 hi + lo pair with FP32 accumulation
-            lg.copy_(_mm32(h, st["rhi"].T)); lg += _mm32(h, st["rlo"].T)
+        if T > 256:  # FP32 router as a BF16 hi + lo pair with FP32 accumulation (it overlaps the pooler on a side stream:
+            lg.copy_(_mm32(h, st["rhi"].T)); lg += _mm32(h, st["rlo"].T)  # rtr / one concatenated GEMM here did not help, judge v8)
         else:
             P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)
         g.routing(lg, st["router_bias"], data["local_start"], ids, loc, tw)
