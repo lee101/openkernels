@@ -23,4 +23,4 @@ torch.cuda.synchronize()
 print(f"prepare {time.time() - t:.1f}s")
 for r in st["gvlog"]:
     print(*r)
-print({k: s.GVI[v[0]] for k, v in st["gv"].items()})
+print({k: s._name(v[0]) if hasattr(s, "_name") else s.GVI[v[0]] for k, v in st["gv"].items()})
