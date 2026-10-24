@@ -55,3 +55,9 @@
 - Production setting on a RunPod RTX 5090 (same GPU class as the live `gpu-rtx5090` cog), 896x672x124 frames, 20 steps, res_multistep/simple, cfg 1, Q4_K_M DiT + Q4_K_M Qwen3-VL TE, --offload-to-cpu, --diffusion-fa: total 313 s (text encode 12.5 s, sampling 244 s = 12.2 s/step, VAE decode 54 s); with --cache-mode spectrum 207 s (sampling 141 s, decode 45 s).
 - Live ComfyUI cog (int8_convrot DiT, NVFP4 TE, Sol-Attn INT8 + Spectrum) on the 5090: 48-72 s generation (manifoldgen docs/old-anime-1920-results, same size/frames). sd.cpp is 3-5x slower at production size: attention-bound at ~73K tokens (ggml FA is fp16 mma; the cog uses INT8 attention + step caching), plus a 54 s VAE decode. Not deployed.
 - 5090 (RunPod) production-size follow-up, same prompt/seed: SageAttention (`--sage-attn`) 14.6 -> 9.1 s/step; DiT+VAE resident (`--params-backend te=cpu`, no --offload-to-cpu) 7.1 s/step and VAE decode 42 -> 29 s (offload re-streamed 34 GB of VAE weights per decode). 20 steps + `--cache-mode spectrum`: 121.7 s total (TE 18.4, sampling 72.4, decode 29.0) vs 313 s baseline; without spectrum 288.6 s. Remaining gap to the ComfyUI cog (~60 s): TE runs from host-mapped params (16 GB staged in 0.36 s, then 12.5 s compute = PCIe reads; on-GPU TE 5.6 s but auto-fit never evicts it before the DiT, OOM at block 37), VAE decode 29 s, DiT 7.1 s/step. CUDA graphs: VAE decode slower (per-tile recapture).
+
+### H3 sd-server warm bench (RunPod 5090, 2026-10-24)
+896x672x124f, 20 steps res_multistep, spectrum, --diffusion-fa --sage-attn --params-backend te=cpu. sd-server has no -M flag.
+- e2e: cold 126.0s, warm-same 110.4s, warm-new 110.3s (~8s HTTP/encode overhead).
+- warm stages: TE 7.0s (cold 17.6s), sampling 68.5s, VAE decode 25.3s, generate 102s.
+- Gap vs cog (48-72s): sampling ~3.4s/step and VAE 25s. Next: int8/fp8 DiT GEMMs instead of Q4_K MMQ, fused VAE decode, TE on GPU then evict.
