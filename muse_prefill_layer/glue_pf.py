@@ -104,6 +104,91 @@ void finish(torch::Tensor Y, torch::Tensor list, torch::Tensor offs, torch::Tens
   post<<<Y.size(0), 256, 0, st>>>((const __nv_bfloat16*)Y.data_ptr(), list.data_ptr<int>(), offs.data_ptr<int>(), gw.data_ptr<float>(), tw.data_ptr<float>(), acc.data_ptr<float>());
   tobf<<<(acc.numel() + 255) / 256, 256, 0, st>>>(acc.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(), acc.numel());
 }
+
+// grouped NT GEMM (fallback when torch has no _grouped_mm): C[rows of group e] = A[rows] @ B[e]^T, bf16 in/out, fp32 acc.
+// tiles: 128 rows x 128 cols, K step 32, 3-stage cp.async ring, 8 warps (2 x 4) of 64 x 32, ldmatrix + mma.sync.
+__device__ __forceinline__ void gcp(uint32_t s, const void* g, bool ok) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(g), "r"(ok ? 16 : 0)); }
+__device__ __forceinline__ void ldm4(uint32_t a, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void gmma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__global__ void __launch_bounds__(256) ggemm(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, const int* offs, int N, int K) {
+  extern __shared__ __align__(128) uint8_t sm[];  // 3 x 16 KB
+  __shared__ int ti[2];
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, wm = w >> 2, wn = w & 3;
+  if (tid == 0) {  // which (group, row tile) this CTA owns: tiles enumerated group by group
+    int t = blockIdx.x, e = 0, lo = 0;
+    for (; e < 32; e++) { const int hi = offs[e], nt = (hi - lo + 127) >> 7; if (t < nt) break; t -= nt; lo = hi; }
+    ti[0] = e; ti[1] = lo + t * 128;
+  }
+  __syncthreads();
+  const int e = ti[0];
+  if (e >= 32) return;
+  const int r0 = ti[1], rend = offs[e], n0 = blockIdx.y * 128;
+  const __nv_bfloat16* Bg = B + (size_t)e * N * K;
+  const uint32_t sb = (uint32_t)__cvta_generic_to_shared(sm);
+  auto load = [&](int st, int k0) {  // A tile 128 x 32 then B tile 128 x 32: 64 B rows, chunk c at c ^ (r >> 1 & 3)
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      const int idx = i * 256 + tid, r = idx >> 2, c = idx & 3;
+      const uint32_t off = r * 64 + ((c ^ ((r >> 1) & 3)) << 4);
+      gcp(sb + st * 16384 + off, A + (size_t)min(r0 + r, rend - 1) * K + k0 + c * 8, r0 + r < rend);
+      gcp(sb + st * 16384 + 8192 + off, Bg + (size_t)(n0 + r) * K + k0 + c * 8, true);
+    }
+    asm volatile("cp.async.commit_group;\n");
+  };
+  float acc[4][4][4] = {};
+  const int nk = K / 32;
+  load(0, 0); load(1, 32);
+  for (int kt = 0; kt < nk; kt++) {
+    if (kt + 2 < nk) load((kt + 2) % 3, (kt + 2) * 32); else asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    __syncthreads();
+    const uint32_t sa = sb + (kt % 3) * 16384, sbb = sa + 8192;
+#pragma unroll
+    for (int kk = 0; kk < 2; kk++) {
+      uint32_t af[4][4], bf[2][4];
+#pragma unroll
+      for (int mi = 0; mi < 4; mi++) {
+        const int r = wm * 64 + mi * 16 + (lane & 15), c = kk * 2 + (lane >> 4);
+        ldm4(sa + r * 64 + ((c ^ ((r >> 1) & 3)) << 4), af[mi][0], af[mi][1], af[mi][2], af[mi][3]);
+      }
+#pragma unroll
+      for (int nj = 0; nj < 2; nj++) {
+        const int r = wn * 32 + nj * 16 + (lane & 7) + ((lane >> 4) << 3), c = kk * 2 + ((lane >> 3) & 1);
+        ldm4(sbb + r * 64 + ((c ^ ((r >> 1) & 3)) << 4), bf[nj][0], bf[nj][1], bf[nj][2], bf[nj][3]);
+      }
+#pragma unroll
+      for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++) gmma(acc[mi][ni], af[mi], bf[ni >> 1][(ni & 1) * 2], bf[ni >> 1][(ni & 1) * 2 + 1]);
+    }
+    __syncthreads();
+  }
+  const int g = lane >> 2, t = lane & 3;
+#pragma unroll
+  for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+    for (int hh = 0; hh < 2; hh++) {
+      const int r = r0 + wm * 64 + mi * 16 + g + hh * 8;
+      if (r >= rend) continue;
+#pragma unroll
+      for (int ni = 0; ni < 4; ni++) {
+        const int c = n0 + wn * 32 + ni * 8 + 2 * t;
+        *(__nv_bfloat162*)(C + (size_t)r * N + c) = __floats2bfloat162_rn(acc[mi][ni][2 * hh], acc[mi][ni][2 * hh + 1]);
+      }
+    }
+}
+void gmm(torch::Tensor A, torch::Tensor B, torch::Tensor offs, torch::Tensor C) {
+  const int N = B.size(1), K = B.size(2), R = A.size(0);
+  dim3 grid((R + 127) / 128 + 32, N / 128);
+  static bool once = false;
+  if (!once) { cudaFuncSetAttribute(ggemm, cudaFuncAttributeMaxDynamicSharedMemorySize, 3 * 16384); once = true; }
+  ggemm<<<grid, 256, 3 * 16384, at::cuda::getCurrentCUDAStream()>>>((const __nv_bfloat16*)A.data_ptr(), (const __nv_bfloat16*)B.data_ptr(), (__nv_bfloat16*)C.data_ptr(), offs.data_ptr<int>(), N, K);
+}
 """
 _pfmod = None
 
@@ -111,19 +196,17 @@ _pfmod = None
 def _pfext():
     global _pfmod
     if _pfmod is None:
-        _pfmod = load_inline("pf_moe_v1", cpp_sources="void dequant(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void routes(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void gather(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void act(torch::Tensor,torch::Tensor,torch::Tensor); void finish(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor);",
-                             cuda_sources=PF_CUDA, functions=["dequant", "routes", "gather", "act", "finish"], extra_cuda_cflags=["-O3"], verbose=False)
+        _pfmod = load_inline("pf_moe_v2", cpp_sources="void dequant(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void routes(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void gather(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void act(torch::Tensor,torch::Tensor,torch::Tensor); void finish(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor); void gmm(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor);",
+                             cuda_sources=PF_CUDA, functions=["dequant", "routes", "gather", "act", "finish", "gmm"], extra_cuda_cflags=["-O3"], verbose=False)
     return _pfmod
 
 
-def _gmm(A, B, offs):
-    """grouped A[rows of group e] @ B[e]; CUTLASS grouped GEMM on Hopper, a per-group loop elsewhere (host sync: tests only)"""
-    if torch.cuda.get_device_capability() == (9, 0):
-        return torch._grouped_mm(A, B, offs=offs)
-    out = torch.zeros((A.shape[0], B.shape[2]), dtype=torch.bfloat16, device=A.device)
-    o = [0] + offs.tolist()
-    for e in range(B.shape[0]):
-        if o[e + 1] > o[e]: out[o[e]:o[e + 1]] = A[o[e]:o[e + 1]] @ B[e]
+def _gmm(A, W, offs):
+    """grouped A[rows of group e] @ W[e].T (W [E, N, K]): torch's CUTLASS grouped GEMM when present, else ours"""
+    if hasattr(torch, "_grouped_mm") and torch.cuda.get_device_capability() == (9, 0):
+        return torch._grouped_mm(A, W.transpose(1, 2), offs=offs)
+    out = torch.empty((A.shape[0], W.shape[1]), dtype=torch.bfloat16, device=A.device)
+    _pfext().gmm(A, W, offs, out)
     return out
 
 
@@ -142,10 +225,10 @@ def _moe_large(p, loc, tw, st):
     g.dequant(st["pw2"], st["pw2_sf"], st["pw2_gs"], cnt, w2)
     A = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.gather(p, lst, offs, A)
-    H = _gmm(A, w13.transpose(1, 2), offs)
+    H = _gmm(A, w13, offs)
     I = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.act(H, offs, I)
-    Y = _gmm(I, w2.transpose(1, 2), offs)
+    Y = _gmm(I, w2, offs)
     acc = torch.empty((T, 4096), dtype=torch.float32, device=dev)
     out = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
     g.finish(Y, lst, offs, st["g_post_expert_norm"], tw.view(-1), acc, out)
