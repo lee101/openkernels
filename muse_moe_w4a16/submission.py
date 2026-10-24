@@ -386,12 +386,16 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
   for (int i = 0; i < S - 1 + EARLYREL; i++) C.issue(i);
   PEVC(p, gw, lane, C.ev, 8);
   for (int i = 0;; i++) {
+    PEVC(p, gw, lane, C.ev, 10);
     const int u = C.tid_of(i);
     if (u >= C.N) break;
     int nxt = 0;
-    if (lead) nxt = atomicAdd(p.ctr + QI, 1);  // tile for i + 3 (minus 3 NG): consumed only after this tile
+    // tile for i + 3 (minus 3 NG), consumed only after this tile. Plain asm: atomicAdd gets warp-aggregated into an
+    // atomic + shfl, and the shfl would wait for the (contended) atomic right here.
+    if (lead) asm volatile("atom.global.inc.u32 %0, [%1], 2147483647;\n" : "=r"(nxt) : "l"(p.ctr + QI) : "memory");
     int g2, e, mt; C.item(u, g2, e, mt);
     const int cnt = sm->cnt[e], np = (cnt + 8 * NTM - 1) / (8 * NTM);
+    PEVC(p, gw, lane, C.ev, 11);
 #ifdef PROF
     long long c0 = clock64();
 #endif
@@ -409,6 +413,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
     }
     __syncwarp();
     const int span = SPT / ks, s0 = C.gj * span;
+    PEVC(p, gw, lane, C.ev, 12);
     bool fin = false;
     for (int ps = 0; ps < np; ps++) {
       int nt = min(NTM, (cnt - ps * 8 * NTM + 7) >> 3);
@@ -418,7 +423,7 @@ __global__ void __launch_bounds__(WPC * 32, 1) moe_kernel(P p) {
       __syncwarp();
       if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], 1;\n" :: "l"(p.ctr + (g2 ? NLOC : 64 + e * 4 + mt / (T1E / 4))) : "memory");
     }
-    if (lead) sm->ids[C.gi][(i + 3) & 3] = nxt + 3 * NG;  // read by the group's producers after the next tile's barrier
+    if (lead) ((volatile int*)sm->ids[C.gi])[(i + 3) & 3] = nxt + 3 * NG;  // volatile: stays after the tile (the atomic's latency hides behind it)
     __syncwarp();
 #ifdef PROF
     PADD(g2 ? 3 : 2, clock64() - c0); PADD(8, 1);
