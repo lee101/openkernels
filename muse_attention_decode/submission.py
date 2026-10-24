@@ -44,7 +44,11 @@ CUDA = r"""
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <cooperative_groups.h>
 #define D 64
+#ifndef CLUS
+#define CLUS 1
+#endif
 #define LOG2E 1.4426950408889634f
 #ifndef PFF
 #define PFF 0
@@ -1355,6 +1359,7 @@ __device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, fl
   __sincosf((float)(a - k * 6.283185307179586), &sn, &cs);
 }
 
+template <bool CL>
 __global__ void __launch_bounds__(256, 1) fdec(F p) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
   PT(0);
@@ -1609,6 +1614,60 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   };
   PT(4);
   if (p.NS == 1) { finish(acc, L); PT(5); return; }
+#if __CUDA_ARCH__ >= 900
+  if constexpr (CL) {  // the request's NS splits form a thread-block cluster: partials meet in distributed shared memory
+    namespace cg = cooperative_groups;
+    cg::cluster_group cl = cg::this_cluster();
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+    __syncthreads();
+    float* xs = (float*)smem;  // this CTA's partial: [16 rows][64] O, then [16] (m, l)
+    ((float4*)(xs + r * 64))[dv] = acc;
+    if (dv == 0) { xs[1024 + 2 * r] = M; xs[1024 + 2 * r + 1] = L; }
+    cl.sync();
+    PT(5);
+    const int NS = p.NS, rp = 16 / NS, d4 = tid & 15, kg = (tid >> 4) & (NS - 1), rl = tid / (16 * NS);
+    const int hr = s + rl * NS;  // rows s, s + NS, ...
+    const float* rx = cl.map_shared_rank(xs, kg);
+    const float2 ml = *(const float2*)(rx + 1024 + 2 * hr);
+    const float4 ov = ((const float4*)(rx + hr * 64))[d4];
+    float* xm = xs + 2048;            // [16][16] max
+    float* xl = xm + 256;             // [16][16] weighted sums
+    float* xo = xl + 256;             // [16][16][64]
+    const int slot = rl * NS + kg;
+    if (d4 == 0) xm[slot] = ml.x;
+    __syncthreads();
+    float Mr = -INFINITY;
+    for (int k = 0; k < NS; k++) Mr = fmaxf(Mr, xm[rl * NS + k]);
+    const float wt = ml.x == -INFINITY ? 0.f : ex2(ml.x - Mr);
+    ((float4*)(xo + slot * 64))[d4] = make_float4(wt * ov.x, wt * ov.y, wt * ov.z, wt * ov.w);
+    if (d4 == 0) xl[slot] = wt * ml.y;
+    __syncthreads();
+    if (kg == 0 && rl < rp) {
+      float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
+      float Lr = 0.f;
+      for (int k = 0; k < NS; k++) {
+        const float4 v = ((const float4*)(xo + (rl * NS + k) * 64))[d4];
+        a4.x += v.x; a4.y += v.y; a4.z += v.z; a4.w += v.w;
+        Lr += xl[rl * NS + k];
+      }
+      const float inv = p.vscale / Lr;
+      a4.x *= inv; a4.y *= inv; a4.z *= inv; a4.w *= inv;
+      float ss = a4.x * a4.x + a4.y * a4.y + a4.z * a4.z + a4.w * a4.w;
+#pragma unroll
+      for (int x = 1; x < 16; x <<= 1) ss += __shfl_xor_sync(0xffffu << (lane & 16), ss, x);
+      const float rn = rsqrtf(ss / D + 1e-5f);
+      const __nv_bfloat16* gt = row + 20 * D + hr * D + d4 * 4;
+      const float vals[4] = {a4.x, a4.y, a4.z, a4.w};
+      __nv_bfloat16 ob[4];
+#pragma unroll
+      for (int i = 0; i < 4; i++) ob[i] = __float2bfloat16(vals[i] * rn / (1.f + expf(-__bfloat162float(gt[i]))));
+      *(uint2*)(p.out + (size_t)b * 16 * D + hr * D + d4 * 4) = *(uint2*)ob;
+    }
+    PT(6);
+    cl.sync();  // remote reads of this CTA's partial are done before it exits
+    return;
+  }
+#endif
   float* gwo = p.wo + ((size_t)(b * p.NS + s) * 16 + r) * D;
   ((float4*)gwo)[dv] = acc;
   if (dv == 0) { p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2] = M; p.wml[((size_t)(b * p.NS + s) * 16 + r) * 2 + 1] = L; }
@@ -1684,8 +1743,20 @@ void run_fdec(torch::Tensor qkv, torch::Tensor loc, torch::Tensor kc, torch::Ten
   p.prof = prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr; p.invf = invf.data_ptr<float>();
   const int sm = max(8 * RBF * 4096 + 256, (512 + 256 * D) * 4);  // ring+table, or the merge scratch
   static bool once = false;
-  if (!once) { cudaFuncSetAttribute(fdec, cudaFuncAttributeMaxDynamicSharedMemorySize, sm); once = true; }
-  fdec<<<p.B * NS, 256, sm, at::cuda::getCurrentCUDAStream()>>>(p);
+  if (!once) {
+    cudaFuncSetAttribute(fdec<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaFuncSetAttribute(fdec<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaFuncSetAttribute(fdec<true>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    once = true;
+  }
+  static int major = 0; if (!major) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev); }
+  if (CLUS && major >= 9 && NS > 1 && NS <= 16 && (NS & (NS - 1)) == 0) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(p.B * NS); cfg.blockDim = dim3(256); cfg.dynamicSmemBytes = sm; cfg.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = NS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+    cfg.attrs = at; cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, fdec<true>, p);
+  } else fdec<false><<<p.B * NS, 256, sm, at::cuda::getCurrentCUDAStream()>>>(p);
 }
 
 void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc, torch::Tensor ksc,
@@ -1791,7 +1862,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v27_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v28_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor);",
                            cuda_sources=CUDA, functions=["run", "run_fdec"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
@@ -1815,6 +1886,7 @@ def _diag(dev):
             qkv = torch.randn((B, 1, 2304), device=dev).bfloat16()
             span = min(mp, window + 1) if window else mp
             NS = max(1, min(132 // B, (span + _NSDIV - 1) // _NSDIV))
+            if NS <= 17: NS = 1 << (min(NS, 16).bit_length() - 1)
             wo = torch.empty((B * NS * 16 * 64,), device=dev); wml = torch.empty((B * NS * 32,), device=dev)
             cnt = torch.zeros((2 * B,), dtype=torch.int32, device=dev); out = torch.empty((B, 1, 1024), dtype=torch.bfloat16, device=dev)
             prof = torch.zeros((B * NS * 8 * 8,), dtype=torch.int64, device=dev)
@@ -1845,6 +1917,8 @@ def kernel_fn(data):
         maxkeys = data["page_table"].shape[1] * cfg["page_size"]
         span = min(maxkeys, cfg["window"] + 1) if cfg["window"] else maxkeys
         NS = max(1, min(132 // B, (span + _NSDIV - 1) // _NSDIV))  # keys per CTA >= _NSDIV, one wave
+        if _hopper() and NS <= 17:  # one cluster per request (power of two <= 16): split merge in distributed shared memory
+            NS = 1 << (min(NS, 16).bit_length() - 1)
         key = ("f", B, NS)
         if key not in _BUF:
             _BUF[key] = (torch.empty((B * NS * 16 * 64,), dtype=torch.float32, device=dev),
