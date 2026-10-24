@@ -1363,6 +1363,10 @@ __device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, fl
 template <bool CL>
 __global__ void __launch_bounds__(256, 1) fdec(F p) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t = lane & 3;
+#ifdef FD_EMPTY
+  if (tid == 0 && p.NS < 0) p.out[0] = __float2bfloat16(0.f);
+  return;
+#endif
   PT(0);
   const int b = blockIdx.x / p.NS, s = blockIdx.x % p.NS;
   // raw query / new key / value loads first: they need nothing, and everything below waits on seq and the page table
@@ -1398,6 +1402,9 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
   auto issue = [&](int slot, int rl, bool tabok) {  // the new token's row comes from the table once it is written
     const uint32_t d0 = ring + slot * 4096;
     if (__all_sync(0xffffffffu, rl == -1)) { asm volatile("cp.async.commit_group;\n"); return; }  // past the range: nothing to load
+#ifdef FD_NOLOAD
+    asm volatile("cp.async.commit_group;\n"); return;
+#endif
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       const int r = i * 4 + (lane >> 3), rw = __shfl_sync(0xffffffffu, rl, r);
@@ -1521,6 +1528,9 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
       rpf = rowsfor(kb + (RBF + PFF) * 16);
     }
     const uint32_t sl = ring + (bi % RBF) * 4096;
+#ifdef FD_NOCOMP
+    if (sl == 0xffffffffu)
+#endif
 #pragma unroll
     for (int h = 0; h < 2; h++) {
       uint4 kw[2];
@@ -1615,6 +1625,10 @@ __global__ void __launch_bounds__(256, 1) fdec(F p) {
     *(uint2*)(p.out + (size_t)b * 16 * D + r * D + dv * 4) = *(uint2*)ob;
   };
   PT(4);
+#ifdef FD_NOMERGE
+  if (s == 0) finish(acc, L);
+  return;
+#endif
   if (p.NS == 1) { finish(acc, L); PT(5); return; }
 #if __CUDA_ARCH__ >= 900
   if constexpr (CL) {  // the request's NS splits form a thread-block cluster: partials meet in distributed shared memory
