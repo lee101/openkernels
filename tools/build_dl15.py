@@ -43,7 +43,7 @@ BIG = ("attnw", "attnw39", "attnx")
 
 
 def sub(s, a, b, n=1):
-    assert s.count(a) == n, (a[:80], s.count(a))
+    assert s.count(a) == n, (a[:80], s.count(a), n)
     return s.replace(a, b)
 
 
@@ -111,13 +111,15 @@ def p_attn(s):
 
 
 def p_moe(s):
-    """MoE v29: PDL on the small-M kernel (CUDA, M <= 64); the M > 64 CTA-ring kernel (CUDA_L) is left as is"""
+    """MoE v30: PDL on the v17-style kernel (CUDA: _ext / _extS builds); the CTA-ring kernel (CUDA_L) is left as is"""
     i = s.index('CUDA_L = r"""')
     s, rest = s[:i], s[i:]
     s = sub(s, "#include <ATen/cuda/CUDAContext.h>\n", "#include <ATen/cuda/CUDAContext.h>\n" + MAC)
-    rest = sub(rest, 'load_inline("moe_w4a16_v29_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void moe(',
-               'load_inline("moe_w4a16_v29p%d_%%d_%%d%%s%%s" %% (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void pdl_set(int64_t); void moe(' % LATE)
-    rest = sub(rest, 'cuda_sources=CUDA, functions=["moe"]', 'cuda_sources=CUDA, functions=["moe", "pdl_set"]')
+    rest = sub(rest, 'load_inline("moe_w4a16_v30_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void moe(',
+               'load_inline("moe_w4a16_v30p%d_%%d_%%d%%s%%s" %% (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void pdl_set(int64_t); void moe(' % LATE)
+    rest = sub(rest, '"moe_w4a16_v30S_%d_%d_k%d" % (wpc, stg, ksf),\n                                 cpp_sources="void moe(',
+               '"moe_w4a16_v30Sp%d_%%d_%%d_k%%d" %% (wpc, stg, ksf),\n                                 cpp_sources="void pdl_set(int64_t); void moe(' % LATE)
+    rest = sub(rest, 'cuda_sources=CUDA, functions=["moe"]', 'cuda_sources=CUDA, functions=["moe", "pdl_set"]', 2)
     s = sub(s, "  if (tid < NLOC) sm->cnt[tid] = 0;\n  __syncthreads();\n", "  if (tid < NLOC) sm->cnt[tid] = 0;\n  __syncthreads();\n  PDL_WAIT(); PDL_GO_EARLY();\n")
     s = sub(s, "  const int T2 = sm->na * T2E;\n", "  PDL_GO_LATE();\n  const int T2 = sm->na * T2E;\n")
     s = tops(s, skip=("moe_kernel",))
@@ -187,7 +189,8 @@ def p_glue(s):
     rc = 'P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)'
     ma = 'p, loc, tw, ms["w1"], ms["w2"], ms["g1"], ms["g2"], ms["nw"], inter, y2, ss, '
     s = sub(s, 'M__ext(M_LARGE and T > 64).moe(' + ma + 'ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"])',
-            '(M__extL().moe(' + ma + 'ms["ctrL"], ms["wsL"], y, 0, 1, ms["prof"]) if T > M_MBIG else M__ext(False).moe(' + ma + 'ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"]))')
+            'y = M_kernel_fn({"hidden_states": p, "topk_ids": loc, "topk_weights": tw, "config": {"local_start": 0}}, ms)  # MoE v30: per-M tuned kernel')
+    s = sub(s, "_gext(); A__ext(); P__ext(); M__ext(M_LARGE)", "_gext(); A__ext(); P__ext(); M__ext(False)")
     return sub(s, rc, "_router(h, lg, st)")
 
 
@@ -196,6 +199,7 @@ def tmpf(name, text):
 
 
 POLICY = '''
+M_TUNE_M = (1, 8, 16, 32, 128, 256)  # MoE v30 per-M tune: the layer's token counts only (buckets cover the tests' T)
 
 _PDLX = ("attn", "glue", "gv", "rtr", "moe")
 
@@ -210,13 +214,14 @@ _kernel_fn19 = kernel_fn
 def kernel_fn(data, st):
     pol = _pdlpol(data["config"]["tokens"])
     A__ext().pdl_set(int(pol["attn"])); _gext().pdl_set(int(pol["glue"])); P__gvext().pdl_set(int(pol["gv"])); P__ext().pdl_set(int(pol["rtr"]))
-    M__ext(False).pdl_set(int(pol["moe"]))
+    for k in M_V17_KSF:
+        M__extS(k).pdl_set(int(pol["moe"]))
     return _kernel_fn19(data, st)
 
 
 def _precompile():
     import threading
-    th = [threading.Thread(target=f) for f in (A__ext, lambda: M__ext(M_LARGE), lambda: M__ext(False), M__extL, _gext, P__ext, P__gvext)]
+    th = [threading.Thread(target=f) for f in [A__ext, lambda: M__extL(0), lambda: M__extL(1), _gext, P__ext, P__gvext] + [lambda k=k: M__extS(k) for k in M_V17_KSF]]
     for t in th:
         t.start()
     for t in th:
