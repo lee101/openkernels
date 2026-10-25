@@ -239,7 +239,7 @@ if __name__ == "__main__":
             refo = x.double() @ w.double().T
             if hl:
                 hlt = Wd.t().contiguous()
-                tcb = tm(lambda: (lambda a: a[:, :N] + a[:, N:])(x.float() @ hlt.float())) - off  # stand-in for v12's lt path
+                tcb = tm(lambda: (lambda a: a[:, :N].float() + a[:, N:].float())(x @ hlt)) - off  # bf16-out stand-in for v12's N=512 GEMM + add
             else:
                 tcb = tm(lambda: x @ w.T) - off
             for k, inst in enumerate(WBI):

@@ -1,0 +1,26 @@
+router   M=128 (64, 6, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb   9.92  ref  18.85
+router 128 (64, 8, 16, 1, 2) rc 1
+router   M=128 (64, 4, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb  10.05  ref  18.85
+router   M=128 (64, 6, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  12.45  ref  18.85
+router 128 (64, 8, 8, 1, 2) rc 1
+router   M=128 (64, 6, 4, 1, 2) err 5.1e-06 probe 0.0e+00  wgb  19.81  ref  18.85
+router 128 (64, 6, 16, 1, 4) rc 1
+router 128 (64, 6, 8, 1, 4) rc 1
+router   M=128 (64, 4, 8, 1, 4) err 3.3e-06 probe 0.0e+00  wgb  15.78  ref  18.85
+router   M=128 (128, 4, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  16.74  ref  18.85
+router   M=128 (128, 4, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb  13.92  ref  18.85
+router   M=128 (32, 8, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  10.18  ref  18.85
+router 128 (32, 8, 16, 1, 4) rc 1
+router   M=256 (64, 6, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb  19.90  ref  18.56
+router 256 (64, 8, 16, 1, 2) rc 1
+router   M=256 (64, 4, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb  19.36  ref  18.56
+router   M=256 (64, 6, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  12.38  ref  18.56
+router 256 (64, 8, 8, 1, 2) rc 1
+router   M=256 (64, 6, 4, 1, 2) err 5.1e-06 probe 0.0e+00  wgb  20.00  ref  18.56
+router 256 (64, 6, 16, 1, 4) rc 1
+router 256 (64, 6, 8, 1, 4) rc 1
+router   M=256 (64, 4, 8, 1, 4) err 3.3e-06 probe 0.0e+00  wgb  17.44  ref  18.56
+router   M=256 (128, 4, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  16.74  ref  18.56
+router   M=256 (128, 4, 16, 1, 2) err 2.7e-06 probe 0.0e+00  wgb  14.11  ref  18.56
+router   M=256 (32, 8, 8, 1, 2) err 3.3e-06 probe 0.0e+00  wgb  19.74  ref  18.56
+router 256 (32, 8, 16, 1, 4) rc 1
