@@ -10,7 +10,7 @@ D = R / "muse_attention_decode"
 ap = argparse.ArgumentParser()
 ap.add_argument("sub"); ap.add_argument("--seeds", type=int, default=1); ap.add_argument("--only", default=None)
 ap.add_argument("--all", action="store_true"); ap.add_argument("--dbg", default=""); ap.add_argument("--stress", type=int, default=0)
-ap.add_argument("--native", action="store_true"); ap.add_argument("--ovr", default="")
+ap.add_argument("--native", action="store_true"); ap.add_argument("--ovr", default=""); ap.add_argument("--vovr", default=""); ap.add_argument("--kind", default="")
 a = ap.parse_args()
 sys.path.insert(0, str(D))
 
@@ -28,6 +28,7 @@ elif a.dbg:
     sub._DBG = a.dbg.split()
 for kv in filter(None, a.ovr.split(";")):
     k, v = kv.split("="); kk = k.split(","); sub.OVR[(kk[0], int(kk[1]), bool(int(kk[2])))] = int(v)
+if a.vovr: sub.VOVR = tuple(int(x) for x in a.vovr.split(","))
 meta = json.load(open(R / "notes" / "muse_attention_decode.json"))
 
 
@@ -42,6 +43,7 @@ blk = re.search(r"must pass these \d+ tests.*?```\n(.*?)```", (D / "TASK.md").re
 tests = [parse(l) for l in blk.group(1).strip().splitlines()]
 cases = [("test", t) for t in tests] + [("bench", b) for b in meta["benchmarks"]]
 if not a.all: cases = [c for c in cases if c[1].get("q_len", 1) == 8]
+if a.kind: cases = [c for c in cases if c[0] == a.kind]
 if a.only: cases = [c for c in cases if a.only in json.dumps(c[1])]
 args_of = lambda c: {k: v for k, v in c.items() if k not in ("load", "weight", "repeats")}
 bad = 0
