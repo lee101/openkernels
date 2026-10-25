@@ -111,14 +111,17 @@ def p_attn(s):
 
 
 def p_moe(s):
+    """MoE v29: PDL on the small-M kernel (CUDA, M <= 64); the M > 64 CTA-ring kernel (CUDA_L) is left as is"""
+    i = s.index('CUDA_L = r"""')
+    s, rest = s[:i], s[i:]
     s = sub(s, "#include <ATen/cuda/CUDAContext.h>\n", "#include <ATen/cuda/CUDAContext.h>\n" + MAC)
-    s = sub(s, '"moe_w4a16_v17_%d_%d%s%s"', '"moe_w4a16_v17p%d_%%d_%%d%%s%%s"' % LATE)
-    s = sub(s, 'cpp_sources="void moe(', 'cpp_sources="void pdl_set(int64_t); void moe(')
-    s = sub(s, 'functions=["moe"]', 'functions=["moe", "pdl_set"]')
+    rest = sub(rest, 'load_inline("moe_w4a16_v29_%d_%d%s%s" % (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void moe(',
+               'load_inline("moe_w4a16_v29p%d_%%d_%%d%%s%%s" %% (wpc, stg, "_L" if large else "", "".join(_DBG).replace("-", "_").replace("=", "")),\n                        cpp_sources="void pdl_set(int64_t); void moe(' % LATE)
+    rest = sub(rest, 'cuda_sources=CUDA, functions=["moe"]', 'cuda_sources=CUDA, functions=["moe", "pdl_set"]')
     s = sub(s, "  if (tid < NLOC) sm->cnt[tid] = 0;\n  __syncthreads();\n", "  if (tid < NLOC) sm->cnt[tid] = 0;\n  __syncthreads();\n  PDL_WAIT(); PDL_GO_EARLY();\n")
     s = sub(s, "  const int T2 = sm->na * T2E;\n", "  PDL_GO_LATE();\n  const int T2 = sm->na * T2E;\n")
     s = tops(s, skip=("moe_kernel",))
-    return launches(s)
+    return launches(s) + rest
 
 
 def p_proj(s):
@@ -182,6 +185,9 @@ def p_glue(s):
     s = tops(s, skip=("resid",))
     s = launches(s)
     rc = 'P__ext().run(st["rA"], st["rA2"], h, lg, st["pws"], st["pcnt"], 256)'
+    ma = 'p, loc, tw, ms["w1"], ms["w2"], ms["g1"], ms["g2"], ms["nw"], inter, y2, ss, '
+    s = sub(s, 'M__ext(M_LARGE and T > 64).moe(' + ma + 'ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"])',
+            '(M__extL().moe(' + ma + 'ms["ctrL"], ms["wsL"], y, 0, 1, ms["prof"]) if T > M_MBIG else M__ext(False).moe(' + ma + 'ms["ctr"], ms["tcnt"], ms["ws"], y, 0, ms["prof"]))')
     return sub(s, rc, "_router(h, lg, st)")
 
 
@@ -204,8 +210,17 @@ _kernel_fn19 = kernel_fn
 def kernel_fn(data, st):
     pol = _pdlpol(data["config"]["tokens"])
     A__ext().pdl_set(int(pol["attn"])); _gext().pdl_set(int(pol["glue"])); P__gvext().pdl_set(int(pol["gv"])); P__ext().pdl_set(int(pol["rtr"]))
-    M__ext(False).pdl_set(int(pol["moe"])); M__ext(True).pdl_set(int(pol["moe"]))
+    M__ext(False).pdl_set(int(pol["moe"]))
     return _kernel_fn19(data, st)
+
+
+def _precompile():
+    import threading
+    th = [threading.Thread(target=f) for f in (A__ext, lambda: M__ext(M_LARGE), lambda: M__ext(False), M__extL, _gext, P__ext, P__gvext)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
 '''.replace("@@POL@@", POL)
 head = '''# okc: problem=muse_decode_layer
 """Decoder layer: c12 register-direct GEMV / cuBLAS projections + fused split-KV FP8 attention + fused residual norms + NVFP4 W4A16 MoE; PDL selectable per (kernel, T)."""
