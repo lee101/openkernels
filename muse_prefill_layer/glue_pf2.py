@@ -353,6 +353,24 @@ void dequant2(torch::Tensor w, torch::Tensor sf, torch::Tensor gs, torch::Tensor
   deq2<<<(n2 + 255) / 256, 256, 0, at::cuda::getCurrentCUDAStream()>>>((const uint4*)w.data_ptr(), (const uint16_t*)sf.data_ptr(), gs.data_ptr<float>(),
       cnt.data_ptr<int>(), (uint4*)out.data_ptr(), nbe, n2);
 }
+// each request's visible keys/values (sliding: its window) gathered into contiguous [B, maxk, 128 B] rows for FA3's TMA path
+__global__ void __launch_bounds__(256) kvg(const uint4* kc, const uint4* vc, const int* pt, const int* seq, int maxp, int ps, int L, int win, int maxk,
+                                           uint4* ko, uint4* vo, int* cslo) {
+  const int b = blockIdx.y, sb = seq[b], s0 = win ? max(0, sb - win + 1) : 0, n = sb + L - s0;
+  if (blockIdx.x == 0 && threadIdx.x == 0) cslo[b] = n;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n * 8; i += gridDim.x * blockDim.x) {
+    const int j = i >> 3, c = i & 7, p = s0 + j;
+    const size_t r = ((size_t)pt[(size_t)b * maxp + p / ps] * ps + p % ps) * 8 + c, o = ((size_t)b * maxk + j) * 8 + c;
+    ko[o] = __ldcs(kc + r); vo[o] = __ldcs(vc + r);
+  }
+}
+void kvgather(torch::Tensor kc, torch::Tensor vc, torch::Tensor pt, torch::Tensor seq, int64_t L, int64_t win, torch::Tensor ko, torch::Tensor vo, torch::Tensor cslo) {
+  TORCH_CHECK(kc.size(2) * kc.size(3) == 128);
+  const int B = ko.size(0), maxk = ko.size(1);
+  dim3 grid(min((maxk * 8 + 255) / 256, 1024), B);
+  kvg<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>((const uint4*)kc.data_ptr(), (const uint4*)vc.data_ptr(), pt.data_ptr<int>(), seq.data_ptr<int>(),
+      (int)pt.size(1), (int)kc.size(1), (int)L, (int)win, maxk, (uint4*)ko.data_ptr(), (uint4*)vo.data_ptr(), cslo.data_ptr<int>());
+}
 template <typename K> static int occ(K k, int nt, int smem) {
   int n = 0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, nt, smem); return n > 0 ? n : 1;
 }
@@ -410,7 +428,7 @@ void rlist(torch::Tensor loc, torch::Tensor cnt, torch::Tensor offs, torch::Tens
 """
 _pf2mod = None
 import time
-_PF2_FN = ["qkprep", "ongate", "res_a", "res_b", "rmsgain2", "gathnorm", "act2", "combine", "routing2", "rlist", "dequant2"]
+_PF2_FN = ["qkprep", "ongate", "res_a", "res_b", "rmsgain2", "gathnorm", "act2", "combine", "routing2", "rlist", "dequant2", "kvgather"]
 
 
 def _pf2():
@@ -418,7 +436,7 @@ def _pf2():
     if _pf2mod is None:
         import re
         decl = " ".join(re.sub(r"\s+", " ", m) + ";" for m in re.findall(r"^void \w+\([^)]*\)", PF2_CUDA, re.M) if m.split("(")[0][5:] in _PF2_FN)
-        _pf2mod = load_inline("pf2_glue_v9", cpp_sources=decl, cuda_sources=PF2_CUDA, functions=_PF2_FN, extra_cuda_cflags=["-O3"], verbose=False)
+        _pf2mod = load_inline("pf2_glue_v10", cpp_sources=decl, cuda_sources=PF2_CUDA, functions=_PF2_FN, extra_cuda_cflags=["-O3"], verbose=False)
     return _pf2mod
 
 
@@ -536,6 +554,9 @@ int64_t lt_mm(torch::Tensor x, torch::Tensor w, torch::Tensor wt, torch::Tensor 
 """
 _ltmod = []
 LT_TUNE = True
+ALIGN_LOCAL = True  # align only the local routes over 32 buckets: Marlin (is_ep) then has no -1 blocks to walk past
+KVC_TUNE = True
+KVC_CASES = ((1, 753, 80000, 0), (1, 753, 80000, 2048), (4, 753, 80000, 0), (4, 753, 80000, 2048), (1, 16384, 32768, 0), (1, 16384, 32768, 2048))
 MAR_BM = {}  # T -> Marlin moe_block_size override (default: SGLang's heuristic)
 # H200 picks from the pf8 judge search, (layout, CUBLASLT_ALGO_CONFIG_*) seeds tried next to the heuristics
 LT_JOBS = (("o", 3012), ("o", 16384), ("pooler", 16384), ("unpooler", 16384))
@@ -672,20 +693,60 @@ def prepare(weights):
         st["bank"]["nopos"], st["bank"]["post_wf"] = st["nocnt"], st["g_post_expert_norm"]
     for k in ("o", "pooler", "unpooler"):
         st[k + "_t"] = weights[k].t().contiguous()
-    st["lt"] = {}
+    st["lt"], st["kvc"] = {}, {}
     torch.cuda.synchronize()
     print(f"pf2 compiled at {time.time() - _T0[0]:.1f}s (lean {lean})", flush=True)
+    fl, sink = torch.empty(64 << 20, dtype=torch.float32, device=dev), torch.empty((), device=dev)
     if LT_TUNE:
-        fl, sink = torch.empty(64 << 20, dtype=torch.float32, device=dev), torch.empty((), device=dev)
         _lt_tune(st, fl, sink)
-        del fl, sink
+    if KVC_TUNE and lean:
+        _kvc_tune(st, fl, sink)
+    del fl, sink
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     print(f"pf2 prepare done at {time.time() - _T0[0]:.1f}s", flush=True)
     return st
 
 
-def _attn_pf(data, cfg, qkv, B, L, T):
+def _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, hkv, win, sm, desc, sched, kvc):
+    """FA3 on the paged cache, or (kvc) on each request's visible keys gathered into a contiguous cache (TMA path)"""
+    ws = (win - 1, 0) if win else (-1, -1)
+    if kvc:
+        maxk = (win - 1 + L) if win else pt.shape[1] * kc.shape[1]
+        k2 = torch.empty((B, maxk, hkv, 64), dtype=kc.dtype, device=kc.device); v2 = torch.empty_like(k2)
+        c2 = torch.empty((B,), dtype=torch.int32, device=kc.device)
+        _pf2().kvgather(kc, vc, pt, seq, L, win, k2, v2, c2)
+        return A__fa3()(q=q8.view(torch.float8_e4m3fn), k_cache=k2, v_cache=v2, cache_seqlens=c2, cu_seqlens_q=cuq, max_seqlen_q=L,
+                        softmax_scale=sm, causal=True, window_size=ws, **desc)
+    return A__fa3()(q=q8.view(torch.float8_e4m3fn), k_cache=kc, v_cache=vc, page_table=pt, cache_seqlens=csl, cu_seqlens_q=cuq, max_seqlen_q=L,
+                    softmax_scale=sm, causal=True, window_size=ws, scheduler_metadata=sched, **desc)
+
+
+def _kvc_tune(st, fl, sink):
+    """per (batch, q_len, sliding): FA3 on the page-1 cache vs gather-to-contiguous + FA3, synthetic caches at the scored contexts"""
+    dev = st["o"].device
+    for B, L, ctx, win in KVC_CASES:
+        try:
+            n = ctx + L
+            kc = torch.randn((B * n, 1, 2, 64), device=dev).to(torch.float8_e4m3fn); vc = torch.randn_like(kc, dtype=torch.float32).to(torch.float8_e4m3fn)
+            pt = torch.randperm(B * n, device=dev).to(torch.int32).view(B, n)
+            seq = torch.full((B,), ctx, dtype=torch.int32, device=dev); csl = seq + L
+            cuq = torch.arange(0, B * L + 1, L, dtype=torch.int32, device=dev)
+            q8 = torch.randn((B * L, 16, 64), device=dev).to(torch.float8_e4m3fn).view(torch.uint8)
+            run = lambda k: _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, 2, win, 0.125, {}, None, k)
+            o0, o1 = run(False), run(True)
+            o0 = o0[0] if isinstance(o0, tuple) else o0; o1 = o1[0] if isinstance(o1, tuple) else o1
+            err = float((o1.float() - o0.float()).norm() / o0.float().norm())
+            t0, t1 = _gtm(lambda: run(False), fl, sink, 9), _gtm(lambda: run(True), fl, sink, 9)
+            t0, t1 = min(t0, _gtm(lambda: run(False), fl, sink, 9)), min(t1, _gtm(lambda: run(True), fl, sink, 9))
+            st["kvc"][(B, L, bool(win))] = err < 1e-2 and t1 < t0 * 0.98
+            print(f"pf2 kvc B{B} L{L} ctx{ctx} win{win}: paged {t0 * 1e3:.1f}us contiguous {t1 * 1e3:.1f}us err {err:.1e} -> {st['kvc'][(B, L, bool(win))]}", flush=True)
+            del kc, vc, pt, q8, o0, o1
+        except Exception as e:
+            print(f"pf2 kvc B{B} L{L} failed: {e}", flush=True)
+
+
+def _attn_pf(data, cfg, qkv, B, L, T, st):
     hq, hkv = cfg["num_q_heads"], cfg["num_kv_heads"]
     dev = qkv.device
     if not (A_FA3PF and A__fa3() is not None and A__hopper() and cfg["head_dim"] == 64):
@@ -708,9 +769,8 @@ def _attn_pf(data, cfg, qkv, B, L, T):
     if float(cfg["kv_scale"]) != 1.0:
         desc = dict(k_descale=data["k_scale"].reshape(1, 1).expand(B, hkv), v_descale=data["v_scale"].reshape(1, 1).expand(B, hkv))
     win = cfg["window"]
-    o = A__fa3()(q=q8.view(torch.float8_e4m3fn), k_cache=data["k_cache"], v_cache=data["v_cache"], page_table=data["page_table"],
-                 cache_seqlens=csl, cu_seqlens_q=cuq, max_seqlen_q=L, softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
-                 window_size=(win - 1, 0) if win else (-1, -1), scheduler_metadata=data.get("scheduler_metadata"), **desc)
+    o = _fa3_run(q8, data["k_cache"], data["v_cache"], data["page_table"], data["seq_lens"], csl, cuq, B, L, hkv, win,
+                 cfg["sm_scale"] * cfg["qk_scale_factor"], desc, data.get("scheduler_metadata"), st["kvc"].get((B, L, bool(win)), False))
     if isinstance(o, tuple):
         o = o[0]
     out = torch.empty((T, hq * 64), dtype=torch.bfloat16, device=dev)
@@ -785,7 +845,7 @@ def kernel_fn(data, st):
     dev = x.device
     g = _pf2()
     qkv = _dmm(x, st, "qkv_gate")
-    att = _attn_pf(data, cfg, qkv, B, L, T)
+    att = _attn_pf(data, cfg, qkv, B, L, T, st)
     a = _dmm(att, st, "o")
     h = torch.empty((T, 8192), dtype=torch.bfloat16, device=dev)
     ra = torch.empty((T,), dtype=torch.float32, device=dev)
@@ -806,7 +866,7 @@ def kernel_fn(data, st):
         g.routing2(lg, st["router_bias"], data["local_start"], ids, loc, lid, tw, st["nocnt"] if mar else cnt)
         if mar:
             mm = _marlin_mods()
-            al = mm["align"](lid, bm, 256)
+            al = mm["align"](lid, bm, 32, ignore_invalid_expert=True) if ALIGN_LOCAL else mm["align"](lid, bm, 256)
             if not torch.cuda.is_current_stream_capturing():
                 for t_ in al:
                     t_.record_stream(cur)
