@@ -67,7 +67,7 @@ CUDA = r"""
 #define C_BAR 35
 #define C_CNT 64
 #ifndef LAG
-#define LAG 1
+#define LAG 64  // all W13 before W2: LAG=1 left producers spinning on W2 dependencies (H100 PROF)
 #endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define TMA 1
