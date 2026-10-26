@@ -50,11 +50,11 @@ if os.environ.get("PROFF"):
         data = ref.generate_input(M, "ep8", 5)
         for c in [c for c in cfgs if c[0] == "fs"]:
             for _ in range(3):
-                sink.copy_(fl.sum()); m._fs(data, st, c)
+                st["profF"].zero_(); sink.copy_(fl.sum()); m._fs(data, st, c)
             torch.cuda.synchronize()
             P = st["profF"].view(-1, 8).cpu()
             n = (P[:, 0] > 0).sum().item(); P = P[:n].double(); t0 = P[:, 0].min()
             q = lambda k, f: (P[:, k] - t0).quantile(f).item() / 1e3
-            mm = min(M, n)
+            mm = n
             print(f"prof M{M} {c} ctas {n}: pro p50/max {q(1,.5):.1f}/{q(1,1):.1f} A p10/50/max {q(2,.1):.1f}/{q(2,.5):.1f}/{q(2,1):.1f} "
-                  f"B {q(3,.1):.1f}/{q(3,.5):.1f}/{q(3,1):.1f} bar {((P[:mm, 4] - t0).max().item() / 1e3):.1f} c1 {((P[:mm, 6] - t0).max().item() / 1e3):.1f} c2 {((P[:mm, 7] - t0).max().item() / 1e3):.1f} end {((P[:mm, 5] - t0).max().item() / 1e3):.1f}", flush=True)
+                  f"B {q(3,.1):.1f}/{q(3,.5):.1f}/{q(3,1):.1f} bar {((P[:mm, 4] - t0).max().item() / 1e3):.1f} fin {((P[:, 7] > 0).nonzero().flatten().tolist()[:3])} c4 {((P[:, 4] - t0) * (P[:, 7] > 0)).max().item() / 1e3:.1f} c1 {((P[:mm, 6] - t0).max().item() / 1e3):.1f} c2 {((P[:mm, 7] - t0).max().item() / 1e3):.1f} end {((P[:mm, 5] - t0).max().item() / 1e3):.1f}", flush=True)
