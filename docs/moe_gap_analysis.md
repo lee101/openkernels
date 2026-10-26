@@ -1,0 +1,132 @@
+# muse_moe_w4a16: how does anyone reach 2.33?
+
+Ours: v34, judge 1.5745. Leader: 2.33, which is 1.48x faster than us in geomean.
+
+## 1. Shapes, routing, byte floors
+
+Sources: `muse_moe_w4a16/reference.py`, `notes/muse_moe_w4a16.json`, `_bytes.py`.
+
+- H = I = 4096, 256 experts, top-8, ep8 (local experts 0-31). One expert is W13 [8192, 4096] + W2 [4096, 4096] = 50.3M NVFP4 values, which is 25.2 MB of codes + 3.1 MB of e4m3 scales = **28.3 MB**.
+- `generate_input`: `scores = rand(bs, 256)` plus a per-expert popularity term `0.03 * t2` (Student-t with 2 degrees of freedom, so heavy-tailed), then `topk(8)`. `rank="busiest"` rotates ids by whole GPUs so that the 32 local experts hold the most pairs. Each token's 8 draft positions are routed independently, with no correlation inside a verify block.
+- Judge seeds: random 64-bit values, new on every run and every repetition (judge record: `seed 6380544118842228819`, ...). The `benchmarks` seeds 401-406 in the metadata are not what gets timed. Every one of the 100 repetitions gets a fresh routing.
+- The TASK floor uses `ROUTING_SHARE = 0.75` times the mean number of distinct experts, so it understates the real mean-routing byte floor by 1.33x.
+
+Monte Carlo over 400 seeds of the real generator (scratch `sim.py`):
+
+| load | M | distinct local experts mean [p10 p50 p90] | local pairs | max tok/expert p50 [p90] | weight MB | t@3.9 TB/s | t@4.8 | SGLang | ours |
+|---|---|---|---|---|---|---|---|---|---|
+| decode1 | 1 | 2.58 [2 2 3] | 2.6 | 1 | 73 | 18.7 | 15.2 | 80.7 | 50.4 |
+| decode16 | 16 | 12.1 [9 12 15] | 25.8 | 6 [16] | 343 | 87.9 | 71.4 | 187.3 | 126.2 |
+| decode32 | 32 | 16.1 [12 16 20] | 49.6 | 11 [31] | 457 | 117.1 | 95.1 | 214.3 | 175.0 |
+| verify1 | 8 | 8.4 [6 8 11] | 13.9 | 4 [8] | 237 | 60.7 | 49.3 | 150.9 | 101.4 |
+| verify16 | 128 | 22.6 [19 23 26] | 195 | 47 [128] | 640 | 164.1 | 133.4 | 469.0 | 259.3 |
+| verify32 | 256 | 24.7 [22 25 28] | 388 | 99 [255] | 700 | 179.5 | 145.8 | 633.5 | 340.5 |
+
+Activation bytes are below 4 MB and are ignored. The weight codes are uniform random (`randint(0,256)`), so the bytes listed are the floor except for the scales (see 4c).
+
+Geomean of SGLang time over time (using our per-load numbers, ours comes out at 1.563, not the judge's 1.5745, because the judge uses paired-ratio medians):
+
+| profile | d1 | d16 | d32 | v1 | v16 | v32 | gm |
+|---|---|---|---|---|---|---|---|
+| ours | 50.4 | 126.2 | 175.0 | 101.4 | 259.3 | 340.5 | 1.56 |
+| weight floor @3.9 TB/s | 18.7 | 87.9 | 117.1 | 60.7 | 164.1 | 179.5 | **2.74** |
+| weight floor @4.8 TB/s | 15.2 | 71.4 | 95.1 | 49.3 | 133.4 | 145.8 | 3.37 |
+| floor@3.9 / 0.85 | 22.1 | 103.4 | 137.7 | 71.4 | 193.1 | 211.1 | 2.33 |
+| bytes/3.7 TB/s + 5 us | 24.8 | 97.6 | 128.4 | 69.0 | 178.0 | 194.2 | 2.41 |
+| ours uniformly / 1.48 | 34.1 | 85.3 | 118.3 | 68.5 | 175.2 | 230.1 | 2.31 |
+
+- A 2.33 score means running every load at about 85% of the 3.9 TB/s weight-streaming roofline (3.3 TB/s effective, end to end), or 69% of the 4.8 TB/s peak. That is physically plausible, so the score needs no exploit.
+- A uniform 1.48x over us is not possible. d16 would need 85 µs, below its 3.9 TB/s floor (88 µs), and d32 would need 118 µs, at its floor (117 µs; our NOCOMP skeleton alone takes 137 µs). The leader must therefore be much further ahead of us where we are furthest from the floor. Our time divided by the floor is: **d1 2.7x**, v32 1.9x, v1 1.67x, v16 1.58x, d32 1.49x, d16 1.44x.
+
+## 2. Timing loop (judge)
+
+The judge's `harness/eval.py`, `runner.py` and `worker.py` are not in the repo; we only have their hashes in `notes/moe_check*.json`. The evidence below is TASK.md plus the judge's result records.
+
+TASK.md, "How a run is timed":
+> Each shape is captured as a CUDA graph and timed by replaying it, in the same run and on the same GPU as SGLang's kernel, your replays and SGLang's taking turns on the same fresh inputs.
+> Every timed replay starts with a cold L2: the judge reads a buffer larger than L2 just before it.
+> The judge subtracts a graph replay's fixed cost (about 4 µs) from both sides.
+
+and under Rules:
+> **Fresh inputs.** Every call gets new inputs; don't cache anything derived from `data`.
+
+`reference.py`: `MAX_REPEATS = 100  # Timed repetitions per shape; each is checked.`
+
+Judge record (`notes/moe_check11.json`, decode1):
+`"replay_overhead": {"gate_ns": 299136, "one_ns": 4992, "overhead_ns": 3904, "parent_one_ns": 304064, ...}`, `"runs": 100`, setup `"baseline_copies": 4, "copies": 1, "prepare_pad": 7215104`.
+
+- **L2 flush:** yes, before every timed replay. The `gate` is a read of a large buffer that takes about 299 µs, which is roughly 1 GB, far more than the 50 MB L2.
+- **Inputs:** the weights (the prepare state) persist. hidden_states, topk_ids and topk_weights are refilled for every repetition, and SGLang and we get the same values in each pair. Baseline per-repetition times swing widely (d16: best 139 µs, median 190, worst 264) because the routing changes on every repetition.
+- **L2 residency:** not possible. The flush runs before every replay, the set of hit experts changes on every repetition, and even decode1 touches 73 MB, which is more than L2. `copies` / `baseline_copies` / `prepare_pad` suggest the judge also rotates or pads state copies where memory allows. We get 1 copy because our state is large.
+- **CUDA graphs:** yes, capture once and replay. `parent_*` and `outside_bursts_ns` show the judge also times work outside the graph.
+
+## 3. What is legal
+
+`checks.py` is numerics only: relative L2 at most 1.5e-2 over the whole output, each row at most 5x that (against the row norm, floored at 0.1x the mean row norm), and no NaN or Inf. It says nothing about caching. The rules come from TASK.md, AGENTS.md and the static checks.
+
+Legal:
+- Any repack, reorder or interleave of weights in `prepare()`. It runs untimed, for up to 300 s.
+- **Lossless compression** of the weights ("compress them losslessly if you like"; in bf16_proj, c12 took us from 1.146 to 1.366).
+- Dequantizing inside the kernel. Branching on shape or config. Per-M autotuning in prepare (we already do this).
+- Any device-side, data-dependent control flow inside the kernel.
+
+Not legal:
+- Caching or memoizing anything derived from `data` (topk, x, outputs) across calls; AGENTS.md: "cache or replay outputs" gets you removed.
+- Storing weights at a different precision. For example, BF16-expanded weights are out, because "NVFP4 stays NVFP4, or smaller losslessly".
+- Activations below BF16 where SGLang keeps BF16.
+- Host syncs or allocation inside kernel_fn.
+- Patching timing, reading harness frames or I/O, editing loaded modules, importing reference, starting processes, network access (static checks).
+- Final review reruns on held-out and nearby shapes, so any trick tuned to the generator gets a closer look.
+
+Note: a hi+lo FP8 split of x (to use FP8 wgmma) is grey at best. It is also blocked on its own terms: an e2m1 x e4m3 block-scale product needs up to 6 significant bits, so the scaled weight is not exact in FP8, and the 16-wide block scale cannot be applied inside a k=32 FP8 wgmma. Not a path.
+
+## 4. Likely mechanisms (ranked)
+
+### (a) wgmma RS large-M path: weights in registers, tokens in smem (M >= 8; biggest gm lever)
+
+This is the Humming design (`docs/upstream_ideas.md` item 1). Dequant warpgroups produce the A fragment (64 W rows x k16, BF16, in registers; the same per-warp layout as the mma.sync A fragment). B is the expert's gathered x rows, loaded into smem once per CTA per K chunk, with N = ceil8(tokens) capped at 128 per wgmma.
+
+What changes against our mma.sync ring:
+- **Tensor issue:** one wgmma per 64x16 weights for all of the expert's tokens, instead of 4 warps x N/8 HMMAs.
+- **B traffic:** about 4x less smem/L1 traffic. For v32 that is about 0.77 GB of smem reads, versus about 3.1 GB of B fragments with m16n8k16.
+- **Hot experts:** experts with 47 / 99 / 128-255 tokens (p50/p90 at v16/v32) cost about the same issue per weight as cold ones. Today they cost 2.5x per granule (v36d: nt4 13.9 vs nt1 6.3 µs per granule).
+- **Clock:** fewer instructions means less power, which recovers some of the 1979 to 1808 MHz clock drop.
+
+Consumer cost then becomes dequant only: 24.7 experts x 50.3M values at about 17 instructions per 8 values comes to about 87 µs at IPC 1, which is below v32's 180 µs stream time. So v16 and v32 become stream-bound.
+
+Estimates: v16 about 185-195 µs, v32 about 200-210 µs, v1 about 70-75 µs, d16 about 105 µs, d32 about 135-145 µs. The floor under d32 is the skeleton, NOCOMP at 137 µs, so d32 also needs the prologue and tail trimmed.
+
+### (b) decode1: a single-pass, latency-hidden GEMV (biggest single-load lever, 2.7x off the floor)
+
+v34d FD M1 breakdown: prologue 3.1, W13 done 29.4 (49 MB, about 1.9 TB/s, consumer-latency-bound at IPC about 0.27), W2 done 39.2, barrier 41.5, exchange 49.2, end 51.2.
+
+Target: about 25 µs, which is 73 MB at 3.9 TB/s plus about 5 µs of prologue and tail. Ingredients:
+- **Prefetch W2 into L2 during W13.** The hit experts' W2 is 24.5 MB (28 MB at p90), which fits in the 50 MB L2. Use `cp.async.bulk.prefetch.L2` for the contiguous slabs with an evict_last policy, and evict_first for the W13 stream. HBM then never idles across the W13 to W2 dependency, and phase B runs from L2.
+- **Raise consumer IPC at M=1.** Options: split K so each warp keeps its x slice in registers (this removes the 5 µs of activation ldg); deeper unroll / software pipelining of LDS, dequant and HMMA; fewer stages per mbarrier. The issue budget is only about 8 µs at IPC 1, so the problem is latency, not instruction count.
+- **Combine in one stage.** Replace the barrier plus column-split exchange (about 10 µs) with a last-arriver RMSNorm on the 2-3 rows. LASTA got the exchange to 45.8, so the remaining tail is in the finisher passes.
+
+Alone this is worth gm 1.56 to 1.76. Combined with (a) it reaches **gm about 2.30** (d1 25, d16 105, d32 135, v1 72, v16 190, v32 205).
+
+### (c) Lossless scale compression (about 4-6% fewer bytes on every load)
+
+Codes are incompressible: uniform, 4.0 bits, or 3.875 bits if ±0 are merged, which is not worth exploiting. The e4m3 block scales (11.1% of bytes) are log-normal with σ = 0.4 octave. Measured on the generator: **32 distinct codes (95..126), entropy 3.71 bits**, top-16 coverage 98.7%.
+
+Options:
+- **5-bit fixed width** (code minus a per-expert base), verified lossless in prepare with a raw-8-bit fallback per expert: saves 4.2% of bytes.
+- **4-bit with a per-16/32-group base:** the range fits in 15 steps for 95% / 85% of groups, and the rest need an escape. That is about 5.5%, at the cost of complexity.
+
+On top of (a) and (b): gm 2.30 to about 2.40.
+
+## Conclusion
+
+2.33 is reachable without exploits. It corresponds to about 85% of the 3.9 TB/s weight roofline on every load, and the leader most plausibly has:
+1. A near-roofline decode1 (about 25 µs vs our 50).
+2. A wgmma-RS (or otherwise B-reuse-heavy) large-M path that makes v16/v32/v1 stream-bound (about 190 / 205 / 72 µs vs our 259 / 341 / 101).
+3. Possibly lossless scale compression for the last few percent.
+
+d16 and d32 cannot carry the gap: they are already within 1.44x and 1.49x of their floors.
+
+What to build, in order:
+1. A wgmma RS expert GEMM for M >= 8, with gathered x in smem, N per expert up to 128, and dequant warpgroups feeding A registers. Validate the layouts with bench/wgt.py first.
+2. A decode1 path: W2 L2 prefetch during W13, split-K x in registers, and a single last-arriver combine.
+3. A 5-bit scale pack in prepare (lossless check plus fallback), shared by both paths.
