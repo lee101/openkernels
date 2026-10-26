@@ -83,7 +83,11 @@ if not PROF:
         B, sl = e[:2]
         d = R.generate_input(batch=B, ctx=80000, heads="tp8", layer="sliding" if sl else "full", seed=7, q_len=1, spread="agentic" if B > 1 else "fixed", dist="soft" if sl else "coherent", page=1)
         for fl in (e[2:] or (None,)):
+            S.DAOVR = None
+            if isinstance(fl, tuple) and fl[0] == "a": S.DAOVR = (fl[1], fl[2]); fl = None
+            elif isinstance(fl, tuple): S.OVR[("d", B, bool(sl))] = fl[1]; fl = fl[0]
+            else: S.OVR.pop(("d", B, bool(sl)), None)
             S.DFLOVR = fl
             ok, msg = R.check_implementation(d, R.collect(d, S.kernel_fn(d)))
-            print("T d%d%s fl%s %.2f %s" % (B, "s" if sl else "f", fl, gt(lambda: S.kernel_fn(d)), "" if ok else "BAD " + msg[:80]), flush=True)
-        S.DFLOVR = None
+            print("T d%d%s fl%s ns%s ad%s %.2f %s" % (B, "s" if sl else "f", fl, S.OVR.get(("d", B, bool(sl))), S.DAOVR, gt(lambda: S.kernel_fn(d)), "" if ok else "BAD " + msg[:80]), flush=True)
+        S.DFLOVR = None; S.DAOVR = None

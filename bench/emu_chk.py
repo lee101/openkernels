@@ -10,7 +10,7 @@ D = R / "muse_attention_decode"
 ap = argparse.ArgumentParser()
 ap.add_argument("sub"); ap.add_argument("--seeds", type=int, default=1); ap.add_argument("--only", default=None)
 ap.add_argument("--all", action="store_true"); ap.add_argument("--dbg", default=""); ap.add_argument("--stress", type=int, default=0)
-ap.add_argument("--native", action="store_true"); ap.add_argument("--ovr", default=""); ap.add_argument("--vovr", default=""); ap.add_argument("--kind", default=""); ap.add_argument("--dfl", type=int, default=-1); ap.add_argument("--l1", action="store_true")
+ap.add_argument("--native", action="store_true"); ap.add_argument("--ovr", default=""); ap.add_argument("--vovr", default=""); ap.add_argument("--kind", default=""); ap.add_argument("--dfl", type=int, default=-1); ap.add_argument("--l1", action="store_true"); ap.add_argument("--daovr", default="")
 a = ap.parse_args()
 sys.path.insert(0, str(D))
 
@@ -30,6 +30,7 @@ for kv in filter(None, a.ovr.split(";")):
     k, v = kv.split("="); kk = k.split(","); sub.OVR[(kk[0], int(kk[1]), bool(int(kk[2])))] = int(v)
 if a.dfl >= 0: sub.DFLOVR = a.dfl
 if a.vovr: sub.VOVR = tuple(int(x) for x in a.vovr.split(","))
+if a.daovr: sub.DAOVR = tuple(int(x) for x in a.daovr.split(","))
 meta = json.load(open(R / "notes" / "muse_attention_decode.json"))
 
 
