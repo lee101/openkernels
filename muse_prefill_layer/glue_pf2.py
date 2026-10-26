@@ -599,10 +599,12 @@ _ltmod = []
 LT_TUNE = True
 ALIGN_LOCAL = True  # align only the local routes over 32 buckets: Marlin (is_ep) then has no -1 blocks to walk past
 KVC_TUNE = True
+FA_TUNE = True  # time FA3 num_splits x pack_gqa per case after the paged/contiguous pick (FA3's heuristic: ~94 CTAs at B1 L753 full)
+FA_FX = tuple({"num_splits": n, "pack_gqa": pg} for n in (1, 2, 3, 4, 6, 8) for pg in (False, True))
 KVC_CASES = ((1, 753, 80000, 0), (1, 753, 80000, 2048), (4, 753, 80000, 0), (4, 753, 80000, 2048), (1, 16384, 32768, 0), (1, 16384, 32768, 2048))
 MOE_Q = True  # time the fused W4A16 prefill kernel in prepare() and use it where it wins
 # fused-ring (muse_moe_w4a16 v23) builds timed in prepare(): extra -D flags over Q__cfg() (TP=128 needs RPW=1: RPW=2 spills, NSLOT=3 exceeds smem)
-QV = {"a": (), "b": ("-DLAG=1",)}  # TP=128 (RPW=1, NSLOT=2) lost 1.4-1.5x on H100
+QV = {"a": (), "b": ("-DLAG=1",)}  # XBULK (583 vs 560 us at T753) and TP=128 builds lost on H100  # TP=128 (RPW=1, NSLOT=2) lost 1.4-1.5x on H100
 HTHR = (256, 384, 512, 768, 1024)  # hybrid split: experts with more local routes than this go to dequant + grouped GEMM
 # per-expert local route counts of the scored soft routing (busiest 32-expert range, ~1.8 routes/token; reference router + judge-style
 # router seeds picked for that load, two draws per size), used for the prepare() timings
@@ -750,7 +752,7 @@ def prepare(weights):
         st["bank"]["nopos"], st["bank"]["post_wf"] = st["nocnt"], st["g_post_expert_norm"]
     for k in ("o", "pooler", "unpooler"):
         st[k + "_t"] = weights[k].t().contiguous()
-    st["lt"], st["kvc"], st["mv"] = {}, {}, {}
+    st["lt"], st["kvc"], st["mv"], st["fx"] = {}, {}, {}, {}
     st["q"] = qj.result() if qj is not None else None
     torch.cuda.synchronize()
     print(f"pf2 compiled at {time.time() - _T0[0]:.1f}s (lean {lean})", flush=True)
@@ -773,9 +775,11 @@ def prepare(weights):
     return st
 
 
-def _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, hkv, win, sm, desc, sched, kvc):
-    """FA3 on the paged cache, or (kvc) on each request's visible keys gathered into a contiguous cache (TMA path)"""
+def _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, hkv, win, sm, desc, sched, kvc, fx=None):
+    """FA3 on the paged cache, or (kvc) on each request's visible keys gathered into a contiguous cache (TMA path); fx: num_splits / pack_gqa"""
     ws = (win - 1, 0) if win else (-1, -1)
+    if fx:
+        desc, sched = {**desc, **fx}, None
     if kvc:
         maxk = (win - 1 + L) if win else pt.shape[1] * kc.shape[1]
         k2 = torch.empty((B, maxk, hkv, 64), dtype=kc.dtype, device=kc.device); v2 = torch.empty_like(k2)
@@ -804,8 +808,28 @@ def _kvc_tune(st, fl, sink):
             err = float((o1.float() - o0.float()).norm() / o0.float().norm())
             t0, t1 = _gtm(lambda: run(False), fl, sink, 9), _gtm(lambda: run(True), fl, sink, 9)
             t0, t1 = min(t0, _gtm(lambda: run(False), fl, sink, 9)), min(t1, _gtm(lambda: run(True), fl, sink, 9))
-            st["kvc"][(B, L, bool(win))] = err < 1e-2 and t1 < t0 * 0.98
+            kv = st["kvc"][(B, L, bool(win))] = err < 1e-2 and t1 < t0 * 0.98
             print(f"pf2 kvc B{B} L{L} ctx{ctx} win{win}: paged {t0 * 1e3:.1f}us contiguous {t1 * 1e3:.1f}us err {err:.1e} -> {st['kvc'][(B, L, bool(win))]}", flush=True)
+            if FA_TUNE:
+                base = min(t0, t1) if kv else t0
+                ref = o1 if kv else o0
+                res = []
+                for fx in FA_FX:
+                    try:
+                        o2 = _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, 2, win, 0.125, {}, None, kv, fx)
+                        o2 = o2[0] if isinstance(o2, tuple) else o2
+                        e2 = float((o2.float() - ref.float()).norm() / ref.float().norm())
+                        if e2 < 1e-2:
+                            f = lambda: _fa3_run(q8, kc, vc, pt, seq, csl, cuq, B, L, 2, win, 0.125, {}, None, kv, fx)
+                            res.append((min(_gtm(f, fl, sink, 9), _gtm(f, fl, sink, 9)), fx))
+                        del o2
+                    except Exception as e:
+                        print(f"pf2 fa3 {fx} failed: {str(e)[:120]}", flush=True)
+                res.sort(key=lambda r: r[0])
+                if res and res[0][0] < base * 0.98:
+                    st["fx"][(B, L, bool(win))] = res[0][1]
+                print(f"pf2 fa3 B{B} L{L} ctx{ctx} win{win} (us): default {base * 1e3:.1f} " + " ".join(f"{fx['num_splits']}{'p' if fx.get('pack_gqa') else ''} {t * 1e3:.1f}" for t, fx in res[:6])
+                      + f" -> {st['fx'].get((B, L, bool(win)))}", flush=True)
             del kc, vc, pt, q8, o0, o1
         except Exception as e:
             print(f"pf2 kvc B{B} L{L} failed: {e}", flush=True)
@@ -835,7 +859,8 @@ def _attn_pf(data, cfg, qkv, B, L, T, st):
         desc = dict(k_descale=data["k_scale"].reshape(1, 1).expand(B, hkv), v_descale=data["v_scale"].reshape(1, 1).expand(B, hkv))
     win = cfg["window"]
     o = _fa3_run(q8, data["k_cache"], data["v_cache"], data["page_table"], data["seq_lens"], csl, cuq, B, L, hkv, win,
-                 cfg["sm_scale"] * cfg["qk_scale_factor"], desc, data.get("scheduler_metadata"), st["kvc"].get((B, L, bool(win)), False))
+                 cfg["sm_scale"] * cfg["qk_scale_factor"], desc, data.get("scheduler_metadata"), st["kvc"].get((B, L, bool(win)), False),
+                 st.get("fx", {}).get((B, L, bool(win))))
     if isinstance(o, tuple):
         o = o[0]
     out = torch.empty((T, hq * 64), dtype=torch.bfloat16, device=dev)
@@ -876,6 +901,33 @@ def _marlin2(x, tw, lid, al, bm, bank, mm):
     return out
 
 
+# XBULK ring builds: the producer fetches each activation row slice (512 B) with one cp.async.bulk per lane (tx-counted on the stage's
+# full barrier, cross-proxy fence after the W13 -> W2 dependency wait) instead of 64 x 32-lane cp.async 16-B loops: the H100 PROF showed
+# the single producer warp issue-bound (NOCOMP 344 of 558 us at T753, producer never waiting on empty slots)
+_QX0 = """        if (lane == 0) expect_tx(fb, WB);
+        __syncwarp();"""
+_QX1 = """#pragma unroll
+        for (int k = 0; k < TP / 32; k++)
+          for (int rw = k * 32; rw < min(ntok, k * 32 + 32); rw++) {
+            const int row = __shfl_sync(0xffffffffu, my[k], rw & 31);
+            cp16(dst + WB + rw * XROW + lane * 16, xsrc + (size_t)row * (HD * 2) + i * 512 + lane * 16);
+          }"""
+if Q_CUDA.count(_QX0) == 1 and Q_CUDA.count(_QX1) == 1:
+    Q_CUDA = Q_CUDA.replace(_QX0, """#if defined(XBULK) && TMA
+        if (lane == 0) expect_tx(fb, WB + ntok * 512);
+#else
+        if (lane == 0) expect_tx(fb, WB);
+#endif
+        __syncwarp();""").replace(_QX1, """#if defined(XBULK) && TMA
+        if (g && i == 0) asm volatile("fence.proxy.async.global;\\n" ::: "memory");
+#pragma unroll
+        for (int k = 0; k < TP / 32; k++)
+          if (k * 32 + lane < ntok) bulk(dst + WB + (k * 32 + lane) * XROW, xsrc + (size_t)my[k] * (HD * 2) + i * 512, 512, fb);
+#else
+""" + _QX1 + """
+#endif""")
+else:
+    print("pf2 XBULK patch did not apply", flush=True)
 Q_DECL = "void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);"
 
 
@@ -883,7 +935,8 @@ def _qfits(fl):
     d = {}
     for x in list(Q__cfg()) + list(fl):
         k, _, val = x[2:].partition("=")
-        d[k] = int(val)
+        if val.isdigit():
+            d[k] = int(val)
     need = d.get("NSLOT", 2) * (d.get("NCW", 8) * d.get("RPW", 1) * 2304 + d.get("TP", 64) * 528) + 2048
     pr = torch.cuda.get_device_properties(0)
     return need <= getattr(pr, "shared_memory_per_block_optin", 232448)
@@ -965,6 +1018,17 @@ def _moe_main(path, pr, loc, lid, tw, d, st, wait=None):
         return _marlin2(p, tw, lid, d["al"], d["bm"], st["bank"], _marlin_mods())
     if kind == "q":
         return _moe_q(p, loc, tw, st, v)
+    if kind == "h" and ovl == 2:
+        dev = pr.device
+        w13 = torch.empty((32, 8192, 4096), dtype=torch.bfloat16, device=dev); w2 = torch.empty((32, 4096, 4096), dtype=torch.bfloat16, device=dev)
+        cur, side = torch.cuda.current_stream(), st["side"]
+        side.wait_stream(cur)
+        with torch.cuda.stream(side):
+            g.dequant3(st["pw13"], st["pw13_sf"], st["pw13_gs"], d["cntb"], w13)
+            g.dequant3(st["pw2"], st["pw2_sf"], st["pw2_gs"], d["cntb"], w2)
+        add = _moe_q(p, d["locq"], tw, st, v)
+        cur.wait_stream(side)
+        return _moe_big(g, pr, d["locb"], tw, d["cntb"], d["offs"], d["lst"], d["pos"], st, add, 0, (w13, w2))
     add = _moe_q(p, d["locq"], tw, st, v) if kind == "h" else st["nocnt"]
     return _moe_big(g, pr, d["locb"], tw, d["cntb"], d["offs"], d["lst"], d["pos"], st, add, ovl)
 
@@ -997,7 +1061,7 @@ MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a"
 
 
 def _mname(k):
-    return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in "qh" else "") + ("o" if k[3] else "")
+    return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in "qh" else "") + ("", "o", "d")[k[3]]
 
 
 def _moe_tune(st, fl, sink):
@@ -1042,6 +1106,8 @@ def _moe_tune(st, fl, sink):
             bo = min((0, 1), key=lambda o: res[("big", 0, "a", o)][0])
             for thr in HTHR:
                 run(("h", thr, bv, bo))
+            bt = min(HTHR, key=lambda t: res[("h", t, bv, bo)][0])
+            run(("h", bt, bv, 2))
             best = min(res, key=lambda k: res[k][0])
             st["mv"][T] = best if res[best][0] < res[dflt][0] * 0.97 else dflt
             print(f"pf2 moe T{T} (us, err): " + " ".join(f"{_mname(k)} {v[0] * 1e3:.0f} {v[1]:.0e}" for k, v in sorted(res.items(), key=lambda kv: kv[1][0]))
@@ -1052,13 +1118,16 @@ def _moe_tune(st, fl, sink):
         torch.cuda.empty_cache()
 
 
-def _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st, add, ovl=0):
+def _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st, add, ovl=0, pre=None):
     T, dev = pr.shape[0], pr.device
     R = T * 8
-    w13 = torch.empty((32, 8192, 4096), dtype=torch.bfloat16, device=dev)
-    w2 = torch.empty((32, 4096, 4096), dtype=torch.bfloat16, device=dev)
     dq = g.dequant3 if DEQ3 else g.dequant2
-    dq(st["pw13"], st["pw13_sf"], st["pw13_gs"], cnt, w13)
+    if pre is None:
+        w13 = torch.empty((32, 8192, 4096), dtype=torch.bfloat16, device=dev)
+        w2 = torch.empty((32, 4096, 4096), dtype=torch.bfloat16, device=dev)
+        dq(st["pw13"], st["pw13_sf"], st["pw13_gs"], cnt, w13)
+    else:
+        w13, w2 = pre
     cur = torch.cuda.current_stream()
     if ovl:
         side = st["side"]
@@ -1071,7 +1140,7 @@ def _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st, add, ovl=0):
     del A, w13
     if ovl:
         cur.wait_stream(side)
-    else:
+    elif pre is None:
         dq(st["pw2"], st["pw2_sf"], st["pw2_gs"], cnt, w2)
     I = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.act2(Hh, offs, I)
