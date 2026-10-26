@@ -1704,18 +1704,46 @@ __device__ __forceinline__ void mb_wait(uint32_t mb, uint32_t ph) {
 template <int NL, int X>
 __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   constexpr int RS = PRS;
-  constexpr bool FS = X & 4, L2H = X & 64, MRG = true;
-  constexpr uint32_t LS = RS * 16384 + 8192 + 32768 + 2048;  // per lane: ring, Q tile, V f16 (2 heads x 2), page-table ring
+  constexpr bool FS = X & 4, L2H = X & 64, MRG = true, BAL = X & 256, PCV = X & 128;
+  // PCV: the producer also converts V to f16 (and places the block's own keys), so the consumers' step is wait, QK, softmax, PV
+  constexpr uint32_t LS = RS * 16384 + 8192 + 32768 + 2048 + (PCV ? 2048 : 0);  // per lane: ring, Q, V f16 (2 heads x 2), page table, own rows
   PS(0);
   const int wg = threadIdx.x >> 7;
   const bool prod = wg == 2 * NL;
   const int LN = prod ? ((threadIdx.x & 127) >> 6) : (wg >> 1);
-  const int nsc = a.nsplit / NL, bq = blockIdx.x / nsc, sp = (blockIdx.x % nsc) * NL + LN, nsp = a.nsplit;
+  int bq, sp, nsp = a.nsplit;
+  bool spare = false;
+  if constexpr (BAL) {  // B <= 32: lanes (grid x NL) split the batch's total keys evenly; every warp derives the same map
+    const int lane_ = threadIdx.x & 31, G = gridDim.x * NL, gl = blockIdx.x * NL + LN;
+    int kb_ = 0;
+    if (lane_ < a.B) { const int sq = a.seq[lane_]; kb_ = sq + 8 - (a.window ? max(0, sq - a.window + 1) : 0); }
+    const int K = __reduce_add_sync(0xffffffffu, kb_), mxk = __reduce_max_sync(0xffffffffu, kb_);
+    int lo = max((K + G - 1) / G, (mxk + a.nsplit - 1) / a.nsplit), hi = max(lo, mxk);
+    while (lo < hi) {
+      const int c = (lo + hi) >> 1;
+      if ((int)__reduce_add_sync(0xffffffffu, lane_ < a.B ? (kb_ + c - 1) / c : 0) <= G) hi = c; else lo = c + 1;
+    }
+    const int nl = lane_ < a.B ? (kb_ + lo - 1) / lo : 0;
+    int pre = nl;
+#pragma unroll
+    for (int o2 = 1; o2 < 32; o2 <<= 1) { const int v2 = __shfl_up_sync(0xffffffffu, pre, o2); if (lane_ >= o2) pre += v2; }
+    const int bb = __popc(__ballot_sync(0xffffffffu, lane_ < a.B && pre <= gl));
+    spare = bb >= a.B;
+    const int bc = spare ? 0 : bb;
+    nsp = max(1, __shfl_sync(0xffffffffu, nl, bc));
+    sp = spare ? 0 : gl - (__shfl_sync(0xffffffffu, pre, bc) - nsp);
+    bq = bc;
+  } else {
+    const int nsc = a.nsplit / NL;
+    bq = blockIdx.x / nsc; sp = (blockIdx.x % nsc) * NL + LN;
+  }
   const int b = bq, t0 = 0, lt = 8, nqb = 1;
   extern __shared__ __align__(1024) uint8_t smem[];
   const uint32_t sb = ((uint32_t)__cvta_generic_to_shared(smem) + 1023) & ~1023u;
   const uint32_t ring = sb + LN * LS, qs = ring + RS * 16384, vf0 = qs + 8192, ptr = vf0 + 32768;
-  const uint32_t ones = sb + NL * LS, mbar = ones + 1024;  // full[NL][RS], empty[NL][RS]
+  const uint32_t ones = sb + NL * LS, mbar = ones + 1024;  // full[NL][RS], empty[NL][RS], vfree[NL][2]
+  const uint32_t newkv = ptr + 2048;  // PCV: the block's own K / V rows (8 tokens x 256 B), written by the consumers
+  auto vfreeb = [&](int s) { return mbar + (2 * NL * RS + LN * 2 + s) * 8; };
   auto fullb = [&](int s) { return mbar + (LN * RS + s) * 8; };
   auto emptyb = [&](int s) { return mbar + (NL * RS + LN * RS + s) * 8; };
   if (threadIdx.x == 0) {
@@ -1723,6 +1751,7 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
       asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" :: "r"(mbar + i * 8), "r"(64));
       asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" :: "r"(mbar + (NL * RS + i) * 8), "r"(8));
     }
+    for (int i = 0; i < 2 * NL; i++) asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" :: "r"(mbar + (2 * NL * RS + i) * 8), "r"(8));
   }
   if (!prod && threadIdx.x < 256) asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(ones + threadIdx.x * 4), "r"(0x3C003C00u));
   const int seq = a.seq[b], nk = seq + t0 + lt;
@@ -1735,7 +1764,10 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
 #endif
     const int pt = threadIdx.x & 63;
-    if (NL == 1 && (threadIdx.x & 127) >= 64) return;
+    if ((NL == 1 && (threadIdx.x & 127) >= 64) || spare) return;
+#ifdef PROF
+    unsigned long long twe = 0, tp0 = gtm2();
+#endif
     const int* ptb = a.pt + (size_t)b * a.maxp;
     auto ptload = [&](int x) {
       const int idx = ks + x * 64 + pt;
@@ -1747,9 +1779,89 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     asm volatile("bar.sync %0, 64;\n" :: "r"(1 + LN) : "memory");
     const int c8 = pt & 7, kr = pt >> 3;
+    if constexpr (PCV) {
+      auto load_step = [&](int y) {  // copies of step y into its slot (an empty group past the range keeps the count)
+        const int slot = y % RS;
+        if (y < nb) {
+#ifdef PROF
+          const unsigned long long tw0 = gtm2();
+#endif
+          if (y >= RS) mb_wait(emptyb(slot), ((y / RS) - 1) & 1);
+#ifdef PROF
+          twe += gtm2() - tw0;
+#endif
+          const int kb = ks + y * 64;
+          uint32_t rw[8];
+#pragma unroll
+          for (int i = 0; i < 8; i++) rw[i] = lds32a(ptr + ((y & 7) * 64 + i * 8 + kr) * 4);
+          asm volatile("bar.sync %0, 64;\n" :: "r"(1 + LN) : "memory");
+          ptload(y + 7);
+#pragma unroll
+          for (int i = 0; i < 8; i++) {
+            const int key = i * 8 + kr, kp = kb + key;
+            if (kp >= seq && kp < ke) continue;
+            const uint32_t n = kp < ke ? 16 : 0;
+            const uint32_t dd = ring + slot * 16384 + key * 128 + ((c8 ^ (key & 7)) << 4);
+            const size_t off = (size_t)(kp < ke ? rw[i] : 0) * 128 + c8 * 16;
+            if (L2H) {
+              asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" :: "r"(dd), "l"(a.kc + off), "r"(n));
+              asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" :: "r"(dd + 8192), "l"(a.vc + off), "r"(n));
+            } else {
+              asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dd), "l"(a.kc + off), "r"(n));
+              asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dd + 8192), "l"(a.vc + off), "r"(n));
+            }
+          }
+        }
+        asm volatile("cp.async.commit_group;\n");
+      };
+#pragma unroll 1
+      for (int y = 0; y < RS - 1; y++) load_step(y);
+      asm volatile("bar.sync %0, 320;\n" :: "r"(3 + LN) : "memory");  // the consumers' own-key rows are in newkv
+      for (int x = 0; x < nb; x++) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(RS - 2) : "memory");  // step x landed (this thread's copies)
+        asm volatile("bar.sync %0, 64;\n" :: "r"(1 + LN) : "memory");  // ... and every producer thread's
+        const int slot = x % RS, kb = ks + x * 64;
+        const uint32_t raw = ring + slot * 16384;
+        if (kb <= seq + 7 && kb + 64 > seq) {  // the block's own rows (K and V, both heads) into the slot
+#pragma unroll
+          for (int u = 0; u < 2; u++) {
+            const int idx = pt * 2 + u, tk = idx >> 4, part = (idx >> 3) & 1, c = idx & 7, kq = seq + tk - kb;
+            if (kq >= 0 && kq < 64 && seq + tk < ke) {
+              uint4 v;
+              asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(newkv + tk * 256 + part * 128 + c * 16));
+              asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(raw + part * 8192 + kq * 128 + ((c ^ (kq & 7)) << 4)), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+            }
+          }
+          asm volatile("bar.sync %0, 64;\n" :: "r"(1 + LN) : "memory");
+        }
+        if (x >= 2) mb_wait(vfreeb(x & 1), ((x - 2) >> 1) & 1);  // PV of step x - 2 retired
+        {
+          const int key = pt;
+          const uint32_t vb = vf0 + (x & 1) * 8192 + key * 128;
+#pragma unroll
+          for (int c = 0; c < 8; c++) {
+            uint4 v;
+            asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(raw + 8192 + key * 128 + ((c ^ (key & 7)) << 4)));
+            const int j0 = 2 * (c & 3);
+            const uint32_t dst = vb + (c >> 2) * 16384;
+            asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dst + ((j0 ^ (key & 7)) << 4)), "r"(e2h(v.x)), "r"(e2h(v.x >> 16)), "r"(e2h(v.y)), "r"(e2h(v.y >> 16)));
+            asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dst + (((j0 + 1) ^ (key & 7)) << 4)), "r"(e2h(v.z)), "r"(e2h(v.z >> 16)), "r"(e2h(v.w)), "r"(e2h(v.w >> 16)));
+          }
+        }
+        fence_async();  // this thread's K rows (cp.async), own rows and f16 V before the consumers' wgmma
+        { uint64_t st_; asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st_) : "r"(fullb(slot)) : "memory"); }
+        load_step(x + RS - 1);
+      }
+    } else
     for (int x = 0; x < nb; x++) {
       const int slot = x % RS;
+#ifdef PROF
+      const unsigned long long tw0 = gtm2();
+#endif
       if (x >= RS) mb_wait(emptyb(slot), ((x / RS) - 1) & 1);
+#ifdef PROF
+      twe += gtm2() - tw0;
+#endif
       const int kb = ks + x * 64;
       uint32_t rw[8];
 #pragma unroll
@@ -1777,11 +1889,15 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
       asm volatile("bar.sync %0, 64;\n" :: "r"(1 + LN) : "memory");
     }
     asm volatile("cp.async.wait_all;\n" ::: "memory");
+#ifdef PROF
+    if (f.prof && pt == 0) { unsigned long long* q = f.prof + 65536 + (blockIdx.x * NL + LN) * 4; q[1] = twe; q[3] = gtm2() - tp0; }
+#endif
     return;
   }
 #if HAS_WG
   asm volatile("setmaxnreg.inc.sync.aligned.u32 112;\n" ::: "memory");
 #endif
+  if (spare) return;
   const int tid = threadIdx.x - 256 * LN, wt = tid & 127, h = tid >> 7, w = wt >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wbar = 9 + wg;
   // query rows: row qr_ (token qr_ >> 3, q head 8 h + (qr_ & 7)), half wt & 1: RMSNorm, RoPE at seq + token, E4M3
@@ -1857,7 +1973,12 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
       *(uint32_t*)((uint8_t*)a.kc + lc) = kb4;
       *(uint32_t*)((uint8_t*)a.vc + lc) = vb4;
     }
+    if (PCV) {
+      asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(newkv + nt * 256 + h * 64 + nd0), "r"(kb4));
+      asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(newkv + nt * 256 + 128 + h * 64 + nd0), "r"(vb4));
+    }
   }
+  if (PCV) asm volatile("bar.sync %0, 320;\n" :: "r"(3 + LN) : "memory");
   fence_async();
   asm volatile("bar.sync %0, 128;\n" :: "r"(wbar) : "memory");
   PS(2);
@@ -1870,11 +1991,20 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   for (int i = 0; i < 32; i++) if (!AW_Z) o[i] = 0.f;
   const int lw0 = 2 * w;
   const int lomax = a.window ? max(0, seq + t0 + lt - 1 - a.window + 1) : 0;
+#ifdef PROF
+  unsigned long long twf = 0, tc0 = gtm2();
+#endif
   for (int bi = 0, kb = ks; bi < nb; bi++, kb += 64) {
     const int slot = bi % RS;
     const uint32_t raw = ring + slot * 16384, vf = vf0 + h * 16384 + (bi & 1) * 8192;
+#ifdef PROF
+    const unsigned long long tw0 = gtm2();
+#endif
     mb_wait(fullb(slot), (bi / RS) & 1);
-    if (kb <= seq + 7 && kb + 64 > seq) {  // the block's own keys into this head's half of the slot
+#ifdef PROF
+    twf += gtm2() - tw0;
+#endif
+    if (!PCV && kb <= seq + 7 && kb + 64 > seq) {  // the block's own keys into this head's half of the slot
       const int kq = seq + nt - kb;
       if (kq >= 0 && kq < 64 && seq + nt < ke) {
         const uint32_t dd = raw + kq * 128 + ((((h * 64 + nd0) >> 4) ^ (kq & 7)) << 4) + (nd0 & 15);
@@ -1883,7 +2013,7 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
       }
       asm volatile("bar.sync %0, 128;\n" :: "r"(wbar) : "memory");
     }
-    {
+    if (!PCV) {
       const int key = wt >> 1;
 #pragma unroll
       for (int u = 0; u < 2; u++) {
@@ -1896,15 +2026,20 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
         asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dst + (((j0 + 1) ^ (key & 7)) << 4)), "r"(e2h(x.z)), "r"(e2h(x.z >> 16)), "r"(e2h(x.w)), "r"(e2h(x.w >> 16)));
       }
     }
-    fence_async();
-    asm volatile("bar.sync %0, 128;\n" :: "r"(wbar) : "memory");
+    if (!PCV) {
+      fence_async();
+      asm volatile("bar.sync %0, 128;\n" :: "r"(wbar) : "memory");
+    }
     float s[32];
     wg_fence();
     wg_ss8<0>(s, gdesc(qs + 64 * h, 16, 1024), gdesc(raw + 64 * h, 16, 1024));
     wg_ss8<1>(s, gdesc(qs + 64 * h + 32, 16, 1024), gdesc(raw + 64 * h + 32, 16, 1024));
     wg_commit(); wg_wait0();  // also retires the previous step's PV
     __syncwarp();
-    if (lane == 0) { uint64_t st_; asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st_) : "r"(emptyb(slot)) : "memory"); }
+    if (lane == 0) {
+      uint64_t st_; asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st_) : "r"(emptyb(slot)) : "memory");
+      if (PCV && bi > 0) asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st_) : "r"(vfreeb((bi - 1) & 1)) : "memory");  // PV of bi - 1 retired
+    }
 #if AW_FOP
     fop(o, 32); fop(s, 32);
 #endif
@@ -2054,6 +2189,9 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   }
   wg_wait0();
   PS(3);
+#ifdef PROF
+  if (f.prof && tid == 0) { unsigned long long* q = f.prof + 65536 + (blockIdx.x * NL + LN) * 4; q[0] = twf; q[2] = gtm2() - tc0; }
+#endif
 #if AW_FOP
   fop(o, 32);
 #endif
@@ -2151,8 +2289,12 @@ static void apf(int g, int smw, cudaStream_t st, const A& a, const WF& f) {
   attnp<NL, X><<<g, 128 * (2 * NL + 1), smw, st>>>(a, f);
 }
 static void ap_x(int nl, int x, int g, int smw, cudaStream_t st, const A& a, const WF& f) {
-  if (nl == 1) { if (x & 64) apf<1, 68>(g, smw, st, a, f); else apf<1, 4>(g, smw, st, a, f); return; }
+  if (nl == 1) { if (x & 128) apf<1, 452>(g, smw, st, a, f); else if (x & 256) apf<1, 324>(g, smw, st, a, f); else if (x & 64) apf<1, 68>(g, smw, st, a, f); else apf<1, 4>(g, smw, st, a, f); return; }
   switch (x) {
+    case 196: apf<2, 196>(g, smw, st, a, f); break;
+    case 452: apf<2, 452>(g, smw, st, a, f); break;
+    case 324: apf<2, 324>(g, smw, st, a, f); break;
+    case 260: apf<2, 260>(g, smw, st, a, f); break;
     case 0: apf<2, 0>(g, smw, st, a, f); break;
     case 64: apf<2, 64>(g, smw, st, a, f); break;
     case 68: apf<2, 68>(g, smw, st, a, f); break;
@@ -3842,8 +3984,9 @@ void run(torch::Tensor qkv, torch::Tensor pos, torch::Tensor loc, torch::Tensor 
       }
       if (var == -2 && FU && ps == 1 && L == 8) {  // warp-specialized: producer warpgroup + 2 lanes of consumer warpgroups
         const int nl = (major == 9 && !WGEMU) ? 2 : 1;
-        const int smp = nl * (PRS * 16384 + 8192 + 32768 + 2048) + 1024 + 256 + 1024;
-        ap_x(nl, (int)x39, B * nsplit / nl, smp, st, a, f);
+        const int smp = nl * (PRS * 16384 + 8192 + 32768 + 2048 + ((x39 & 128) ? 2048 : 0)) + 1024 + 256 + 1024;
+        static int nsm = 0; if (!nsm) { int dev; cudaGetDevice(&dev); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev); }
+        ap_x(nl, (int)x39, (x39 & 256) ? nsm : B * nsplit / nl, smp, st, a, f);  // balanced: one CTA per SM
         return;
       }
       if (var < 0) {  // v39 kernel, grafts x39
@@ -3903,7 +4046,8 @@ VDEF = (-1, 256, 8, 32, 0, 1)
 # row, so without it DRAM sees 64 B gathers), 256 full-layer splits balanced over the batch's total keys (grid = resident CTAs)
 VCFG = {(1, True): (-1, 128, 8, 1 << 30, 8, 1), (1, False): (520, 607, 128, 1 << 30, 0, 1),  # (new-kernel V 7/14/15 trip ptxas 12.9 here)
         (16, True): (-2, 160, 8, 1 << 30, 68, 1), (32, True): (-2, 256, 8, 1 << 30, 68, 1),
-        (16, False): (-2, 256, 8, 1 << 30, 68, 1), (32, False): (-2, 256, 8, 1 << 30, 68, 1)}
+        (16, False): (-2, 256, 8, 1 << 30, 324, 1), (32, False): (-2, 256, 8, 1 << 30, 324, 1)}
+# v51: x39 256 on attnp = lanes balanced over the batch's total keys on all SMs (full layers), 128 = producer converts V
 # var -2: attnp (warp-specialized: producer warpgroup + 2 split lanes x 2 consumer warpgroups per CTA, setmaxnreg 32 / 112),
 # x39 bits there: 4 fast softmax, 64 L2::128B hint
 DCFG = {}  # decode (B, sliding) -> unrolled cross-CTA merge (default 1)
@@ -3944,7 +4088,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v50_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v51_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
@@ -4074,6 +4218,8 @@ def kernel_fn(data):
         nsplit = max(1, min((span + 127) // 128, (132 * 3) // B)) if not _hopper() else max(1, min((span + kps - 1) // kps, (132 * 2) // B))
         if var == -2:  # warp-specialized kernel: 2 splits per CTA on Hopper, one CTA per SM (spinning mergers stay co-resident)
             nsplit = max(2, min(nsplit + (nsplit & 1), 2 * (132 // B)))
+            if x39 & 256:  # balanced lanes over all SMs: nsplit = most splits one request may get (buffer stride)
+                nsplit = min(64, 2 * ((264 + B - 1) // B))
         if x39 & 256:  # balanced splits (full layers, B <= 32): nsplit = most splits one request may get (buffer stride)
             nsplit = min(64, 2 * ((132 * 2 + B - 1) // B))
     else:
