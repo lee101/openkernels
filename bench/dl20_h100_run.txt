@@ -1,0 +1,182 @@
+[notice] To update, run: python -m pip install --upgrade pip
+compile 43.7s
+v30 prepare 0s before tuning
+v30 tune M1:v0=60,v1=91,v4=60,r1=103,r2=77,r4=65,r8=70,r1n=63,r2n=59,r4n=59,r8n=71->ring2n | M8:v0=121,v1=139,v4=124,r1=124,r2=130,r4=144,r8=169,r1n=112,r2n=126,r4n=136,r8n=171->ring1n | M16:v0=139,v1=141,v4=147,r1=130,r2=163,r4=176,r8=213,r1n=129,r2n=151,r4n=168,r8n=213->ring1n | M32:v0=219,v1=218,v4=210,r1=196,r2=236,r4=261,r8=335,r1n=200,r2n=224,r4n=257,r8n=332->ring1 | M128:r1=270,r1n=279->ring1 | M256:r1=373,r1n=379->ring1
+env torch 2.8.0.dev20250319+cu128 grouped_mm False cap (9, 0)
+lt qkv_gate m128 heur 21.76 best 2:66.15.1.0.0.1.35.0.2 20.42 (112 tried, 3.6s)
+lt qkv_gate m256 heur 24.32 best 0:66.124.1.0.0.0.35.0.2 23.07 (108 tried, 7.1s)
+lt o m128 heur 12.48 best torch 12.48 (47 tried, 8.9s)
+lt o m256 heur 13.66 best 3:66.20.1.0.0.4.35.0.2 13.31 (47 tried, 10.5s)
+lt pooler m128 heur 29.15 best 2:66.15.1.0.0.2.35.0.5 28.74 (48 tried, 12.4s)
+lt pooler m256 heur 36.29 best 2:66.18.1.0.0.4.35.0.2 30.62 (47 tried, 14.0s)
+lt unpooler m128 heur 28.70 best 2:66.18.1.0.0.6.35.0.5 28.32 (47 tried, 15.9s)
+lt unpooler m256 heur 30.62 best 3:66.20.1.0.0.4.35.0.2 29.22 (47 tried, 17.4s)
+lt router m128 heur 65.41 best 2:66.15.5.2.0.1.35.0.7 13.25 (48 tried, 19.1s)
+lt router m256 heur 96.80 best 3:66.15.4.2.0.0.35.0.2 13.60 (99 tried, 22.2s)
+gv qkv_gate m1 v12 15.84 best 1.1.2.1.8.16.1.1.0.1 11.04
+  v12:16.00 1.1.2.1.8.16.1.1.0.1:10.91
+gv qkv_gate m8 v12 15.84 best 1.1.2.1.8.16.1.1.0.1 11.20
+  v12:15.84 1.1.2.1.8.16.1.1.0.1:11.14
+gv qkv_gate m16 v12 15.87 best 1.2.1.1.4.8.4.1.2.13 11.46
+  v12:16.06 1.2.2.1.4.16.2.1.0.1:12.61 1.2.2.1.4.8.4.1.2.3:13.06 1.2.1.1.4.16.2.1.2.1:12.67 1.2.1.1.4.16.2.1.2.5:11.94 1.2.1.1.4.16.2.1.2.13:11.97 1.2.1.1.4.8.4.1.2.1:12.42 1.2.1.1.4.8.4.1.2.5:11.39 1.2.1.1.4.8.4.1.2.13:11.62
+gv qkv_gate m32 v12 14.75 best 1.4.1.1.4.16.2.1.2.13 12.45
+  v12:14.78 1.4.1.1.4.8.4.1.2.1:19.01 1.4.1.1.4.8.4.1.2.5:17.25 1.4.1.1.4.8.4.1.2.13:14.82 1.4.1.1.4.16.2.1.2.1:14.78 1.4.1.1.4.16.2.1.2.5:13.82 1.4.1.1.4.16.2.1.2.13:12.48
+gv o m1 v12 6.72 best 1.1.2.1.8.2.1.1.0.1 5.28
+  v12:6.85 1.1.2.1.8.2.1.1.0.1:5.25 1.1.2.1.8.2.1.1.0.3:5.25
+gv o m8 v12 6.75 best 1.1.2.1.8.2.1.1.0.3 5.22
+  v12:6.78 1.1.2.1.8.2.1.1.0.1:5.31 1.1.2.1.8.2.1.1.0.3:5.28
+gv o m16 v12 6.82 best 1.2.2.1.8.2.1.1.0.1 5.38
+  v12:6.88 1.2.2.1.8.2.1.1.0.1:5.47
+gv o m32 v12 6.98 best v12 6.98
+  v12:6.98
+gv pooler m1 v12 25.25 best 1.1.2.2.8.16.1.1.0.0 17.60
+  v12:29.41 1.1.1.2.16.8.1.1.0.3:17.47 1.1.2.2.8.16.1.1.0.0:17.63
+gv pooler m8 v12 24.77 best 1.1.2.2.8.16.1.1.0.0 17.66
+  v12:24.99 1.1.1.2.16.8.1.1.0.3:17.70 1.1.2.2.8.16.1.1.0.0:17.82
+gv pooler m16 v12 25.41 best 1.2.2.2.8.16.1.1.0.1 17.60
+  v12:25.54 1.2.2.2.8.16.1.1.0.1:17.70
+gv pooler m32 v12 25.25 best 1.4.2.1.8.16.1.1.2.1 19.68
+  v12:25.70 1.4.2.1.8.16.1.1.2.0:19.65 1.4.2.1.8.16.1.1.2.1:19.87
+gv unpooler m1 v12 6.78 best 1.1.2.1.16.4.1.1.0.1 3.78
+  v12:7.39 1.1.2.1.16.4.1.1.0.1:3.71 1.1.2.1.16.4.1.1.0.0:4.06
+gv unpooler m8 v12 6.91 best 1.1.2.1.16.4.1.1.0.1 3.84
+  v12:7.04 1.1.2.1.16.4.1.1.0.1:4.00 1.1.2.1.16.4.1.1.0.0:4.06
+gv unpooler m16 v12 22.56 best 1.2.2.1.4.16.1.1.2.1 18.08
+  v12:22.69 1.2.2.1.4.16.1.1.2.1:18.46 1.2.2.1.4.16.1.1.2.0:18.34
+gv unpooler m32 v12 22.85 best 1.4.2.1.4.16.1.1.2.0 19.81
+  v12:22.91 1.4.2.1.4.16.1.1.2.1:20.16 1.4.2.1.4.16.1.1.2.0:19.71 1.4.2.2.4.16.1.1.2.1:19.74
+gv router m1 v12 5.38 best rr1 3.55
+  v12:5.76 2.1.2.1.8.2.8.1.0.0:5.09 2.1.2.1.8.2.8.1.0.4:4.06 2.1.2.1.8.1.16.1.0.0:7.30 rr0:3.65 rr1:3.39
+gv router m8 v12 5.47 best 2.1.2.1.8.2.8.1.0.4 4.06
+  v12:5.57 2.1.2.1.8.2.8.1.0.0:5.02 2.1.2.1.8.2.8.1.0.4:4.10 2.1.2.1.8.1.16.1.0.0:7.14 wb0:8.80
+gv router m16 v12 5.66 best 2.2.2.1.8.2.8.1.0.4 4.26
+  v12:6.05 2.2.2.1.8.2.8.1.0.0:5.09 2.2.2.1.8.2.8.1.0.4:4.16 wb0:9.09
+gv router m32 v12 6.94 best 2.4.2.1.4.2.16.1.0.0 5.92
+  v12:7.10 2.4.2.1.4.2.16.1.0.0:5.89 2.4.2.1.4.2.16.1.0.4:6.08 2.4.2.1.8.2.8.1.0.0:8.67 2.4.2.1.8.2.8.1.0.4:7.23 wb0:9.15
+gv router m128 v12 14.34 best wr2 8.70
+  v12:14.75 wb1:11.33 wb3:10.46 wr0:9.22 wr1:9.09 wr2:8.67
+gv router m256 v12 21.50 best wr4 10.43
+  v12:21.60 wb2:12.93 wr3:10.66 wr4:10.53 wr5:10.72
+router T1 rtr:28.00 gv:26.24 -> gv
+router T8 rtr:28.19 gv:26.78 -> gv
+router T16 rtr:28.48 gv:26.85 -> gv
+router T32 rtr:30.14 gv:29.98 -> gv
+router T128 skinny:41.63 lt:35.49 gv:38.53 -> lt
+router T256 skinny:70.56 lt:53.63 gv:59.68 -> lt
+p19 prepare 29.4s gv ['o/1', 'o/16', 'o/8', 'pooler/1', 'pooler/16', 'pooler/32', 'pooler/8', 'qkv_gate/1', 'qkv_gate/16', 'qkv_gate/32', 'qkv_gate/8', 'router/1', 'router/128', 'router/16', 'router/256', 'router/32', 'router/8', 'unpooler/1', 'unpooler/16', 'unpooler/32', 'unpooler/8'] lt ['o/128', 'o/256', 'pooler/128', 'pooler/256', 'qkv_gate/128', 'qkv_gate/256', 'qkv_gate/32', 'router/128', 'router/256', 'unpooler/128', 'unpooler/256', 'unpooler/32']
+prepare sub_mod 76.7s
+compile 0.0s
+v30 prepare 0s before tuning
+v30 tune M1:v0=61,v1=91,v4=60,r1=102,r2=76,r4=66,r8=70,r1n=63,r2n=59,r4n=60,r8n=71->ring2n | M8:v0=121,v1=138,v4=123,r1=123,r2=130,r4=143,r8=169,r1n=111,r2n=125,r4n=135,r8n=170->ring1n | M16:v0=140,v1=141,v4=146,r1=131,r2=163,r4=176,r8=208,r1n=129,r2n=152,r4n=168,r8n=212->ring1n | M32:v0=220,v1=218,v4=210,r1=196,r2=235,r4=263,r8=333,r1n=200,r2n=223,r4n=257,r8n=332->ring1 | M128:r1=268,r1n=278->ring1 | M256:r1=372,r1n=377->ring1
+env torch 2.8.0.dev20250319+cu128 grouped_mm False cap (9, 0)
+lt qkv_gate m128 heur 21.57 best 2:66.15.1.0.0.0.35.0.2 19.87 (149 tried, 4.2s)
+lt qkv_gate m256 heur 24.58 best 0:66.124.1.0.0.0.35.0.2 23.65 (144 tried, 8.3s)
+lt o m128 heur 12.48 best torch 12.48 (47 tried, 9.9s)
+lt o m256 heur 13.57 best torch 13.57 (47 tried, 11.4s)
+lt pooler m128 heur 29.34 best 2:66.15.1.0.0.2.35.0.5 28.61 (48 tried, 13.1s)
+lt pooler m256 heur 36.74 best 2:66.18.1.0.0.4.35.0.2 30.78 (56 tried, 14.8s)
+lt unpooler m128 heur 28.67 best 2:66.18.1.0.0.6.35.0.5 28.26 (47 tried, 16.6s)
+lt unpooler m256 heur 30.46 best 3:66.20.1.0.0.0.35.0.5 29.25 (54 tried, 18.3s)
+lt router m128 heur 65.89 best 0:66.12.4.2.0.0.35.0.2 12.80 (139 tried, 22.2s)
+lt router m256 heur 97.02 best 1:66.15.4.2.0.0.35.0.2 14.05 (143 tried, 26.2s)
+gv qkv_gate m1 v12 15.87 best 1.1.2.1.8.16.1.1.0.1 10.94
+  v12:15.87 1.1.2.1.8.16.1.1.0.1:10.91
+gv qkv_gate m8 v12 15.78 best 1.1.2.1.8.16.1.1.0.1 11.20
+  v12:15.78 1.1.2.1.8.16.1.1.0.1:11.07
+gv qkv_gate m16 v12 15.81 best 1.2.2.1.4.16.2.1.0.1 12.54
+  v12:15.81 1.2.2.1.4.16.2.1.0.1:12.58 1.2.2.1.4.8.4.1.2.3:12.93
+gv qkv_gate m32 v12 14.85 best v12 14.85
+  v12:14.85
+gv o m1 v12 6.62 best 1.1.2.1.8.2.1.1.0.1 5.28
+  v12:6.78 1.1.2.1.8.2.1.1.0.1:5.28 1.1.2.1.8.2.1.1.0.3:5.50
+gv o m8 v12 6.62 best 1.1.2.1.8.2.1.1.0.1 5.44
+  v12:6.66 1.1.2.1.8.2.1.1.0.1:5.28 1.1.2.1.8.2.1.1.0.3:5.47
+gv o m16 v12 6.66 best 1.2.2.1.8.2.1.1.0.1 5.38
+  v12:6.66 1.2.2.1.8.2.1.1.0.1:5.28
+gv o m32 v12 6.82 best v12 6.82
+  v12:6.82
+gv pooler m1 v12 24.83 best 1.1.2.2.8.16.1.1.0.0 17.47
+  v12:29.15 1.1.1.2.16.8.1.1.0.3:17.41 1.1.2.2.8.16.1.1.0.0:17.25
+gv pooler m8 v12 24.67 best 1.1.1.2.16.8.1.1.0.3 17.60
+  v12:24.67 1.1.1.2.16.8.1.1.0.3:17.57 1.1.2.2.8.16.1.1.0.0:17.54
+gv pooler m16 v12 24.90 best 1.2.2.2.8.16.1.1.0.1 17.54
+  v12:24.90 1.2.2.2.8.16.1.1.0.1:17.47
+gv pooler m32 v12 25.28 best 1.4.2.1.8.16.1.1.2.0 19.46
+  v12:25.41 1.4.2.1.8.16.1.1.2.0:19.74 1.4.2.1.8.16.1.1.2.1:19.49
+gv unpooler m1 v12 6.66 best 1.1.2.1.16.4.1.1.0.1 3.84
+  v12:7.65 1.1.2.1.16.4.1.1.0.1:3.84 1.1.2.1.16.4.1.1.0.0:3.87
+gv unpooler m8 v12 6.69 best 1.1.2.1.16.4.1.1.0.1 3.71
+  v12:6.69 1.1.2.1.16.4.1.1.0.1:3.74 1.1.2.1.16.4.1.1.0.0:3.97
+gv unpooler m16 v12 22.69 best 1.2.2.1.4.16.1.1.2.1 17.98
+  v12:22.75 1.2.2.1.4.16.1.1.2.1:17.95 1.2.2.1.4.16.1.1.2.0:18.50
+gv unpooler m32 v12 22.78 best 1.4.2.1.4.16.1.1.2.0 19.52
+  v12:22.98 1.4.2.1.4.16.1.1.2.1:19.87 1.4.2.1.4.16.1.1.2.0:19.68 1.4.2.2.4.16.1.1.2.1:19.78
+gv router m1 v12 5.44 best rr1 3.49
+  v12:5.60 2.1.2.1.8.2.8.1.0.0:5.41 2.1.2.1.8.1.16.1.0.0:7.33 rr0:3.65 rr1:3.46
+gv router m8 v12 5.22 best 2.1.2.1.8.2.8.1.0.0 5.09
+  v12:5.22 2.1.2.1.8.2.8.1.0.0:5.09 2.1.2.1.8.1.16.1.0.0:7.17
+gv router m16 v12 5.86 best 2.2.2.1.8.2.8.1.0.0 5.18
+  v12:5.86 2.2.2.1.8.2.8.1.0.0:5.34
+gv router m32 v12 6.88 best 2.4.2.1.4.2.16.1.0.0 6.02
+  v12:7.01 2.4.2.1.4.2.16.1.0.0:5.86 2.4.2.1.8.2.8.1.0.0:8.83
+router T1 rtr:27.90 gv:26.11 -> gv
+router T8 rtr:27.55 gv:27.33 -> gv
+router T16 rtr:28.38 gv:27.74 -> gv
+router T32 rtr:30.27 gv:29.47 -> gv
+router T128 skinny:41.34 lt:35.87 -> lt
+router T256 skinny:70.30 lt:53.82 -> lt
+p19 prepare 30.9s gv ['o/1', 'o/16', 'o/8', 'pooler/1', 'pooler/16', 'pooler/32', 'pooler/8', 'qkv_gate/1', 'qkv_gate/16', 'qkv_gate/8', 'router/1', 'router/16', 'router/32', 'router/8', 'unpooler/1', 'unpooler/16', 'unpooler/32', 'unpooler/8'] lt ['o/128', 'o/256', 'pooler/128', 'pooler/256', 'pooler/32', 'qkv_gate/128', 'qkv_gate/256', 'qkv_gate/32', 'router/128', 'router/256', 'unpooler/128', 'unpooler/256']
+/usr/local/lib/python3.11/dist-packages/torch/cuda/graphs.py:84: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:175.)
+  super().capture_end()
+prepare base_mod 34.2s
+OK  test             {"batch": 1, "ctx": 10, "layer": "sliding"} s7000: update relative L2 error 4.948e-03 (worst row 4.948e-03) [bound 0.090]; attention input relative L2 error 4.012e-03 (worst row 4.012e-03) [bound 0.062]
+OK  test             {"batch": 1, "ctx": 3000, "layer": "full"} s7000: update relative L2 error 7.697e-03 (worst row 7.697e-03) [bound 0.140]; attention input relative L2 error 4.853e-03 (worst row 4.853e-03) [bound 0.079]
+OK  test             {"batch": 8, "ctx": 2047, "layer": "sliding"} s7000: update relative L2 error 7.311e-03 (worst row 8.853e-03) [bound 0.150]; attention input relative L2 error 4.811e-03 (worst row 6.575e-03) [bound 0.107]
+OK  test             {"batch": 9, "ctx": 5000, "layer": "sliding", "spread": "mixed", "page": 1} s7000: update relative L2 error 6.772e-03 (worst row 8.345e-03) [bound 0.150]; attention input relative L2 error 5.234e-03 (worst row 6.035e-03) [bound 0.113]
+OK  test             {"batch": 3, "ctx": 6000, "layer": "full", "q_len": 8, "dist": "outliers"} s7000: update relative L2 error 6.664e-02 (worst row 9.086e-02) [bound 0.150]; attention input relative L2 error 3.614e-02 (worst row 4.807e-02) [bound 0.089]
+OK  test             {"batch": 5, "ctx": 5000, "layer": "sliding", "q_len": 8, "spread": "mixed", "page": 1} s7000: update relative L2 error 6.875e-02 (worst row 1.169e-01) [bound 0.150]; attention input relative L2 error 4.380e-02 (worst row 6.822e-02) [bound 0.108]
+OK  test             {"batch": 33, "ctx": 20000, "layer": "full", "spread": "mixed", "page": 1} s7000: update relative L2 error 7.954e-03 (worst row 1.003e-02) [bound 0.150]; attention input relative L2 error 5.627e-03 (worst row 7.187e-03) [bound 0.122]
+OK  test             {"batch": 2, "ctx": 300000, "layer": "sliding", "q_len": 8} s7000: update relative L2 error 6.563e-02 (worst row 9.485e-02) [bound 0.150]; attention input relative L2 error 4.272e-02 (worst row 5.400e-02) [bound 0.106]
+OK  test             {"batch": 1, "ctx": 1048576, "layer": "full", "q_len": 8} s7000: update relative L2 error 8.237e-02 (worst row 1.016e-01) [bound 0.150]; attention input relative L2 error 5.410e-02 (worst row 6.907e-02) [bound 0.140]
+OK  test             {"batch": 4, "ctx": 7000, "layer": "sliding", "q_len": 8, "page": 1, "kv_scale": 0.015625} s7000: update relative L2 error 7.062e-02 (worst row 1.164e-01) [bound 0.150]; attention input relative L2 error 4.614e-02 (worst row 6.786e-02) [bound 0.113]
+OK  test             {"batch": 1, "ctx": 80000, "layer": "full", "dist": "soft", "page": 1} s7000: update relative L2 error 7.310e-03 (worst row 7.310e-03) [bound 0.150]; attention input relative L2 error 5.778e-03 (worst row 5.778e-03) [bound 0.139]
+OK  test             {"batch": 4, "ctx": 6000, "layer": "sliding", "q_len": 8, "dist": "soft"} s7000: update relative L2 error 5.739e-02 (worst row 7.699e-02) [bound 0.141]; attention input relative L2 error 3.768e-02 (worst row 5.090e-02) [bound 0.093]
+OK  test             {"batch": 16, "ctx": 20000, "layer": "full", "spread": "mixed", "dist": "soft", "page": 1} s7000: update relative L2 error 7.190e-03 (worst row 9.416e-03) [bound 0.146]; attention input relative L2 error 5.248e-03 (worst row 7.693e-03) [bound 0.096]
+OK  bench decode 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "page": 1, "dist": "soft", "seed": 801} s801: update relative L2 error 7.181e-03 (worst row 7.181e-03) [bound 0.135]; attention input relative L2 error 5.804e-03 (worst row 5.804e-03) [bound 0.102]
+OK  bench decode 1   {"batch": 1, "ctx": 80000, "layer": "full", "page": 1, "dist": "soft", "seed": 802} s802: update relative L2 error 7.101e-03 (worst row 7.101e-03) [bound 0.119]; attention input relative L2 error 5.501e-03 (worst row 5.501e-03) [bound 0.085]
+OK  bench decode 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "page": 1, "spread": "agentic", "dist": "s s803: update relative L2 error 9.201e-03 (worst row 1.511e-02) [bound 0.127]; attention input relative L2 error 6.162e-03 (worst row 1.004e-02) [bound 0.081]
+OK  bench decode 16  {"batch": 16, "ctx": 80000, "layer": "full", "page": 1, "spread": "agentic", "dist": "soft s804: update relative L2 error 7.626e-03 (worst row 1.115e-02) [bound 0.150]; attention input relative L2 error 5.403e-03 (worst row 8.059e-03) [bound 0.104]
+OK  bench decode 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "page": 1, "spread": "agentic", "dist": "s s805: update relative L2 error 7.675e-03 (worst row 1.377e-02) [bound 0.136]; attention input relative L2 error 5.411e-03 (worst row 8.315e-03) [bound 0.088]
+OK  bench decode 32  {"batch": 32, "ctx": 80000, "layer": "full", "page": 1, "spread": "agentic", "dist": "soft s806: update relative L2 error 7.630e-03 (worst row 1.314e-02) [bound 0.150]; attention input relative L2 error 5.205e-03 (worst row 9.707e-03) [bound 0.093]
+OK  bench verify 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "dist": "soft", "see s807: update relative L2 error 5.733e-02 (worst row 6.745e-02) [bound 0.146]; attention input relative L2 error 3.654e-02 (worst row 4.569e-02) [bound 0.093]
+OK  bench verify 1   {"batch": 1, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "dist": "soft", "seed": s808: update relative L2 error 6.083e-02 (worst row 8.308e-02) [bound 0.149]; attention input relative L2 error 3.885e-02 (worst row 4.680e-02) [bound 0.095]
+OK  bench verify 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "spread": "agentic" s809: update relative L2 error 5.343e-02 (worst row 9.659e-02) [bound 0.130]; attention input relative L2 error 3.488e-02 (worst row 5.248e-02) [bound 0.085]
+OK  bench verify 16  {"batch": 16, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "spread": "agentic", " s810: update relative L2 error 6.207e-02 (worst row 9.262e-02) [bound 0.150]; attention input relative L2 error 4.028e-02 (worst row 6.000e-02) [bound 0.100]
+OK  bench verify 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "spread": "agentic" s811: update relative L2 error 5.688e-02 (worst row 1.016e-01) [bound 0.140]; attention input relative L2 error 3.657e-02 (worst row 5.538e-02) [bound 0.090]
+OK  bench verify 32  {"batch": 32, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "spread": "agentic", " s812: update relative L2 error 6.224e-02 (worst row 1.342e-01) [bound 0.150]; attention input relative L2 error 4.084e-02 (worst row 6.755e-02) [bound 0.102]
+correctness: PASS
+stress decode 1   3/3 ok
+stress decode 1   3/3 ok
+stress decode 16  3/3 ok
+stress decode 16  3/3 ok
+stress decode 32  3/3 ok
+stress decode 32  3/3 ok
+stress verify 1   3/3 ok
+stress verify 1   3/3 ok
+stress verify 16  3/3 ok
+stress verify 16  3/3 ok
+stress verify 32  3/3 ok
+stress verify 32  3/3 ok
+decode 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "pa     112.4us  base     112.1us  x0.999
+decode 1   {"batch": 1, "ctx": 80000, "layer": "full", "page"     125.9us  base     126.0us  x1.001
+decode 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "p     186.0us  base     187.0us  x1.005
+decode 16  {"batch": 16, "ctx": 80000, "layer": "full", "page     308.1us  base     310.1us  x1.008
+decode 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "p     236.7us  base     232.8us  x0.982
+decode 32  {"batch": 32, "ctx": 80000, "layer": "full", "page     476.1us  base     479.2us  x1.007
+verify 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "pa     165.5us  base     165.8us  x1.002
+verify 1   {"batch": 1, "ctx": 80000, "layer": "full", "page"     184.5us  base     184.4us  x1.001
+verify 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "p     318.2us  base     317.4us  x0.997
+verify 16  {"batch": 16, "ctx": 80000, "layer": "full", "page     492.7us  base     493.1us  x1.000
+verify 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "p     459.9us  base     460.7us  x1.003
+verify 32  {"batch": 32, "ctx": 80000, "layer": "full", "page     810.9us  base     809.7us  x0.999
+geomean speedup x1.000  per-load decode 1:1.00 decode 16:1.01 decode 32:0.99 verify 1:1.00 verify 16:1.00 verify 32:1.00
