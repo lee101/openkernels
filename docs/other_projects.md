@@ -71,3 +71,53 @@ A/B vs 345a185 (same flags: --diffusion-fa --sage-attn --params-backend te=cpu, 
 - int8: sd.cpp already loads the cog's ComfyUI int8_convrot DiT (Comfy-Org/MiniMax-H3 diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors, sha256 e889202c..., local copy /vfast/data/h3work/weights). cuBLAS int8 GEMM is 1.9-2.1x Q4_K MMQ on Ampere (all 4 H3 shapes, 6.6K and 23.7K rows); DiT GEMM time 2.0 -> 0.86 s/step at 640x480x56. Added GEMM->swiglu->convrot-quantize and GEMM->gated-residual int8 epilogues (bit-identical). 21 GB weights do not fit a 24 GB card with compute; on a 5090 run with --params-backend te=cpu,vae=cpu.
 - TE: warm sd-server request 1.2 s (640x480) / 2.2 s (896x672, 51 streamed segments) on the 3090 Ti; the 5090's 7.0 s warm TE was not reproduced locally.
 - Remaining gap to the cog: Sol-Attn (block-sparse int8 attention, ~35-40% of a 5090 DiT eval is dense sage), cog Spectrum is more aggressive (degree 1, warmup 1).
+- Follow-up (same day): RMS_NORM+MUL -> F16 GEMM operand fusion for the VAE (frames identical to unfused; not timed, GPU shared with other jobs). SageAttention "fp16+fp32" PV accumulation (inst buffer) on Ampere was 1.4-2.4x slower than f32 accumulation: reverted. 5090 validation pod not run: awaiting the user's direct confirmation (plan: (a) 345a185 Q4_K, (b) new Q4_K, (c) new int8 te=cpu,vae=cpu, (d) (c)+SD_H3_VAE_SAGE=1; sd-server 896x672x124 20 steps spectrum, 2 requests each, 50 min TTL).
+
+## daisy deploy (RTX 3090 sm_86, 2026-10-26 ~23:00 NZDT)
+- Inventory before: both lanes image-only (omniserve built WITH_LLAMA=OFF / no libllama loaded; no llama.cpp on daisy, so LLM decode libs N/A).
+  - omniserve-native :8791 Z-Image: bin 20261022-fuse (main 02a69a1), lib 20261022-fuse = /mnt/fast/code/sdcpp-prod-20261022 (byte-identical to sdcpp-opt base 689e7f7 + ggml ada26aab), te=cpu, cuDNN VAE.
+  - omniserve-native-qwen :8792 ra2: bin /home/lee/omniserve-native-tiers/build-main (7213f12), lib /home/lee/sdcpp-ra2 (10-02 build of local stable-diffusion.cpp-master c0d6c1e / ggml f583f393 = sdmaster-opt base).
+- Built on daisy (cuda 12.9, sm_86, same cmake flags as prior builds): omniserve main a406606 at /mnt/fast/code/omniserve-native-20261026 (build-z, build-q); libs /mnt/fast/code/sdcpp-zimage-exact-20261026, sdcpp-zimage-opt-20261026, sdcpp-ra2-opt-20261026 (git repos, base + applied patches). Artifacts + drop-ins + A/B scripts: /mnt/fast/code/omniserve-native-deploy/20261026-latest/{zimage,qwen,ab,nsys}.
+- ra2: lib = sdmaster-opt 433ff24 + ggml perf/fusion 5b698ffc. omniserve A/B on :18791 (old bin+lib / new bin+old lib / new bin+new lib), 4 requests (turbo LoRA 512/1024/768x1024 + 30-step base): pixel md5 identical. gen 1024^2 13.63 -> 12.68 s, 768x1024 10.05 -> 9.64 s, base 512 5.37 -> 5.16 s (single samples).
+- Z-Image: lib "exact" = ggml sink/rope_pe/rope_pe_ext + sd rope_pe (a5d5cff). Pixel-identical (4 omniserve requests + sd-cli). nsys --cuda-graph-trace=node, sd-cli 1024^2 9 steps: kernel 11.74/12.30 -> 11.20/11.53 s, sampling 13.2 -> 12.5 s. Served wall time not measurably different (GPU warms to 74 C and drifts 10 -> 16 s per image over back-to-back runs; new vs old binary equal within drift).
+- Rejected: sdcpp-opt adaLN fold (ebf4fff) + kv_scale FA (74bb3dd, depends on fold): PSNR vs prod 45.7 / 37.2 / 23.0 / 21.1 dB on the 4 daisy requests (9 steps; divergence, not rounding).
+- Drop-ins: /etc/systemd/system/omniserve-native.service.d/zzz-latest-20261026.conf (WorkingDirectory=/mnt/fast/code/omniserve-native-20261026, new bin+lib), /etc/systemd/system/omniserve-native-qwen.service.d/zzz-latest-20261026.conf (new bin+lib). Post-deploy: health 200, authenticated 1024^2 generations 200 on both.
+- Rollback (each service): sudo rm <drop-in>; sudo systemctl daemon-reload; sudo systemctl restart <service>.
+
+## Image-gen kernel pass 2 (2026-10-26, local 3090 Ti, sm_86) — Z-Image (sdcpp-opt) + Qwen-Image 2.1 VAE (sdmaster-opt)
+All changes bit-identical (md5) to the previous graphs; every fusion has an env off-switch. Timing = nsys kernel sums;
+the local GPU and daisy were shared with other jobs, so "min-est" = per-(kernel, grid) minimum x count (contention-robust).
+Bench scripts/artifacts: /vfast/data/imgopt (zbench.sh, zq4.sh, lqv.sh, qrun.sh, zstep.py, qvae3.py).
+
+### Z-Image turbo — sdcpp-opt perf/dit-fusion @8406ede, ggml branch perf/zimage-dit-fusion @18f1c867 (lib md5 b11ace08...)
+- Prod config (Q4_K DiT + Flux ae VAE, 1024^2, 8 steps): DiT step min-est 616 -> 577 ms (raw 728 -> 670); VAE decode GPU 442 -> 330 ms
+  (im2col 172 -> 81, bias add+convert 82 -> 61). Q8_0 DiT: 589 -> 560 ms (raw 713 -> 652). md5: Q4_K 5c46c96b..., Q8_0 262480b0...
+  identical base vs new; Q4_K 4-step on daisy also identical.
+- Fusions: RMS_NORM[->MUL]->ROPE_PE for q/k (port of h3 80d01170); RMS_NORM->MUL->MMQ writes the q8_1 activation directly (D4 and DS4,
+  ffn_norm1 quantized once for w1+w3); SWIGLU[->SCALE]->MMQ quantizes silu(x)*g without the hidden tensor; w2's 1/128 output
+  rescale folded into ffn_norm2 eps (exact pow2); tiled im2col 3x3/1x1 + half2; F16 GEMM -> row-bias ADD in the output conversion;
+  conv2d N=1 skips the no-op permute copy. Remaining per step: MMQ 333 ms, FA 178 ms, elementwise ~50 ms (was ~110).
+- MMQ experiments (no gain, reverted): int->float via magic-number add instead of I2F (-6%: MMQ is not I2F bound); mmq_x cap
+  96/64/48 (-6/-20/-30%). q8_0 MMQ is ~33% of int8 peak on GA102 at these shapes (1 CTA/SM, 58 KB smem, no cp.async pipeline);
+  needs a pipelined kernel or repacked aligned q8_0 weights. FA 42.8 TFLOPS (60% of fp32-acc peak); faster options change numerics.
+
+### Qwen-Image 2.1 VAE — sdmaster-opt perf/master-dit-fusion @2ca573c, ggml perf/fusion @d38023c9 (lib md5 9543c59e...)
+- Warm VAE decode 1024^2 (tile 32, overlap 0.5, 9 tiles): wall 2.62 -> 1.05 s; kernel min-est 1809 -> 766 ms (raw 2428 -> 1012).
+  Full pipeline (6 steps) cold decode 3.62 -> 1.77 s. md5 03b3fb13... identical (full pipeline) and 9834df69... (VAE-only latent).
+- Per stage (min-est ms): im2col 921 -> 139; cpy (permute conts) 251 -> 26; RMS_norm+mul+silu 113 -> 114 (now incl. both permutes);
+  bias add + f16->f32 130 -> 89; concat 45 -> 7; GEMM ~330 unchanged.
+- How: ggml_rms_norm_ch (RMS over ne[3], CUDA kernel reproduces rms_norm_f32's reduction order; fuses gamma + SiLU; smem column
+  cache / float2 variant); tiled im2col; single-frame DupUp3D = nearest upscale of a channel-strided view; conv2d N=1 copy skip +
+  GEMM row-bias epilogue; H3 ports: parallel tile split/merge (18459fd tiling.cpp) and cached cudaDeviceProp (799b5c01).
+  Off-switches: SD_NO_NORM_CH, SD_NO_DUPUP_FAST, SD_NO_CONV2D_N1, GGML_CUDA_NO_IM2COL_TILED, GGML_CUDA_NO_GEMM_ROWBIAS,
+  GGML_CUDA_NO_NORM_CH2. Bench hooks: SD_DECODE_LATENT_OUT/IN, SD_VAE_DECODE_REPEAT.
+- --vae-conv-direct is now a regression (existing implicit-GEMM kernel 3.3 s vs ~0.47 s im2col+GEMM, and not bit-identical).
+  omniserve branch perf/vae-conv-direct-20261026 (worktree ../omniserve-native-vaeconv @e0939cf) adds
+  OMNISERVE_NATIVE_SD_VAE_CONV_DIRECT (default off); not recommended to enable.
+- Remaining VAE: cuBLAS F16 GEMM 330 ms, im2col 139, norm 114, bias/convert 89, residual adds 42.
+
+### Deploy notes (for the deploy agent; nothing deployed by this pass)
+- Both branches build on the earlier opt branches, not on the exact live trees: port the commits onto the live source recipe
+  (prod-deploys memory), rebuild for the target arch, then md5-compare same-seed images (expected identical).
+- sdmaster-opt ggml_rms_norm_ch adds an op_params flag to GGML_OP_RMS_NORM; only CUDA and CPU implement it (sd.cpp uses it only on
+  those backends).
