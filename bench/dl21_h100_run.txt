@@ -1,0 +1,322 @@
+[notice] To update, run: python -m pip install --upgrade pip
+compile 58.1s
+v34 prepare 0s before tuning
+v34 tune M1:v0=61,v1=91,v4=59,f0s3=58,f1s3=59,f0s5w8=58,r1=103,r2=76,r4=65,r8=69,r1n=63,r2n=59,r4n=59,r8n=71->f0s3 | M8:v0=121,v1=138,v4=123,f0s3=132,f1s3=126,f0s5w8=124,r1=124,r2=129,r4=144,r8=169,r1n=112,r2n=126,r4n=137,r8n=171->r1n | M16:v0=140,v1=141,v4=147,f0s3=158,f1s3=156,f0s5w8=153,r1=131,r2=164,r4=176,r8=209,r1n=129,r2n=152,r4n=168,r8n=213->r1n | M32:v0=219,v1=218,v4=212,f0s3=229,f1s3=231,f0s5w8=219,r1=196,r2=234,r4=264,r8=333,r1n=199,r2n=224,r4n=257,r8n=331->r1 | M128:r1=271,r1n=280->r1 | M256:r1=374,r1n=380->r1
+env torch 2.8.0.dev20250319+cu128 grouped_mm False cap (9, 0)
+lt qkv_gate m128 heur 21.70 best 2:66.15.1.0.0.3.35.0.6 20.42 (117 tried, 3.6s)
+lt qkv_gate m256 heur 24.51 best 0:66.124.1.0.0.0.35.0.2 22.24 (107 tried, 7.1s)
+lt o m128 heur 12.42 best torch 12.42 (47 tried, 8.9s)
+lt o m256 heur 13.57 best 3:66.20.1.0.0.4.35.0.2 13.18 (47 tried, 10.5s)
+lt pooler m128 heur 29.28 best 2:66.15.1.0.0.1.35.0.2 28.64 (48 tried, 12.4s)
+lt pooler m256 heur 35.87 best 3:66.18.1.0.0.5.35.0.2 30.18 (47 tried, 14.0s)
+lt unpooler m128 heur 28.67 best 3:66.18.1.0.0.2.35.0.5 28.22 (47 tried, 15.8s)
+lt unpooler m256 heur 30.34 best 3:66.20.1.0.0.4.35.0.2 29.06 (47 tried, 17.3s)
+lt router m128 heur 66.02 best 0:66.13.4.2.0.3.35.0.5 12.77 (48 tried, 19.0s)
+lt router m256 heur 96.83 best 1:66.15.4.2.0.0.35.0.2 13.82 (106 tried, 22.2s)
+gv qkv_gate m1 v12 16.13 best 1.1.2.1.8.16.1.1.0.1 10.78
+  v12:16.13 1.1.2.1.8.16.1.1.0.1:10.82
+gv qkv_gate m8 v12 15.71 best 1.1.2.1.8.16.1.1.0.1 11.01
+  v12:15.71 1.1.2.1.8.16.1.1.0.1:10.94
+gv qkv_gate m16 v12 15.87 best 1.2.1.1.4.8.4.1.2.13 11.42
+  v12:15.87 1.2.2.1.4.16.2.1.0.1:12.35 1.2.2.1.4.8.4.1.2.3:13.15 1.2.1.1.4.16.2.1.2.1:12.58 1.2.1.1.4.16.2.1.2.5:11.55 1.2.1.1.4.16.2.1.2.13:11.68 1.2.1.1.4.8.4.1.2.1:12.16 1.2.1.1.4.8.4.1.2.5:11.52 1.2.1.1.4.8.4.1.2.13:11.46
+gv qkv_gate m32 v12 15.10 best 1.4.1.1.4.16.2.1.2.13 12.32
+  v12:15.30 1.4.1.1.4.8.4.1.2.1:18.88 1.4.1.1.4.8.4.1.2.5:16.96 1.4.1.1.4.8.4.1.2.13:15.14 1.4.1.1.4.16.2.1.2.1:14.78 1.4.1.1.4.16.2.1.2.5:13.73 1.4.1.1.4.16.2.1.2.13:12.29
+gv o m1 v12 6.78 best 1.1.2.1.8.2.1.1.0.3 5.44
+  v12:6.78 1.1.2.1.8.2.1.1.0.1:5.41 1.1.2.1.8.2.1.1.0.3:5.44
+gv o m8 v12 6.85 best 1.1.2.1.8.2.1.1.0.1 5.44
+  v12:6.94 1.1.2.1.8.2.1.1.0.1:5.47 1.1.2.1.8.2.1.1.0.3:5.34
+gv o m16 v12 6.78 best 1.2.2.1.8.2.1.1.0.1 5.54
+  v12:6.91 1.2.2.1.8.2.1.1.0.1:5.38
+gv o m32 v12 6.85 best v12 6.85
+  v12:6.85
+gv pooler m1 v12 24.77 best 1.1.2.2.8.16.1.1.0.0 17.47
+  v12:29.86 1.1.1.2.16.8.1.1.0.3:17.60 1.1.2.2.8.16.1.1.0.0:17.50
+gv pooler m8 v12 24.83 best 1.1.1.2.16.8.1.1.0.3 17.60
+  v12:25.09 1.1.1.2.16.8.1.1.0.3:17.86 1.1.2.2.8.16.1.1.0.0:17.76
+gv pooler m16 v12 25.38 best 1.2.2.2.8.16.1.1.0.1 17.54
+  v12:25.44 1.2.2.2.8.16.1.1.0.1:17.54
+gv pooler m32 v12 25.38 best 1.4.2.1.8.16.1.1.2.0 19.58
+  v12:25.54 1.4.2.1.8.16.1.1.2.0:19.65 1.4.2.1.8.16.1.1.2.1:19.58
+gv unpooler m1 v12 6.72 best 1.1.2.1.16.4.1.1.0.0 3.84
+  v12:7.39 1.1.2.1.16.4.1.1.0.1:3.90 1.1.2.1.16.4.1.1.0.0:3.71
+gv unpooler m8 v12 6.62 best 1.1.2.1.16.4.1.1.0.1 3.62
+  v12:6.62 1.1.2.1.16.4.1.1.0.1:3.65 1.1.2.1.16.4.1.1.0.0:3.87
+gv unpooler m16 v12 22.53 best 1.2.2.1.4.16.1.1.2.1 17.98
+  v12:22.59 1.2.2.1.4.16.1.1.2.1:17.82 1.2.2.1.4.16.1.1.2.0:18.02
+gv unpooler m32 v12 22.69 best 1.4.2.1.4.16.1.1.2.0 19.55
+  v12:22.82 1.4.2.1.4.16.1.1.2.1:19.62 1.4.2.1.4.16.1.1.2.0:19.65 1.4.2.2.4.16.1.1.2.1:19.36
+gv router m1 v12 5.34 best rr1 3.17
+  v12:5.57 2.1.2.1.8.2.8.1.0.0:5.15 2.1.2.1.8.2.8.1.0.4:3.74 2.1.2.1.8.1.16.1.0.0:7.01 rr0:3.68 rr1:3.36
+gv router m8 v12 5.34 best 2.1.2.1.8.2.8.1.0.4 4.00
+  v12:5.34 2.1.2.1.8.2.8.1.0.0:5.02 2.1.2.1.8.2.8.1.0.4:4.03 2.1.2.1.8.1.16.1.0.0:6.98 wb0:8.77
+gv router m16 v12 5.73 best 2.2.2.1.8.2.8.1.0.4 4.13
+  v12:5.86 2.2.2.1.8.2.8.1.0.0:5.25 2.2.2.1.8.2.8.1.0.4:4.10 wb0:8.99
+gv router m32 v12 6.91 best 2.4.2.1.4.2.16.1.0.0 5.82
+  v12:6.91 2.4.2.1.4.2.16.1.0.0:5.89 2.4.2.1.4.2.16.1.0.4:6.30 2.4.2.1.8.2.8.1.0.0:8.80 2.4.2.1.8.2.8.1.0.4:7.33 wb0:9.44
+gv router m128 v12 13.95 best wr2 8.61
+  v12:14.18 wb1:11.46 wb3:10.56 wr0:9.22 wr1:9.15 wr2:8.64
+gv router m256 v12 21.22 best wr3 10.59
+  v12:21.47 wb2:12.93 wr3:10.50 wr4:10.56 wr5:10.98
+router T1 rtr:27.90 gv:26.08 -> gv
+router T8 rtr:27.81 gv:26.30 -> gv
+router T16 rtr:28.35 gv:26.85 -> gv
+router T32 rtr:30.53 gv:29.60 -> gv
+router T128 skinny:47.17 lt:38.30 gv:42.30 -> lt
+router T256 skinny:70.37 lt:55.68 gv:61.22 -> lt
+p19 prepare 29.5s gv ['o/1', 'o/16', 'o/8', 'pooler/1', 'pooler/16', 'pooler/32', 'pooler/8', 'qkv_gate/1', 'qkv_gate/16', 'qkv_gate/32', 'qkv_gate/8', 'router/1', 'router/128', 'router/16', 'router/256', 'router/32', 'router/8', 'unpooler/1', 'unpooler/16', 'unpooler/32', 'unpooler/8'] lt ['o/128', 'o/256', 'pooler/128', 'pooler/256', 'pooler/32', 'qkv_gate/128', 'qkv_gate/256', 'qkv_gate/32', 'router/128', 'router/256', 'unpooler/128', 'unpooler/256']
+prepare sub_mod 92.2s
+compile 46.2s
+v30 prepare 0s before tuning
+v30 tune M1:v0=61,v1=93,v4=60,r1=103,r2=76,r4=66,r8=70,r1n=63,r2n=59,r4n=59,r8n=71->ring4n | M8:v0=121,v1=140,v4=122,r1=124,r2=129,r4=143,r8=168,r1n=112,r2n=125,r4n=136,r8n=171->ring1n | M16:v0=139,v1=140,v4=147,r1=131,r2=162,r4=175,r8=215,r1n=128,r2n=151,r4n=167,r8n=214->ring1n | M32:v0=219,v1=218,v4=213,r1=197,r2=235,r4=263,r8=331,r1n=198,r2n=224,r4n=258,r8n=337->ring1 | M128:r1=271,r1n=280->ring1 | M256:r1=374,r1n=380->ring1
+env torch 2.8.0.dev20250319+cu128 grouped_mm False cap (9, 0)
+lt qkv_gate m128 heur 21.57 best 3:66.15.1.0.0.0.35.0.2 20.35 (139 tried, 4.3s)
+lt qkv_gate m256 heur 24.26 best 0:66.124.1.0.0.0.35.0.3 22.34 (133 tried, 8.2s)
+lt o m128 heur 12.35 best 2:66.15.1.0.0.2.35.0.5 12.22 (47 tried, 10.1s)
+lt o m256 heur 13.66 best 3:66.20.1.0.0.4.35.0.2 13.34 (47 tried, 11.6s)
+lt pooler m128 heur 29.25 best 2:66.15.1.0.0.0.35.0.2 28.74 (48 tried, 13.4s)
+lt pooler m256 heur 35.33 best 2:66.17.1.0.0.0.35.0.2 30.18 (47 tried, 15.0s)
+lt unpooler m128 heur 28.54 best 2:66.17.1.0.0.0.35.0.3 28.26 (47 tried, 16.8s)
+lt unpooler m256 heur 30.62 best 3:66.20.1.0.0.4.35.0.2 29.28 (47 tried, 18.4s)
+lt router m128 heur 65.73 best 2:66.15.5.2.0.0.35.0.5 12.58 (128 tried, 22.3s)
+lt router m256 heur 96.70 best 0:66.15.4.2.0.0.35.0.2 13.47 (134 tried, 26.3s)
+gv qkv_gate m1 v12 15.71 best 1.1.2.1.8.16.1.1.0.1 10.82
+  v12:15.78 1.1.2.1.8.16.1.1.0.1:10.66
+gv qkv_gate m8 v12 15.71 best 1.1.2.1.8.16.1.1.0.1 10.91
+  v12:15.71 1.1.2.1.8.16.1.1.0.1:11.10
+gv qkv_gate m16 v12 15.87 best 1.2.2.1.4.16.2.1.0.1 12.54
+  v12:15.87 1.2.2.1.4.16.2.1.0.1:12.38 1.2.2.1.4.8.4.1.2.3:13.28
+gv qkv_gate m32 v12 14.85 best v12 14.85
+  v12:14.85
+gv o m1 v12 6.59 best 1.1.2.1.8.2.1.1.0.1 5.18
+  v12:6.59 1.1.2.1.8.2.1.1.0.1:5.28 1.1.2.1.8.2.1.1.0.3:5.34
+gv o m8 v12 6.72 best 1.1.2.1.8.2.1.1.0.3 5.15
+  v12:6.72 1.1.2.1.8.2.1.1.0.1:5.15 1.1.2.1.8.2.1.1.0.3:5.18
+gv o m16 v12 6.78 best 1.2.2.1.8.2.1.1.0.1 5.18
+  v12:6.78 1.2.2.1.8.2.1.1.0.1:5.22
+gv o m32 v12 6.72 best v12 6.72
+  v12:6.72
+gv pooler m1 v12 24.90 best 1.1.2.2.8.16.1.1.0.0 17.50
+  v12:29.15 1.1.1.2.16.8.1.1.0.3:17.54 1.1.2.2.8.16.1.1.0.0:17.50
+gv pooler m8 v12 24.86 best 1.1.2.2.8.16.1.1.0.0 17.50
+  v12:24.93 1.1.1.2.16.8.1.1.0.3:17.82 1.1.2.2.8.16.1.1.0.0:17.54
+gv pooler m16 v12 25.18 best 1.2.2.2.8.16.1.1.0.1 17.38
+  v12:25.28 1.2.2.2.8.16.1.1.0.1:17.41
+gv pooler m32 v12 25.09 best 1.4.2.1.8.16.1.1.2.1 19.42
+  v12:25.09 1.4.2.1.8.16.1.1.2.0:19.33 1.4.2.1.8.16.1.1.2.1:19.33
+gv unpooler m1 v12 6.75 best 1.1.2.1.16.4.1.1.0.0 3.58
+  v12:7.23 1.1.2.1.16.4.1.1.0.1:3.62 1.1.2.1.16.4.1.1.0.0:3.68
+gv unpooler m8 v12 6.75 best 1.1.2.1.16.4.1.1.0.1 3.68
+  v12:6.94 1.1.2.1.16.4.1.1.0.1:3.68 1.1.2.1.16.4.1.1.0.0:3.87
+gv unpooler m16 v12 22.53 best 1.2.2.1.4.16.1.1.2.1 18.11
+  v12:22.72 1.2.2.1.4.16.1.1.2.1:17.98 1.2.2.1.4.16.1.1.2.0:18.53
+gv unpooler m32 v12 22.75 best 1.4.2.1.4.16.1.1.2.0 19.55
+  v12:22.94 1.4.2.1.4.16.1.1.2.1:19.97 1.4.2.1.4.16.1.1.2.0:19.49 1.4.2.2.4.16.1.1.2.1:20.16
+gv router m1 v12 5.44 best rr1 3.42
+  v12:5.44 2.1.2.1.8.2.8.1.0.0:5.25 2.1.2.1.8.1.16.1.0.0:7.33 rr0:3.55 rr1:3.42
+gv router m8 v12 5.47 best 2.1.2.1.8.2.8.1.0.0 5.15
+  v12:5.54 2.1.2.1.8.2.8.1.0.0:5.25 2.1.2.1.8.1.16.1.0.0:7.20
+gv router m16 v12 5.98 best 2.2.2.1.8.2.8.1.0.0 5.44
+  v12:5.98 2.2.2.1.8.2.8.1.0.0:5.31
+gv router m32 v12 6.88 best 2.4.2.1.4.2.16.1.0.0 6.11
+  v12:6.88 2.4.2.1.4.2.16.1.0.0:5.95 2.4.2.1.8.2.8.1.0.0:9.02
+router T1 rtr:27.84 gv:25.95 -> gv
+router T8 rtr:27.87 gv:27.65 -> gv
+router T16 rtr:28.32 gv:27.65 -> gv
+router T32 rtr:30.40 gv:29.73 -> gv
+router T128 skinny:47.20 lt:36.86 -> lt
+router T256 skinny:61.82 lt:45.92 -> lt
+p19 prepare 31.2s gv ['o/1', 'o/16', 'o/8', 'pooler/1', 'pooler/16', 'pooler/32', 'pooler/8', 'qkv_gate/1', 'qkv_gate/16', 'qkv_gate/8', 'router/1', 'router/16', 'router/32', 'router/8', 'unpooler/1', 'unpooler/16', 'unpooler/32', 'unpooler/8'] lt ['o/128', 'o/256', 'pooler/128', 'pooler/256', 'pooler/32', 'qkv_gate/128', 'qkv_gate/256', 'qkv_gate/32', 'router/128', 'router/256', 'unpooler/128', 'unpooler/256', 'unpooler/32']
+/usr/local/lib/python3.11/dist-packages/torch/cuda/graphs.py:84: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:175.)
+  super().capture_end()
+prepare base_mod 80.9s
+OK  test             {"batch": 1, "ctx": 10, "layer": "sliding"} s7000: update relative L2 error 4.727e-03 (worst row 4.727e-03) [bound 0.090]; attention input relative L2 error 3.933e-03 (worst row 3.933e-03) [bound 0.062]
+OK  test             {"batch": 1, "ctx": 3000, "layer": "full"} s7000: update relative L2 error 7.637e-03 (worst row 7.637e-03) [bound 0.140]; attention input relative L2 error 4.848e-03 (worst row 4.848e-03) [bound 0.079]
+OK  test             {"batch": 8, "ctx": 2047, "layer": "sliding"} s7000: update relative L2 error 7.312e-03 (worst row 8.853e-03) [bound 0.150]; attention input relative L2 error 4.819e-03 (worst row 6.593e-03) [bound 0.107]
+OK  test             {"batch": 9, "ctx": 5000, "layer": "sliding", "spread": "mixed", "page": 1} s7000: update relative L2 error 6.772e-03 (worst row 8.346e-03) [bound 0.150]; attention input relative L2 error 5.234e-03 (worst row 6.038e-03) [bound 0.113]
+OK  test             {"batch": 3, "ctx": 6000, "layer": "full", "q_len": 8, "dist": "outliers"} s7000: update relative L2 error 6.664e-02 (worst row 9.086e-02) [bound 0.150]; attention input relative L2 error 3.614e-02 (worst row 4.807e-02) [bound 0.089]
+OK  test             {"batch": 5, "ctx": 5000, "layer": "sliding", "q_len": 8, "spread": "mixed", "page": 1} s7000: update relative L2 error 6.875e-02 (worst row 1.169e-01) [bound 0.150]; attention input relative L2 error 4.380e-02 (worst row 6.822e-02) [bound 0.108]
+OK  test             {"batch": 33, "ctx": 20000, "layer": "full", "spread": "mixed", "page": 1} s7000: update relative L2 error 7.954e-03 (worst row 1.003e-02) [bound 0.150]; attention input relative L2 error 5.627e-03 (worst row 7.187e-03) [bound 0.122]
+OK  test             {"batch": 2, "ctx": 300000, "layer": "sliding", "q_len": 8} s7000: update relative L2 error 6.563e-02 (worst row 9.485e-02) [bound 0.150]; attention input relative L2 error 4.272e-02 (worst row 5.400e-02) [bound 0.106]
+OK  test             {"batch": 1, "ctx": 1048576, "layer": "full", "q_len": 8} s7000: update relative L2 error 8.238e-02 (worst row 1.016e-01) [bound 0.150]; attention input relative L2 error 5.412e-02 (worst row 6.910e-02) [bound 0.140]
+OK  test             {"batch": 4, "ctx": 7000, "layer": "sliding", "q_len": 8, "page": 1, "kv_scale": 0.015625} s7000: update relative L2 error 7.062e-02 (worst row 1.164e-01) [bound 0.150]; attention input relative L2 error 4.614e-02 (worst row 6.786e-02) [bound 0.113]
+OK  test             {"batch": 1, "ctx": 80000, "layer": "full", "dist": "soft", "page": 1} s7000: update relative L2 error 7.299e-03 (worst row 7.299e-03) [bound 0.150]; attention input relative L2 error 5.801e-03 (worst row 5.801e-03) [bound 0.139]
+OK  test             {"batch": 4, "ctx": 6000, "layer": "sliding", "q_len": 8, "dist": "soft"} s7000: update relative L2 error 5.739e-02 (worst row 7.699e-02) [bound 0.141]; attention input relative L2 error 3.768e-02 (worst row 5.090e-02) [bound 0.093]
+OK  test             {"batch": 16, "ctx": 20000, "layer": "full", "spread": "mixed", "dist": "soft", "page": 1} s7000: update relative L2 error 7.190e-03 (worst row 9.416e-03) [bound 0.146]; attention input relative L2 error 5.248e-03 (worst row 7.693e-03) [bound 0.096]
+OK  bench decode 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "page": 1, "dist": "soft", "seed": 801} s801: update relative L2 error 6.983e-03 (worst row 6.983e-03) [bound 0.135]; attention input relative L2 error 5.691e-03 (worst row 5.691e-03) [bound 0.102]
+OK  bench decode 1   {"batch": 1, "ctx": 80000, "layer": "full", "page": 1, "dist": "soft", "seed": 802} s802: update relative L2 error 6.911e-03 (worst row 6.911e-03) [bound 0.119]; attention input relative L2 error 5.421e-03 (worst row 5.421e-03) [bound 0.085]
+OK  bench decode 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "page": 1, "spread": "agentic", "dist": "s s803: update relative L2 error 9.201e-03 (worst row 1.511e-02) [bound 0.127]; attention input relative L2 error 6.162e-03 (worst row 1.004e-02) [bound 0.081]
+OK  bench decode 16  {"batch": 16, "ctx": 80000, "layer": "full", "page": 1, "spread": "agentic", "dist": "soft s804: update relative L2 error 7.626e-03 (worst row 1.115e-02) [bound 0.150]; attention input relative L2 error 5.403e-03 (worst row 8.059e-03) [bound 0.104]
+OK  bench decode 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "page": 1, "spread": "agentic", "dist": "s s805: update relative L2 error 7.675e-03 (worst row 1.377e-02) [bound 0.136]; attention input relative L2 error 5.411e-03 (worst row 8.315e-03) [bound 0.088]
+OK  bench decode 32  {"batch": 32, "ctx": 80000, "layer": "full", "page": 1, "spread": "agentic", "dist": "soft s806: update relative L2 error 7.629e-03 (worst row 1.314e-02) [bound 0.150]; attention input relative L2 error 5.205e-03 (worst row 9.707e-03) [bound 0.093]
+OK  bench verify 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "dist": "soft", "see s807: update relative L2 error 5.731e-02 (worst row 6.745e-02) [bound 0.146]; attention input relative L2 error 3.652e-02 (worst row 4.569e-02) [bound 0.093]
+OK  bench verify 1   {"batch": 1, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "dist": "soft", "seed": s808: update relative L2 error 6.081e-02 (worst row 8.308e-02) [bound 0.149]; attention input relative L2 error 3.884e-02 (worst row 4.680e-02) [bound 0.095]
+OK  bench verify 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "spread": "agentic" s809: update relative L2 error 5.344e-02 (worst row 9.667e-02) [bound 0.130]; attention input relative L2 error 3.488e-02 (worst row 5.247e-02) [bound 0.085]
+OK  bench verify 16  {"batch": 16, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "spread": "agentic", " s810: update relative L2 error 6.207e-02 (worst row 9.262e-02) [bound 0.150]; attention input relative L2 error 4.027e-02 (worst row 5.998e-02) [bound 0.100]
+OK  bench verify 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "page": 1, "q_len": 8, "spread": "agentic" s811: update relative L2 error 5.688e-02 (worst row 1.016e-01) [bound 0.140]; attention input relative L2 error 3.657e-02 (worst row 5.538e-02) [bound 0.090]
+OK  bench verify 32  {"batch": 32, "ctx": 80000, "layer": "full", "page": 1, "q_len": 8, "spread": "agentic", " s812: update relative L2 error 6.224e-02 (worst row 1.342e-01) [bound 0.150]; attention input relative L2 error 4.084e-02 (worst row 6.755e-02) [bound 0.102]
+correctness: PASS
+stress decode 1   5/5 ok
+stress decode 1   5/5 ok
+stress decode 16  5/5 ok
+stress decode 16  5/5 ok
+stress decode 32  5/5 ok
+stress decode 32  5/5 ok
+stress verify 1   5/5 ok
+stress verify 1   5/5 ok
+stress verify 16  5/5 ok
+stress verify 16  5/5 ok
+stress verify 32  5/5 ok
+stress verify 32  5/5 ok
+decode 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "pa     107.3us  base     103.1us  x0.961
+         0.0 +   12.7us  void gv<1, 1, 2, 1, 8, 16, 1, 1, 0, 1>(G)
+        11.8 +    9.3us  void fdec<true, true>(F)
+        17.9 +    9.0us  void gv<1, 1, 2, 1, 8, 2, 1, 1, 0, 3>(G)
+        26.1 +    5.0us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        28.0 +    7.2us  void rr<1, 2>(float4 const*, __nv_bfloat16 const*, float*, int, int, int)
+        28.2 +   24.6us  void gv<1, 1, 2, 2, 8, 16, 1, 1, 0, 0>(G)
+        34.8 +   17.4us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        51.1 +    4.5us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        53.5 +   41.2us  moe_f(P)
+        95.1 +    4.7us  void gv<1, 1, 2, 1, 16, 4, 1, 1, 0, 0>(G)
+        99.2 +    4.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+decode 1   {"batch": 1, "ctx": 80000, "layer": "full", "page"     125.0us  base     128.0us  x1.024
+         0.0 +   12.6us  void gv<1, 1, 2, 1, 8, 16, 1, 1, 0, 1>(G)
+        11.5 +   18.8us  void fdec<false, true>(F)
+        26.0 +    9.8us  void gv<1, 1, 2, 1, 8, 2, 1, 1, 0, 3>(G)
+        35.3 +    4.5us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        36.9 +    7.0us  void rr<1, 2>(float4 const*, __nv_bfloat16 const*, float*, int, int, int)
+        37.1 +   24.4us  void gv<1, 1, 2, 2, 8, 16, 1, 1, 0, 0>(G)
+        43.6 +   17.5us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        59.7 +    4.4us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        62.1 +   50.9us  moe_f(P)
+       112.9 +    5.1us  void gv<1, 1, 2, 1, 16, 4, 1, 1, 0, 0>(G)
+       117.2 +    5.1us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+decode 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "p     186.1us  base     187.7us  x1.010
+         0.0 +   12.7us  void gv<1, 2, 1, 1, 4, 8, 4, 1, 2, 13>(G)
+        13.2 +   13.1us  void fdec<false, true>(F)
+        26.8 +    7.0us  void gv<1, 2, 2, 1, 8, 2, 1, 1, 0, 1>(G)
+        34.2 +    4.7us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        39.4 +    7.7us  void gv<2, 2, 2, 1, 8, 2, 8, 1, 0, 4>(G)
+        39.4 +   22.3us  void gv<1, 2, 2, 2, 8, 16, 1, 1, 0, 1>(G)
+        48.5 +   14.1us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        62.4 +    3.0us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        66.3 +   91.3us  moe_kernel(P)
+       157.9 +   18.5us  void gv<1, 2, 2, 1, 4, 16, 1, 1, 2, 1>(G)
+       177.0 +    5.4us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+decode 16  {"batch": 16, "ctx": 80000, "layer": "full", "page     310.3us  base     311.0us  x1.004
+         0.0 +   12.9us  void gv<1, 2, 1, 1, 4, 8, 4, 1, 2, 13>(G)
+        13.4 +  136.1us  void fdec<false, true>(F)
+       149.8 +    6.3us  void gv<1, 2, 2, 1, 8, 2, 1, 1, 0, 1>(G)
+       156.5 +    4.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+       162.0 +   22.2us  void gv<1, 2, 2, 2, 8, 16, 1, 1, 0, 1>(G)
+       162.1 +    7.4us  void gv<2, 2, 2, 1, 8, 2, 8, 1, 0, 4>(G)
+       170.0 +   15.2us  route(float const*, float const*, int const*, int, int*, int*, float*)
+       185.1 +    3.0us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+       188.9 +   94.1us  moe_kernel(P)
+       283.4 +   18.7us  void gv<1, 2, 2, 1, 4, 16, 1, 1, 2, 1>(G)
+       302.5 +    5.4us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+decode 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "p     236.9us  base     235.3us  x0.994
+         0.0 +   13.9us  void gv<1, 4, 1, 1, 4, 16, 2, 1, 2, 13>(G)
+        14.3 +   17.6us  void fdec<false, true>(F)
+        32.4 +    8.1us  nvjet_tst_64x32_64x16_2x1_v_bz_TNT
+        40.9 +    4.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        46.2 +   25.8us  void gv<1, 4, 2, 1, 8, 16, 1, 1, 2, 0>(G)
+        46.2 +    8.4us  void gv<2, 4, 2, 1, 4, 2, 16, 1, 0, 0>(G)
+        55.6 +   11.6us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        72.9 +    3.5us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        77.2 +  131.1us  moe_kernel(P)
+       209.0 +   20.1us  void gv<1, 4, 2, 1, 4, 16, 1, 1, 2, 0>(G)
+       229.6 +    5.5us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+decode 32  {"batch": 32, "ctx": 80000, "layer": "full", "page     475.0us  base     477.5us  x1.005
+         0.0 +   13.8us  void gv<1, 4, 1, 1, 4, 16, 2, 1, 2, 13>(G)
+        14.2 +  256.5us  void fdec<false, true>(F)
+       271.1 +    8.3us  nvjet_tst_64x32_64x16_2x1_v_bz_TNT
+       279.8 +    5.0us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+       285.2 +   25.4us  void gv<1, 4, 2, 1, 8, 16, 1, 1, 2, 0>(G)
+       285.3 +    8.8us  void gv<2, 4, 2, 1, 4, 2, 16, 1, 0, 0>(G)
+       295.7 +   11.2us  route(float const*, float const*, int const*, int, int*, int*, float*)
+       311.0 +    3.6us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+       315.5 +  129.6us  moe_kernel(P)
+       445.5 +   19.8us  void gv<1, 4, 2, 1, 4, 16, 1, 1, 2, 0>(G)
+       465.8 +    5.6us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 1   {"batch": 1, "ctx": 80000, "layer": "sliding", "pa     165.2us  base     166.0us  x1.004
+         0.0 +   11.9us  void gv<1, 1, 2, 1, 8, 16, 1, 1, 0, 1>(G)
+        11.2 +   12.7us  void attnw39<true, true, true, 8>(A, WF)
+        24.0 +    6.4us  void gv<1, 1, 2, 1, 8, 2, 1, 1, 0, 1>(G)
+        30.1 +    4.8us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        31.8 +    9.8us  void gv<2, 1, 2, 1, 8, 2, 8, 1, 0, 4>(G)
+        32.0 +   24.5us  void gv<1, 1, 1, 2, 16, 8, 1, 1, 0, 3>(G)
+        39.5 +   15.1us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        55.1 +    4.2us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        59.7 +   91.2us  moe_kernel(P)
+       151.4 +    4.6us  void gv<1, 1, 2, 1, 16, 4, 1, 1, 0, 1>(G)
+       155.4 +    5.2us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 1   {"batch": 1, "ctx": 80000, "layer": "full", "page"     184.3us  base     185.9us  x1.010
+         0.0 +   11.8us  void gv<1, 1, 2, 1, 8, 16, 1, 1, 0, 1>(G)
+        11.0 +   32.0us  void attnw<true, true, true, 520>(A, WF)
+        43.2 +    6.5us  void gv<1, 1, 2, 1, 8, 2, 1, 1, 0, 1>(G)
+        49.2 +    4.7us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        50.9 +    9.3us  void gv<2, 1, 2, 1, 8, 2, 8, 1, 0, 4>(G)
+        51.1 +   25.1us  void gv<1, 1, 1, 2, 16, 8, 1, 1, 0, 3>(G)
+        59.1 +   15.0us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        74.5 +    4.5us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        79.4 +   92.4us  moe_kernel(P)
+       172.2 +    4.7us  void gv<1, 1, 2, 1, 16, 4, 1, 1, 0, 1>(G)
+       176.3 +    5.0us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 16  {"batch": 16, "ctx": 80000, "layer": "sliding", "p     317.5us  base     319.2us  x1.005
+         0.0 +   16.7us  nvjet_tst_64x64_64x13_2x2_h_bz_NNT
+        17.1 +   16.6us  void attnp<2, 68>(A, WF)
+        34.2 +    8.8us  nvjet_tst_128x64_64x8_1x2_h_bz_TNT
+        43.4 +    6.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        51.0 +    8.9us  nvjet_tss_64x32_64x16_1x2_h_bz_splitK_TNT
+        51.2 +   38.4us  nvjet_tst_64x64_64x13_1x1_v_bz_NNT
+        60.8 +   26.1us  void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, 
+        87.2 +    2.5us  void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:
+        89.9 +    5.2us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+        90.5 +    7.1us  route(float const*, float const*, int const*, int, int*, int*, float*)
+        98.4 +  185.6us  moe_kernel(P)
+       284.8 +   25.5us  nvjet_tst_128x64_64x8_1x2_h_bz_NNN
+       310.6 +    6.8us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 16  {"batch": 16, "ctx": 80000, "layer": "full", "page     468.7us  base     491.8us  x1.049
+         0.0 +   16.7us  nvjet_tst_64x64_64x13_2x2_h_bz_NNT
+        17.0 +  142.2us  void attnp<2, 68>(A, WF)
+       159.5 +    9.0us  nvjet_tst_128x64_64x8_1x2_h_bz_TNT
+       169.0 +    7.0us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+       176.4 +    7.6us  nvjet_tss_64x32_64x16_1x2_h_bz_splitK_TNT
+       176.7 +   37.2us  nvjet_tst_64x64_64x13_1x1_v_bz_NNT
+       184.4 +   25.2us  void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, 
+       210.2 +    2.6us  void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:
+       213.3 +    7.1us  route(float const*, float const*, int const*, int, int*, int*, float*)
+       214.1 +    5.3us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+       221.3 +  213.7us  moe_kernel(P)
+       435.8 +   26.1us  nvjet_tst_128x64_64x8_1x2_h_bz_NNN
+       462.1 +    6.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 32  {"batch": 32, "ctx": 80000, "layer": "sliding", "p     456.7us  base     458.8us  x1.004
+         0.0 +   19.1us  nvjet_tst_72x64_64x12_1x1_v_bz_TNN
+        19.4 +   21.6us  void attnp<2, 68>(A, WF)
+        41.3 +    9.4us  nvjet_tst_128x128_64x6_1x1_v_bz_coopA_NNN
+        51.2 +   12.3us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+        64.2 +    7.4us  nvjet_tss_64x64_64x13_1x1_v_bz_splitK_TNN
+        64.3 +   47.9us  nvjet_tst_128x64_64x8_1x1_v_bz_coopA_NNT
+        72.1 +   36.4us  void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, 
+       109.0 +    2.6us  void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:
+       112.0 +   10.4us  route(float const*, float const*, int const*, int, int*, int*, float*)
+       112.5 +    8.6us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+       123.3 +  293.4us  moe_kernel(P)
+       417.5 +   27.4us  nvjet_tst_128x128_64x6_1x1_v_bz_coopA_NNN
+       445.1 +   11.7us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+verify 32  {"batch": 32, "ctx": 80000, "layer": "full", "page     729.6us  base     808.2us  x1.109
+         0.0 +   19.5us  nvjet_tst_72x64_64x12_1x1_v_bz_TNN
+        19.9 +  267.2us  void attnp<2, 68>(A, WF)
+       288.0 +    9.5us  nvjet_tst_128x128_64x6_1x1_v_bz_coopA_NNN
+       297.9 +   11.9us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+       310.3 +    7.6us  nvjet_tss_64x64_64x13_1x1_v_bz_splitK_TNN
+       310.5 +   47.0us  nvjet_tst_128x64_64x8_1x1_v_bz_coopA_NNT
+       318.4 +   36.1us  void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, 
+       354.5 +    2.6us  void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:
+       357.5 +   10.4us  route(float const*, float const*, int const*, int, int*, int*, float*)
+       357.8 +    9.0us  rmsg(__nv_bfloat16 const*, float const*, __nv_bfloat16*)
+       368.8 +  321.9us  moe_kernel(P)
+       691.3 +   27.1us  nvjet_tst_128x128_64x6_1x1_v_bz_coopA_NNN
+       718.6 +   11.8us  resid(__nv_bfloat16 const*, int, float const*, float const*, float const*, float const*, f
+geomean speedup x1.008  per-load decode 1:0.98 decode 16:1.01 decode 32:1.00 verify 1:1.01 verify 16:1.02 verify 32:1.04
