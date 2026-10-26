@@ -230,7 +230,7 @@ __global__ void __launch_bounds__(256) swiglu2(const bf* H, const int* offs, bf*
 }
 // MoE combine as a weighted gather: out[t] = sum over t's local slots of tw * rms(Y[pos] * gw, 1e-8), bf16; 256 threads x 16 columns,
 // the next slot's row prefetched, one barrier per slot (double-buffered partials)
-__global__ void __launch_bounds__(256) comb(const bf* Y, const int* loc, const int* pos, const float* gw, const float* tw, bf* out) {
+__global__ void __launch_bounds__(256) comb(const bf* Y, const int* loc, const int* pos, const float* gw, const float* tw, const bf* add, bf* out) {
   __shared__ float red[2][8];
   const int t = blockIdx.x, c0 = threadIdx.x * 8, c1 = c0 + 2048, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
   unsigned msk = 0;
@@ -239,6 +239,7 @@ __global__ void __launch_bounds__(256) comb(const bf* Y, const int* loc, const i
   float acc[16];
 #pragma unroll
   for (int j = 0; j < 16; j++) acc[j] = 0.f;
+  if (add) { unp8(__ldcs((const uint4*)(add + (size_t)t * 4096 + c0)), acc); unp8(__ldcs((const uint4*)(add + (size_t)t * 4096 + c1)), acc + 8); }
   int k = -1; uint4 u0 = make_uint4(0, 0, 0, 0), u1 = u0;
   if (msk) {
     k = __ffs(msk) - 1; msk &= msk - 1;
@@ -311,6 +312,16 @@ __global__ void route2(const float* lg, int ld, const float* bias, const int* ls
     if (cnt && l < 32) atomicAdd(cnt + l, 1);
   }
 }
+// hybrid MoE: experts with more than thr local routes go to dequant + grouped GEMM (locb, cntb), the rest to the fused ring kernel (locq)
+__global__ void msplit_k(const int* loc, const int* cnt, int thr, int R, int* locq, int* locb, int* cntb) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32) cntb[i] = cnt[i] > thr ? cnt[i] : 0;
+  if (i < R) {
+    const int l = loc[i];
+    const bool lc = l < 32, hv = lc && cnt[l] > thr;
+    locq[i] = hv ? 255 : l; locb[i] = (lc && !hv) ? 255 : l;
+  }
+}
 __global__ void rscan2(const int* cnt, int* offs, int* fill) {
   const int l = threadIdx.x;
   int v = cnt[l], x = v;
@@ -346,6 +357,33 @@ __global__ void __launch_bounds__(256) deq2(const uint4* w, const uint16_t* sf, 
     for (int k = 0; k < 8; k++) v[k] = e2m1(qq[h] >> (4 * k)) * sc;
     __stcs(out + 4 * (size_t)i + h, pk8(v));
   }
+}
+// deq2 with coalesced stores: one 4-byte word (8 values) per lane per step, a warp's 32 words contiguous, so each 16-byte store
+// instruction covers 512 contiguous bytes; 4 independent words per thread (stride 32 words) loaded up front
+__global__ void __launch_bounds__(256) deq3(const uint32_t* w, const uint8_t* sf, const float* gs, const int* cnt, uint4* out, long long wpe, long long nw) {
+  const long long base = ((long long)blockIdx.x * 8 + (threadIdx.x >> 5)) * 128 + (threadIdx.x & 31);
+  if (base >= nw) return;
+  const int e = (int)(base / wpe);
+  if (cnt[e] == 0) return;
+  uint32_t q[4]; uint32_t sb[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++) { q[k] = __ldcs(w + base + 32 * k); sb[k] = __ldcs(sf + ((base + 32 * k) >> 1)); }
+  const float g = gs[e];
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    __nv_fp8_e4m3 a; a.__x = (uint8_t)sb[k];
+    const float sc = (float)a * g;
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) v[j] = e2m1(q[k] >> (4 * j)) * sc;
+    __stcs(out + base + 32 * k, pk8(v));
+  }
+}
+void dequant3(torch::Tensor w, torch::Tensor sf, torch::Tensor gs, torch::Tensor cnt, torch::Tensor out) {
+  const long long nw = w.numel() / 4, wpe = nw / 32;
+  TORCH_CHECK(wpe % 1024 == 0);
+  deq3<<<(unsigned)((nw + 1023) / 1024), 256, 0, at::cuda::getCurrentCUDAStream()>>>((const uint32_t*)w.data_ptr(), (const uint8_t*)sf.data_ptr(), gs.data_ptr<float>(),
+      cnt.data_ptr<int>(), (uint4*)out.data_ptr(), wpe, nw);
 }
 void dequant2(torch::Tensor w, torch::Tensor sf, torch::Tensor gs, torch::Tensor cnt, torch::Tensor out) {
   const long long per_e = w.numel() * 2 / 32;
@@ -410,8 +448,9 @@ void gathnorm(torch::Tensor x, torch::Tensor list, torch::Tensor offs, torch::Te
 void act2(torch::Tensor H, torch::Tensor offs, torch::Tensor I) {
   swiglu2<<<nsm() * occ(swiglu2, 256, 0), 256, 0, ST>>>(BP(H), offs.data_ptr<int>(), BP(I));
 }
-void combine(torch::Tensor Y, torch::Tensor loc, torch::Tensor pos, torch::Tensor gw, torch::Tensor tw, torch::Tensor out) {
-  comb<<<out.size(0), 256, 0, ST>>>(BP(Y), loc.data_ptr<int>(), pos.numel() ? pos.data_ptr<int>() : nullptr, gw.data_ptr<float>(), tw.data_ptr<float>(), BP(out));
+void combine(torch::Tensor Y, torch::Tensor loc, torch::Tensor pos, torch::Tensor gw, torch::Tensor tw, torch::Tensor add, torch::Tensor out) {
+  comb<<<out.size(0), 256, 0, ST>>>(BP(Y), loc.data_ptr<int>(), pos.numel() ? pos.data_ptr<int>() : nullptr, gw.data_ptr<float>(), tw.data_ptr<float>(),
+      add.numel() ? (const bf*)add.data_ptr() : nullptr, BP(out));
 }
 void routing2(torch::Tensor lg, torch::Tensor bias, torch::Tensor ls, torch::Tensor ids, torch::Tensor loc, torch::Tensor lid, torch::Tensor tw, torch::Tensor cnt) {
   const int T = lg.size(0);
@@ -419,6 +458,10 @@ void routing2(torch::Tensor lg, torch::Tensor bias, torch::Tensor ls, torch::Ten
   if (c) cudaMemsetAsync(c, 0, 32 * 4, ST);
   route2<<<(T + 3) / 4, 128, 0, ST>>>(lg.data_ptr<float>(), (int)lg.stride(0), bias.data_ptr<float>(), ls.data_ptr<int>(), T, ids.data_ptr<int>(), loc.data_ptr<int>(),
       lid.data_ptr<int>(), tw.data_ptr<float>(), c);
+}
+void msplit(torch::Tensor loc, torch::Tensor cnt, int64_t thr, torch::Tensor locq, torch::Tensor locb, torch::Tensor cntb) {
+  const int R = loc.numel();
+  msplit_k<<<(R + 255) / 256, 256, 0, ST>>>(loc.data_ptr<int>(), cnt.data_ptr<int>(), (int)thr, R, locq.data_ptr<int>(), locb.data_ptr<int>(), cntb.data_ptr<int>());
 }
 void rlist(torch::Tensor loc, torch::Tensor cnt, torch::Tensor offs, torch::Tensor fill, torch::Tensor list, torch::Tensor pos) {
   const int R = loc.numel();
@@ -428,7 +471,7 @@ void rlist(torch::Tensor loc, torch::Tensor cnt, torch::Tensor offs, torch::Tens
 """
 _pf2mod = None
 import time
-_PF2_FN = ["qkprep", "ongate", "res_a", "res_b", "rmsgain2", "gathnorm", "act2", "combine", "routing2", "rlist", "dequant2", "kvgather"]
+_PF2_FN = ["qkprep", "ongate", "res_a", "res_b", "rmsgain2", "gathnorm", "act2", "combine", "routing2", "rlist", "dequant2", "kvgather", "msplit", "dequant3"]
 
 
 def _pf2():
@@ -436,7 +479,7 @@ def _pf2():
     if _pf2mod is None:
         import re
         decl = " ".join(re.sub(r"\s+", " ", m) + ";" for m in re.findall(r"^void \w+\([^)]*\)", PF2_CUDA, re.M) if m.split("(")[0][5:] in _PF2_FN)
-        _pf2mod = load_inline("pf2_glue_v10", cpp_sources=decl, cuda_sources=PF2_CUDA, functions=_PF2_FN, extra_cuda_cflags=["-O3"], verbose=False)
+        _pf2mod = load_inline("pf2_glue_v12", cpp_sources=decl, cuda_sources=PF2_CUDA, functions=_PF2_FN, extra_cuda_cflags=["-O3"], verbose=False)
     return _pf2mod
 
 
@@ -558,6 +601,16 @@ ALIGN_LOCAL = True  # align only the local routes over 32 buckets: Marlin (is_ep
 KVC_TUNE = True
 KVC_CASES = ((1, 753, 80000, 0), (1, 753, 80000, 2048), (4, 753, 80000, 0), (4, 753, 80000, 2048), (1, 16384, 32768, 0), (1, 16384, 32768, 2048))
 MOE_Q = True  # time the fused W4A16 prefill kernel in prepare() and use it where it wins
+# fused-ring (muse_moe_w4a16 v23) builds timed in prepare(): extra -D flags over Q__cfg() (TP=128 needs RPW=1: RPW=2 spills, NSLOT=3 exceeds smem)
+QV = {"a": (), "b": ("-DLAG=1",)}  # TP=128 (RPW=1, NSLOT=2) lost 1.4-1.5x on H100
+HTHR = (256, 384, 512, 768, 1024)  # hybrid split: experts with more local routes than this go to dequant + grouped GEMM
+# per-expert local route counts of the scored soft routing (busiest 32-expert range, ~1.8 routes/token; reference router + judge-style
+# router seeds picked for that load, two draws per size), used for the prepare() timings
+MOE_PROF = {753: ((400, 314, 241, 174, 105, 57, 19, 15, 9, 9, 5, 2, 1, 1, 1), (635, 184, 181, 154, 69, 68, 18, 16, 10, 6, 5, 4, 4, 3)),
+            3012: ((1571, 1248, 749, 490, 488, 280, 255, 120, 61, 46, 42, 30, 25, 6, 2, 2, 1, 1, 1),
+                   (2466, 1799, 397, 261, 256, 78, 46, 43, 21, 19, 14, 11, 8, 7, 1, 1, 1)),
+            16384: ((10543, 8504, 3315, 2228, 1774, 1545, 852, 661, 306, 128, 109, 60, 57, 28, 24, 13, 5, 2),
+                    (7853, 5763, 4218, 4026, 2729, 2553, 1105, 608, 511, 336, 281, 94, 75, 8, 6, 5, 5, 3, 2, 1))}
 MOE_T = (753, 3012, 16384)
 MAR_BM = {}  # T -> Marlin moe_block_size override (default: SGLang's heuristic)
 # H200 picks from the pf8 judge search, (layout, CUBLASLT_ALGO_CONFIG_*) seeds tried next to the heuristics
@@ -667,8 +720,8 @@ def prepare(weights):
     _T0[:] = [time.time()]
     from concurrent.futures import ThreadPoolExecutor
     lean = _lean()
-    with ThreadPoolExecutor(3) as ex:
-        jobs = [ex.submit(_pf2)] + ([ex.submit(_ltext)] if LT_TUNE else [])
+    with ThreadPoolExecutor(3 + len(QV)) as ex:
+        jobs = [ex.submit(_pf2)] + ([ex.submit(_ltext)] if LT_TUNE else []) + ([ex.submit(_qx, v) for v in QV if QV[v]] if MOE_Q and lean else [])
         qj = ex.submit(Q_prepare, {"w13": weights["w13"], "w13_sf": weights["w13_sf"], "w13_gs": weights["w13_gs"], "w2": weights["w2"],
                                    "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"], "post_norm_w": weights["post_expert_norm"]}) if MOE_Q else None
         if lean:
@@ -701,6 +754,11 @@ def prepare(weights):
     st["q"] = qj.result() if qj is not None else None
     torch.cuda.synchronize()
     print(f"pf2 compiled at {time.time() - _T0[0]:.1f}s (lean {lean})", flush=True)
+    try:
+        import deep_gemm as _dg
+        print("pf2 deep_gemm", getattr(_dg, "__version__", "?"), [n for n in dir(_dg) if "grouped" in n][:12], flush=True)
+    except Exception as e:
+        print("pf2 deep_gemm unavailable", str(e)[:120], flush=True)
     fl, sink = torch.empty(64 << 20, dtype=torch.float32, device=dev), torch.empty((), device=dev)
     if LT_TUNE:
         _lt_tune(st, fl, sink)
@@ -814,12 +872,44 @@ def _marlin2(x, tw, lid, al, bm, bank, mm):
     y = mm["gemm"](c2, c3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws, sid, bexp, npad, tw, top_k=1,
                    size_m=T * 8, size_n=K, size_k=N, **com).view(T, 8, K)
     out = torch.empty((T, K), device=x.device, dtype=x.dtype)
-    _pf2().combine(y, lid, bank["nopos"], bank["post_wf"], tw, out)
+    _pf2().combine(y, lid, bank["nopos"], bank["post_wf"], tw, bank["nopos"], out)
     return out
 
 
-def _moe_q(p, loc, tw, st):
-    """the MoE agent's prefill-scale fused W4A16 kernel (muse_moe_w4a16 v23): p = normalized expert input, loc = local ids"""
+Q_DECL = "void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);"
+
+
+def _qfits(fl):
+    d = {}
+    for x in list(Q__cfg()) + list(fl):
+        k, _, val = x[2:].partition("=")
+        d[k] = int(val)
+    need = d.get("NSLOT", 2) * (d.get("NCW", 8) * d.get("RPW", 1) * 2304 + d.get("TP", 64) * 528) + 2048
+    pr = torch.cuda.get_device_properties(0)
+    return need <= getattr(pr, "shared_memory_per_block_optin", 232448)
+
+
+def _qx(v):
+    fl = QV[v]
+    if not fl:
+        return Q__ext()
+    if not _qfits(fl):
+        return None
+    key = ("pf12",) + fl
+    if key not in Q__mods:
+        base = [d for d in Q__cfg() if not any(x.startswith(d.split("=")[0] + "=") for x in fl)] + list(fl)
+        name = "moe_w4a16_v23_" + "".join(base).replace("-", "_").replace("=", "")
+        try:
+            Q__mods[key] = load_inline(name, cpp_sources=Q_DECL, cuda_sources=Q_CUDA, functions=["moe"],
+                                       extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + base, verbose=False)
+        except Exception as e:
+            print("pf2 ring", v, "build failed", str(e)[-300:], flush=True)
+            Q__mods[key] = None
+    return Q__mods[key]
+
+
+def _moe_q(p, loc, tw, st, v="a"):
+    """the MoE agent's prefill-scale fused W4A16 kernel (muse_moe_w4a16 v23, build v): p = normalized expert input, loc = local ids"""
     q = st["q"]
     T, dev = p.shape[0], p.device
     R = T * 8
@@ -827,83 +917,169 @@ def _moe_q(p, loc, tw, st):
     ss = torch.empty((R,), dtype=torch.float32, device=dev)
     lst = torch.empty((R,), dtype=torch.int32, device=dev); pos = torch.empty((R,), dtype=torch.int32, device=dev)
     out = torch.empty_like(p)
-    Q__ext().moe(p, loc, tw, q["w1"], q["w2"], q["g1"], q["g2"], q["nw"], inter, y, ss, q["ctr"], lst, pos, out, 0, q["prof"])
+    _qx(v).moe(p, loc, tw, q["w1"], q["w2"], q["g1"], q["g2"], q["nw"], inter, y, ss, q["ctr"], lst, pos, out, 0, q["prof"])
     return out
 
 
+# MoE paths (kind, thr, ring build, overlap): "mar" SGLang's Marlin, "q" fused ring for all experts, "big" dequant + grouped GEMM for all,
+# "h" hybrid (experts with > thr routes on big, the rest on the ring, whose output big's combine adds); overlap: w2 dequant on the side
+# stream under the first grouped GEMM
 def _moe_path(st, T):
     if st["mv"]:
         return st["mv"][min(st["mv"], key=lambda m: abs(m - T))]
-    return "mar" if MARLIN_MIN < T <= MARLIN_MAX and st.get("bank") is not None else "big"
+    return ("mar", 0, "a", 0) if MARLIN_MIN < T <= MARLIN_MAX and st.get("bank") is not None else ("big", 0, "a", 0)
 
 
-def _skew_routes(T, dev, seed):
-    """synthetic routes shaped like the scored soft routing: ~42% of tokens on one local expert, ~0.75 local routes per token"""
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    ids = 32 + torch.argsort(torch.rand((T, 224), generator=gen, device=dev), dim=1)[:, :8].to(torch.int32)
-    ids[:, 0] = torch.where(torch.rand((T,), generator=gen, device=dev) < 0.42, torch.zeros_like(ids[:, 0]), ids[:, 0])
-    for k in range(1, 8):
-        ids[:, k] = torch.where(torch.rand((T,), generator=gen, device=dev) < 0.05, 1 + k * 4 + (torch.arange(T, device=dev) % 4).int(), ids[:, k])
-    loc = ids.contiguous()
+def _moe_pre(path, loc, lid, cnt, T, st):
+    """routing-side prep (side stream in kernel_fn): Marlin's align, or the grouped lists of the big part"""
+    kind, thr = path[0], path[1]
+    dev = loc.device
+    if kind == "mar":
+        mm = _marlin_mods()
+        bm = MAR_BM.get(T, _mbm(T))
+        return {"al": mm["align"](lid, bm, 32, ignore_invalid_expert=True) if ALIGN_LOCAL else mm["align"](lid, bm, 256), "bm": bm}
+    if kind == "q":
+        return {}
+    g = _pf2()
+    d = {}
+    if kind == "h":
+        d["locq"], d["locb"], d["cntb"] = torch.empty_like(loc), torch.empty_like(loc), torch.empty_like(cnt)
+        g.msplit(loc, cnt, thr, d["locq"], d["locb"], d["cntb"])
+    else:
+        d["locb"], d["cntb"] = loc, cnt
+    d["offs"], d["fill"] = torch.empty_like(cnt), torch.empty_like(cnt)
+    d["lst"] = torch.empty(T * 8, dtype=torch.int32, device=dev); d["pos"] = torch.empty_like(d["lst"])
+    g.rlist(d["locb"], d["cntb"], d["offs"], d["fill"], d["lst"], d["pos"])
+    return d
+
+
+def _moe_main(path, pr, loc, lid, tw, d, st, wait=None):
+    kind, v, ovl = path[0], path[2], path[3]
+    g = _pf2()
+    if kind in ("mar", "q", "h"):
+        p = torch.empty_like(pr)
+        g.rmsgain2(pr, st["g_pre_expert_norm"], p)
+    if wait is not None:
+        wait()
+    if kind == "mar":
+        return _marlin2(p, tw, lid, d["al"], d["bm"], st["bank"], _marlin_mods())
+    if kind == "q":
+        return _moe_q(p, loc, tw, st, v)
+    add = _moe_q(p, d["locq"], tw, st, v) if kind == "h" else st["nocnt"]
+    return _moe_big(g, pr, d["locb"], tw, d["cntb"], d["offs"], d["lst"], d["pos"], st, add, ovl)
+
+
+def _prof_routes(T, prof, dev, seed):
+    """synthetic routes with a measured per-expert local count profile (scaled to T): each expert takes distinct random tokens"""
+    gen = torch.Generator().manual_seed(seed)
+    loc = torch.full((T, 8), 255, dtype=torch.int32)
+    fill = torch.zeros(T, dtype=torch.int64)
+    tref = min(MOE_PROF, key=lambda m: abs(m - T))
+    for c, e in zip(prof, torch.randperm(32, generator=gen).tolist()):
+        free = torch.nonzero(fill < 8).squeeze(1)
+        tok = free[torch.randperm(free.numel(), generator=gen)[: min(free.numel(), max(1, round(c * T / tref)))]]
+        loc[tok, fill[tok]] = e
+        fill[tok] += 1
+    ar = torch.arange(T)
+    for k in range(8):
+        m = loc[:, k] == 255
+        loc[m, k] = (32 + 28 * k + ar[m] % 28).int()
+    perm = torch.argsort(torch.rand((T, 8), generator=gen), dim=1)
+    loc = torch.gather(loc, 1, perm).contiguous().to(dev)
     lid = torch.where(loc < 32, loc, torch.full_like(loc, -1))
-    tw = torch.rand((T, 8), generator=gen, device=dev)
-    return loc, lid, (tw / tw.sum(1, keepdim=True)).contiguous()
+    tw = torch.rand((T, 8), generator=gen).to(dev)
+    cnt = torch.bincount(loc[loc < 32].long(), minlength=32).to(torch.int32)
+    return loc, lid, (tw / tw.sum(1, keepdim=True)).contiguous(), cnt
+
+
+DEQ3 = True  # coalesced-store dequant (deq3) for the big path
+MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
+
+
+def _mname(k):
+    return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in "qh" else "") + ("o" if k[3] else "")
 
 
 def _moe_tune(st, fl, sink):
-    """per scored size: the fused W4A16 kernel vs SGLang's Marlin (turn sizes) or vs dequant + grouped GEMM (16K), timed on skewed synthetic routes"""
-    g = _pf2()
+    """per scored size, on routes with the scored per-expert load profile: ring builds, big (with/without the w2-dequant overlap), Marlin
+    (turn sizes), then hybrid splits with the best ring build; default (pf11's pick) kept unless >3% faster"""
     dev = st["o"].device
-    mm = _marlin_mods() if st.get("bank") is not None else None
+    vs = [v for v in QV if _qx(v) is not None]
+    hasmar = st.get("bank") is not None and _marlin_mods() is not None
     for T in MOE_T:
         try:
             pr = torch.randn((T, 4096), device=dev).to(torch.bfloat16)
-            p = torch.empty_like(pr); g.rmsgain2(pr, st["g_pre_expert_norm"], p)
-            loc, lid, tw = _skew_routes(T, dev, 5)
-            cand = {"q": lambda: (g.rmsgain2(pr, st["g_pre_expert_norm"], p), _moe_q(p, loc, tw, st))[1]}
-            if MARLIN_MIN < T <= MARLIN_MAX and mm is not None:
-                bm = MAR_BM.get(T, _mbm(T))
-                al = mm["align"](lid, bm, 32, ignore_invalid_expert=True) if ALIGN_LOCAL else mm["align"](lid, bm, 256)
-                cand["mar"] = lambda: (g.rmsgain2(pr, st["g_pre_expert_norm"], p), _marlin2(p, tw, lid, al, bm, st["bank"], mm))[1]
-                dflt = "mar"
-            else:
-                cnt = torch.bincount(loc[loc < 32].long(), minlength=32).to(torch.int32)
-                offs, fill = torch.empty_like(cnt), torch.empty_like(cnt)
-                lst = torch.empty(T * 8, dtype=torch.int32, device=dev); pos = torch.empty_like(lst)
-                g.rlist(loc, cnt, offs, fill, lst, pos)
-                cand["big"] = lambda: _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st)
-                dflt = "big"
-            ref = cand[dflt](); out = cand["q"]()
-            torch.cuda.synchronize()
-            err = float((out.float() - ref.float()).norm() / ref.float().norm())
-            t = {k: _gtm(f, fl, sink, 7) for k, f in cand.items()}
-            t = {k: min(v, _gtm(cand[k], fl, sink, 7)) for k, v in t.items()}
-            st["mv"][T] = "q" if err < 2e-2 and t["q"] < t[dflt] * 0.95 else dflt
-            print(f"pf2 moe T{T}: " + " ".join(f"{k} {v * 1e3:.0f}us" for k, v in t.items()) + f" err {err:.1e} -> {st['mv'][T]}", flush=True)
-            del pr, p
+            rs = [_prof_routes(T, pf, dev, 5 + i) for i, pf in enumerate(MOE_PROF[T])]
+            dflt = MOE_DFLT.get(T, ("big", 0, "a", 0))
+            refs = [_moe_main(dflt, pr, loc, lid, tw, _moe_pre(dflt, loc, lid, cnt, T, st), st) for loc, lid, tw, cnt in rs]
+            res = {}
+
+            def run(path):
+                if path in res:
+                    return
+                try:
+                    tot, err = 0.0, 0.0
+                    for (loc, lid, tw, cnt), ref in zip(rs, refs):
+                        d = _moe_pre(path, loc, lid, cnt, T, st)
+                        f = lambda: _moe_main(path, pr, loc, lid, tw, d, st)
+                        out = f()
+                        torch.cuda.synchronize()
+                        err = max(err, float((out.float() - ref.float()).norm() / ref.float().norm()))
+                        tot += min(_gtm(f, fl, sink, 7), _gtm(f, fl, sink, 7))
+                        del out, d
+                    res[path] = (tot / len(rs) if err < 2e-2 else 1e9, err)
+                except Exception as e:
+                    print(f"pf2 moe T{T} {path} failed: {str(e)[-200:]}", flush=True)
+                    res[path] = (1e9, 1.0)
+            run(dflt)
+            if hasmar and MARLIN_MIN < T <= MARLIN_MAX:
+                run(("mar", 0, "a", 0))
+            for v in vs:
+                run(("q", 0, v, 0))
+            for o in (0, 1):
+                run(("big", 0, "a", o))
+            bv = min(vs, key=lambda v: res[("q", 0, v, 0)][0])
+            bo = min((0, 1), key=lambda o: res[("big", 0, "a", o)][0])
+            for thr in HTHR:
+                run(("h", thr, bv, bo))
+            best = min(res, key=lambda k: res[k][0])
+            st["mv"][T] = best if res[best][0] < res[dflt][0] * 0.97 else dflt
+            print(f"pf2 moe T{T} (us, err): " + " ".join(f"{_mname(k)} {v[0] * 1e3:.0f} {v[1]:.0e}" for k, v in sorted(res.items(), key=lambda kv: kv[1][0]))
+                  + f" -> {_mname(st['mv'][T])}", flush=True)
+            del pr, rs, refs
         except Exception as e:
             print(f"pf2 moe T{T} failed: {e}", flush=True)
-    torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
 
-def _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st):
+def _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st, add, ovl=0):
     T, dev = pr.shape[0], pr.device
     R = T * 8
     w13 = torch.empty((32, 8192, 4096), dtype=torch.bfloat16, device=dev)
-    g.dequant2(st["pw13"], st["pw13_sf"], st["pw13_gs"], cnt, w13)
+    w2 = torch.empty((32, 4096, 4096), dtype=torch.bfloat16, device=dev)
+    dq = g.dequant3 if DEQ3 else g.dequant2
+    dq(st["pw13"], st["pw13_sf"], st["pw13_gs"], cnt, w13)
+    cur = torch.cuda.current_stream()
+    if ovl:
+        side = st["side"]
+        side.wait_stream(cur)
+        with torch.cuda.stream(side):
+            dq(st["pw2"], st["pw2_sf"], st["pw2_gs"], cnt, w2)
     A = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.gathnorm(pr, lst, offs, st["g_pre_expert_norm"], A)
     Hh = _gmm(A, w13, offs)
     del A, w13
-    w2 = torch.empty((32, 4096, 4096), dtype=torch.bfloat16, device=dev)
-    g.dequant2(st["pw2"], st["pw2_sf"], st["pw2_gs"], cnt, w2)
+    if ovl:
+        cur.wait_stream(side)
+    else:
+        dq(st["pw2"], st["pw2_sf"], st["pw2_gs"], cnt, w2)
     I = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.act2(Hh, offs, I)
     del Hh
     Y = _gmm(I, w2, offs)
     del I, w2
     y = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
-    g.combine(Y, loc, pos, st["g_post_expert_norm"], tw, y)
+    g.combine(Y, loc, pos, st["g_post_expert_norm"], tw, add, y)
     return y
 
 
@@ -926,41 +1102,21 @@ def kernel_fn(data, st):
     ra = torch.empty((T,), dtype=torch.float32, device=dev)
     g.res_a(a, data["stream"], st["a1"], st["b1"], st["g_pre_ffn_norm"], h, ra)
     path = _moe_path(st, T)
-    mar = path == "mar"
-    bm = MAR_BM.get(T, _mbm(T))
     ids = torch.empty((T, 8), dtype=torch.int32, device=dev)
     loc, lid = torch.empty_like(ids), torch.empty_like(ids)
     tw = torch.empty((T, 8), dtype=torch.float32, device=dev)
-    if path == "big":
-        cnt = torch.empty(32, dtype=torch.int32, device=dev); offs = torch.empty_like(cnt); fill = torch.empty_like(cnt)
-        lst = torch.empty(T * 8, dtype=torch.int32, device=dev); pos = torch.empty(T * 8, dtype=torch.int32, device=dev)
+    cnt = torch.empty(32, dtype=torch.int32, device=dev) if path[0] in ("big", "h") else st["nocnt"]
     cur, side = torch.cuda.current_stream(), st["side"]
     side.wait_stream(cur)
     pr = _dmm(h, st, "pooler")
     with torch.cuda.stream(side):
         lg = _mm32(h, st["rhl_t"])
-        g.routing2(lg, st["router_bias"], data["local_start"], ids, loc, lid, tw, cnt if path == "big" else st["nocnt"])
-        if mar:
-            mm = _marlin_mods()
-            al = mm["align"](lid, bm, 32, ignore_invalid_expert=True) if ALIGN_LOCAL else mm["align"](lid, bm, 256)
-            if not torch.cuda.is_current_stream_capturing():
-                for t_ in al:
-                    t_.record_stream(cur)
-        elif path == "big":
-            g.rlist(loc, cnt, offs, fill, lst, pos)
-    if path == "q":
-        p = torch.empty_like(pr)
-        g.rmsgain2(pr, st["g_pre_expert_norm"], p)
-        cur.wait_stream(side)
-        y = _moe_q(p, loc, tw, st)
-    elif mar:
-        p = torch.empty_like(pr)
-        g.rmsgain2(pr, st["g_pre_expert_norm"], p)
-        cur.wait_stream(side)
-        y = _marlin2(p, tw, lid, al, bm, st["bank"], mm)
-    else:
-        cur.wait_stream(side)
-        y = _moe_big(g, pr, loc, tw, cnt, offs, lst, pos, st)
+        g.routing2(lg, st["router_bias"], data["local_start"], ids, loc, lid, tw, cnt)
+        d = _moe_pre(path, loc, lid, cnt, T, st)
+        if not torch.cuda.is_current_stream_capturing():
+            for t_ in list(d.get("al", ())) + [v for v in d.values() if isinstance(v, torch.Tensor)] + [lg, ids, loc, lid, tw, cnt]:
+                t_.record_stream(cur)
+    y = _moe_main(path, pr, loc, lid, tw, d, st, wait=lambda: cur.wait_stream(side))
     f = _dmm(y, st, "unpooler")
     s2 = torch.empty((T, 8192), dtype=torch.float32, device=dev)
     hid = torch.empty_like(h)
