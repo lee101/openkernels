@@ -1,0 +1,23 @@
+[notice] To update, run: python -m pip install --upgrade pip
+prepare 39.1s
+compiled 10 in 76s
+time base M16 na 10 maxT 16: 122.8 us
+time base M32 na 21 maxT 8: 228.7 us
+prof base M16: mhz 1802 pro 3.3 prodEnd p50/max 106.2/110.3 consEnd p10/50/max 90.4/109.8/113.7 w2wait 114.2 end 116.7 | prod waitEmpty 0.21 dep 0.01 | cons waitFull 0.24 units p50/max 4/4
+prof base M32: mhz 1788 pro 4.4 prodEnd p50/max 211.1/214.8 consEnd p10/50/max 195.3/214.8/219.1 w2wait 219.4 end 222.0 | prod waitEmpty 0.18 dep 0.00 | cons waitFull 0.21 units p50/max 8/8
+time -DNCW=16 -DRPW=1 M16 na 10 maxT 16: 130.2 us
+time -DNCW=16 -DRPW=1 M32 na 21 maxT 8: 238.4 us
+prof -DNCW=16 -DRPW=1 M16: mhz 1801 pro 4.4 prodEnd p50/max 111.4/115.2 consEnd p10/50/max 93.2/114.7/120.6 w2wait 121.3 end 124.2 | prod waitEmpty 0.18 dep 0.01 | cons waitFull 0.27 units p50/max 4/4
+prof -DNCW=16 -DRPW=1 M32: mhz 1801 pro 5.4 prodEnd p50/max 220.2/225.3 consEnd p10/50/max 203.0/223.5/229.6 w2wait 230.7 end 233.0 | prod waitEmpty 0.18 dep 0.00 | cons waitFull 0.25 units p50/max 8/8
+time -DNCW=16 -DRPW=2 -DNSLOT=2 M16 na 10 maxT 16: 159.5 us
+time -DNCW=16 -DRPW=2 -DNSLOT=2 M32 na 21 maxT 8: 226.9 us
+prof -DNCW=16 -DRPW=2 -DNSLOT=2 M16: mhz 1812 pro 4.1 prodEnd p50/max 105.0/143.4 consEnd p10/50/max 67.3/109.6/149.0 w2wait 149.2 end 151.8 | prod waitEmpty 0.30 dep 0.05 | cons waitFull 0.33 units p50/max 2/2
+prof -DNCW=16 -DRPW=2 -DNSLOT=2 M32: mhz 1796 pro 5.6 prodEnd p50/max 209.2/214.3 consEnd p10/50/max 172.8/213.8/219.9 w2wait 221.2 end 224.0 | prod waitEmpty 0.40 dep 0.00 | cons waitFull 0.32 units p50/max 4/4
+time -DFAKEDQ -DNOMMA M16 na 10 maxT 16: 116.5 us
+time -DFAKEDQ -DNOMMA M32 na 21 maxT 8: 218.5 us
+prof -DFAKEDQ -DNOMMA M16: mhz 1980 pro 3.3 prodEnd p50/max 97.8/103.9 consEnd p10/50/max 89.3/102.4/106.8 w2wait 107.0 end 109.8 | prod waitEmpty 0.37 dep 0.02 | cons waitFull 0.50 units p50/max 4/4
+prof -DFAKEDQ -DNOMMA M32: mhz 1992 pro 4.4 prodEnd p50/max 200.7/206.6 consEnd p10/50/max 192.3/203.5/209.9 w2wait 210.2 end 212.7 | prod waitEmpty 0.38 dep 0.01 | cons waitFull 0.49 units p50/max 8/9
+time -DNOCOMP M16 na 10 maxT 16: 113.1 us
+time -DNOCOMP M32 na 21 maxT 8: 215.7 us
+prof -DNOCOMP M16: mhz 1995 pro 3.1 prodEnd p50/max 92.4/100.9 consEnd p10/50/max 88.8/97.3/103.4 w2wait 103.7 end 106.5 | prod waitEmpty 0.39 dep 0.02 | cons waitFull 0.73 units p50/max 4/4
+prof -DNOCOMP M32: mhz 1994 pro 4.4 prodEnd p50/max 188.9/202.5 consEnd p10/50/max 191.2/194.0/205.1 w2wait 205.3 end 208.1 | prod waitEmpty 0.42 dep 0.01 | cons waitFull 0.71 units p50/max 7/9
