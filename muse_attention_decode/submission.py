@@ -69,6 +69,7 @@ CUDA = r"""
 
 // ---------------------------------------------------------------- prep: one CTA (64 x Hq+2Hkv threads) per new token
 __device__ __forceinline__ void rope_cs(const float* invf, int pos, int pair, float& sn, float& cs);
+__device__ __forceinline__ void rope_cs2(float invf, int pos, float& sn, float& cs);
 __global__ void prep(const __nv_bfloat16* qkv, const int64_t* pos, const int64_t* loc, uint8_t* kc, uint8_t* vc,
                      const float* ksc, const float* vsc, __half* qo, uint8_t* q8, int hq, int hkv, float theta, float qsc, const float* invf) {
   const int tok = blockIdx.x, hd = blockIdx.y, d = threadIdx.x;  // one 64-thread block per (token, head)
@@ -1787,12 +1788,10 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     for (int i = 0; i < 2 * NL; i++) asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" :: "r"(mbar + (2 * NL * RS + i) * 8), "r"(8));
   }
   if (!prod && threadIdx.x < 256) asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(ones + threadIdx.x * 4), "r"(0x3C003C00u));
-  const int seq = a.seq[b], nk = seq + t0 + lt;
-  const int k0 = SSI ? 0 : (a.window ? max(0, seq + t0 - a.window + 1) : 0), span = SSI ? a.maxp * a.ps : nk - k0;
-  const int ks = k0 + (int)((long long)span * sp / nsp), ke0 = k0 + (int)((long long)span * (sp + 1) / nsp);
-  const int ke = SSI ? min(ke0, nk) : ke0;
-  const int nb = max(0, (ke - ks + 63) >> 6);
+  const int seq = a.seq[b];  // issued here; nothing before the CTA barrier below consumes it
   uint4 qpre[4];
+  float4 ivp[4];  // EQ: the RoPE inverse frequencies of this thread's query pairs and own-key pairs, fetched with the rows
+  float2 ivk = make_float2(0.f, 0.f);
   uint2 kpre = make_uint2(0, 0), vpre = make_uint2(0, 0);
   int64_t lpre = 0;
   if (EQ && !prod) {
@@ -1803,12 +1802,22 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     const __nv_bfloat16* krow = f.qkv + ((size_t)b * a.L + (wt_ >> 4)) * (2 * 16 + 4) * D;
     kpre = *(const uint2*)(krow + (16 + h_) * D + (wt_ & 15) * 4); vpre = *(const uint2*)(krow + (18 + h_) * D + (wt_ & 15) * 4);
     lpre = f.loc[b * a.L + (wt_ >> 4)];
+    if (a.window) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) ivp[i] = __ldg((const float4*)(f.invf + (wt_ & 1) * 16) + i);
+      ivk = __ldg((const float2*)(f.invf + (wt_ & 15) * 2));
+    }
   }
 #ifdef PROF
   unsigned long long st4[4] = {0, 0, 0, 0};  // prologue sub-stamps (producer: start, seq landed, page table landed, first KV issued;
                                             // consumer: start, query tile written, own keys done, first step's data)
 #endif
   __syncthreads();
+  const int nk = seq + t0 + lt;
+  const int k0 = SSI ? 0 : (a.window ? max(0, seq + t0 - a.window + 1) : 0), span = SSI ? a.maxp * a.ps : nk - k0;
+  const int ks = k0 + (int)((long long)span * sp / nsp), ke0 = k0 + (int)((long long)span * (sp + 1) / nsp);
+  const int ke = SSI ? min(ke0, nk) : ke0;
+  const int nb = max(0, (ke - ks + 63) >> 6);
   if (prod) {
 #if HAS_WG
     asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
@@ -1988,7 +1997,9 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     if (f.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 32; i += 2) {
-        float sn, cs2; rope_cs(f.invf, seq + ql, (qhf * 32 + i) >> 1, sn, cs2);
+        float sn, cs2;
+        if (EQ) { const float4 v4 = ivp[i >> 3]; const int k = (i >> 1) & 3; rope_cs2(k == 0 ? v4.x : k == 1 ? v4.y : k == 2 ? v4.z : v4.w, seq + ql, sn, cs2); }
+        else rope_cs(f.invf, seq + ql, (qhf * 32 + i) >> 1, sn, cs2);
         const float e = x[i], o = x[i + 1];
         x[i] = e * cs2 - o * sn; x[i + 1] = e * sn + o * cs2;
       }
@@ -2029,7 +2040,9 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     if (f.theta > 0.f) {
 #pragma unroll
       for (int i = 0; i < 4; i += 2) {
-        float sn, cs2; rope_cs(f.invf, seq + nt, (nd0 + i) >> 1, sn, cs2);
+        float sn, cs2;
+        if (EQ) rope_cs2(i ? ivk.y : ivk.x, seq + nt, sn, cs2);
+        else rope_cs(f.invf, seq + nt, (nd0 + i) >> 1, sn, cs2);
         const float e = kk4[i], o = kk4[i + 1];
         kk4[i] = e * cs2 - o * sn; kk4[i + 1] = e * sn + o * cs2;
       }
@@ -4541,7 +4554,7 @@ VDEF = (-1, 256, 8, 32, 0, 1)
 # v48 x39 bits: 64 L2::128B prefetch hint on the K/V row copies (each warpgroup copies only its head's 64 B half of a 128 B
 # row, so without it DRAM sees 64 B gathers), 256 full-layer splits balanced over the batch's total keys (grid = resident CTAs)
 VCFG = {(1, True): (-1, 128, 8, 1 << 30, 8, 1), (1, False): (-2, 304, 128, 1 << 30, 68, 1),  # v1f: attnp, 264 lanes, 128 grouped mergers  # (new-kernel V 7/14/15 trip ptxas 12.9 here)
-        (16, True): (-2, 128, 8, 1 << 30, 68, 1), (32, True): (-2, 256, 8, 1 << 30, 68, 1),
+        (16, True): (-2, 128, 8, 1 << 30, 32836, 1), (32, True): (-2, 256, 8, 1 << 30, 32836, 1),  # x 32768: early query loads
         (16, False): (-2, 256, 8, 1 << 30, 324, 1), (32, False): (-2, 256, 8, 1 << 30, 324, 1)}
 # v51: x39 256 on attnp = lanes balanced over the batch's total keys on all SMs (full layers), 128 = producer converts V
 # var -2: attnp (warp-specialized: producer warpgroup + 2 split lanes x 2 consumer warpgroups per CTA, setmaxnreg 32 / 112),
@@ -4586,7 +4599,7 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v55_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+        _mod = load_inline("attn_v56_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
                            cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,torch::Tensor,int64_t);",
                            cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
