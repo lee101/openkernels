@@ -52,7 +52,7 @@ if os.environ.get("PROFF"):
             for _ in range(3):
                 st["profF"].zero_(); sink.copy_(fl.sum()); m._fs(data, st, c)
             torch.cuda.synchronize()
-            P = st["profF"].view(-1, 8).cpu()
+            P = st["profF"].view(-1, 16).cpu()
             n = (P[:, 0] > 0).sum().item(); P = P[:n].double(); t0 = P[:, 0].min()
             q = lambda k, f: (P[:, k] - t0).quantile(f).item() / 1e3
             mm = n
