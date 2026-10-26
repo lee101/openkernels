@@ -26,17 +26,23 @@ def gt(fn, reps=30):
 
 
 def timeline(data):
-    S._VPROF = torch.zeros((data["config"]["batch"] * 264 * 8,), dtype=torch.int64, device="cuda")
+    S._VPROF = torch.zeros((65536 + 2048,), dtype=torch.int64, device="cuda")
     for _ in range(3):
         S._VPROF.zero_(); FL.sum(); S.kernel_fn(data)
     torch.cuda.synchronize()
-    P = [r for r in S._VPROF.view(-1, 8).cpu().tolist() if r[0]]
+    V = S._VPROF.cpu()
+    P = [r for r in V[:65536].view(-1, 8).tolist() if r[0]]
+    W = [r for r in V[65536:].view(-1, 4).tolist() if r[2]]
     S._VPROF = None
+    wl = ""
+    if W:
+        med = lambda k: sorted(r[k] for r in W)[len(W) // 2] / 1e3
+        wl = " | lanes %d full-wait %.1f empty-wait %.1f cons-loop %.1f prod-loop %.1f us (p50)" % (len(W), med(0), med(1), med(2), med(3))
     t0 = min(r[0] for r in P); out = []
     for k, nm in enumerate(["start", "q", "prolog", "loop", "parts", "ranked", "all-in", "end"]):
         c = sorted((r[k] - t0) / 1e3 for r in P if r[k])
         if c: out.append("%s %.1f/%.1f" % (nm, c[len(c) // 2], c[-1]))
-    return " ".join(out)
+    return " ".join(out) + wl
 
 
 if PROF: S._DBG = S._DBG + ["-DPROF"]
