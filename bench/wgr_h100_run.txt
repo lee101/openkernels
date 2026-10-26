@@ -1,0 +1,9 @@
+H100 80GB HBM3 (1980 MHz), torch 2.9.0+cu128, 2026-10-26 01:13-01:26 UTC, submission_v22.py prepare log (us, minus a 1-kernel graph) + okb paired (incl ~5 us graph cost)
+gv qkv_gate m16 best 1.2.1.1.4.8.4.1.2.5 11.74 (v21 pick 1.2.1.1.4.8.4.1.2.1 12.16; V13 11.58)
+gv qkv_gate m32 best 1.4.1.1.4.16.2.1.2.13 12.54 (v21 pick .1 15.23; .5 push 14.02; .9 no reg cap 13.66; 2.4.16.2 V13 12.93; 1.4.8.4 V13 14.78)
+gv o m32 best 1.4.1.1.8.2.1.1.0.1 6.24-6.30 (push/no-cap variants 6.9-11.3: lose)
+gv router m8 2.1.2.1.8.2.8.1.0.4 3.81 vs .0 4.96; m16 2.2.2.1.8.2.8.1.0.4 4.00 vs 5.28; m32 push 5.92 vs 5.86
+gv router m128 v12 9.95 wb1 9.50 wb3 9.60 wb2 11.97 wr(64,4,32,2) 7.94 wr(128,2,64,2) 10.85 wr(32,8,16,2) 6.98 wr(32,6,16,2) 7.07
+gv router m256 v12 11.55 wb2 11.84 wb1 18.30 wr(64,4,32,4) 11.07 wr(64,6,16,2) 9.12 wr(128,4,32,2) 11.30 wr(128,2,64,4) 16.38 wr(32,4,16,4) 9.44 wr(32,5,16,4) 9.22
+okb v22 vs v21 (us): d16 qkv 17.0/17.7 router 9.8/10.5; d32 qkv 18.3/20.2; v1 router 9.3/10.4; v16 router 12.5/15.0; v32 router 14.7/16.9; others within noise; geomean x1.024 (graph cost not subtracted)
+correctness: okb all tests + benches PASS, --stress 2 every load 2/2
