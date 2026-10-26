@@ -1,0 +1,13 @@
+[notice] To update, run: python -m pip install --upgrade pip
+name, clocks.max.sm [MHz]
+NVIDIA H100 80GB HBM3, 1980 MHz
+prepare 43.9s
+time M1: fs.0.3.=61.0  fs.0.3.-DNORED=61.3
+time M8: fs.0.3.=132.5  fs.0.3.-DNORED=133.8
+time M32: fs.0.3.=267.9  fs.0.3.-DNORED=266.5
+prof M1 ('fs', 0, 3, '') ctas 132: pro p50/max 3.3/3.6 A p10/50/max 34.8/35.3/35.8 B 44.5/45.1/46.3 bar 47.1 end 55.6
+prof M1 ('fs', 0, 3, '-DNORED') ctas 132: pro p50/max 3.3/3.6 A p10/50/max 34.6/35.6/36.4 B 44.3/45.1/45.6 bar 46.3 end 55.8
+prof M8 ('fs', 0, 3, '') ctas 132: pro p50/max 4.4/6.9 A p10/50/max 59.1/60.4/69.9 B 79.9/80.4/90.4 bar 91.1 end 99.6
+prof M8 ('fs', 0, 3, '-DNORED') ctas 132: pro p50/max 4.4/7.4 A p10/50/max 61.2/62.2/73.2 B 80.6/81.2/91.4 bar 92.4 end 100.6
+prof M32 ('fs', 0, 3, '') ctas 132: pro p50/max 6.4/7.9 A p10/50/max 131.6/136.1/193.3 B 183.6/189.2/241.2 bar 241.9 end 249.9
+prof M32 ('fs', 0, 3, '-DNORED') ctas 132: pro p50/max 6.1/7.7 A p10/50/max 131.3/135.4/208.1 B 181.5/187.9/251.6 bar 252.4 end 260.6

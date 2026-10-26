@@ -1,0 +1,64 @@
+[notice] To update, run: python -m pip install --upgrade pip
+name, clocks.max.sm [MHz]
+NVIDIA H100 80GB HBM3, 1980 MHz
+prepare 47.7s
+M1 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.448e-03 (worst row 2.448e-03)
+M1 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.448e-03 (worst row 2.448e-03)
+M1 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.448e-03 (worst row 2.448e-03)
+M1 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.517e-03 (worst row 2.517e-03)
+M1 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.517e-03 (worst row 2.517e-03)
+M1 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.517e-03 (worst row 2.517e-03)
+M2 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.604e-03 (worst row 2.656e-03)
+M2 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.604e-03 (worst row 2.656e-03)
+M2 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.605e-03 (worst row 2.656e-03)
+M2 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.586e-03 (worst row 2.636e-03)
+M2 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.586e-03 (worst row 2.636e-03)
+M2 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.585e-03 (worst row 2.635e-03)
+M4 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.496e-03 (worst row 2.598e-03)
+M4 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.496e-03 (worst row 2.598e-03)
+M4 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.496e-03 (worst row 2.598e-03)
+M4 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.545e-03 (worst row 2.579e-03)
+M4 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.545e-03 (worst row 2.579e-03)
+M4 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.545e-03 (worst row 2.579e-03)
+M8 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.547e-03 (worst row 2.648e-03)
+M8 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.547e-03 (worst row 2.648e-03)
+M8 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.547e-03 (worst row 2.648e-03)
+M8 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.568e-03 (worst row 2.654e-03)
+M8 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.568e-03 (worst row 2.654e-03)
+M8 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.568e-03 (worst row 2.654e-03)
+M16 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.553e-03 (worst row 2.723e-03)
+M16 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.553e-03 (worst row 2.723e-03)
+M16 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.553e-03 (worst row 2.723e-03)
+M16 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.560e-03 (worst row 2.709e-03)
+M16 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.560e-03 (worst row 2.709e-03)
+M16 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.560e-03 (worst row 2.709e-03)
+M32 normal ('fs', 0, 3) rep1: OK  relative L2 error 2.566e-03 (worst row 2.709e-03)
+M32 normal ('fs', 0, 2) rep1: OK  relative L2 error 2.566e-03 (worst row 2.709e-03)
+M32 normal ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.566e-03 (worst row 2.709e-03)
+M32 skewed ('fs', 0, 3) rep1: OK  relative L2 error 2.530e-03 (worst row 2.668e-03)
+M32 skewed ('fs', 0, 2) rep1: OK  relative L2 error 2.530e-03 (worst row 2.668e-03)
+M32 skewed ('fs', 0, 3, '-DFD1=3') rep1: OK  relative L2 error 2.530e-03 (worst row 2.668e-03)
+time M1: fs.0.3=56.3  fs.0.2=56.4  fs.0.3.-DFD1=3=57.1  v17.0.0=60.2  ring.1.1=64.3
+time M2: fs.0.3=55.4  fs.0.2=55.1  fs.0.3.-DFD1=3=54.5  v17.0.0=62.7  ring.1.1=65.0
+time M4: fs.0.3=68.6  fs.0.2=68.2  fs.0.3.-DFD1=3=72.2  v17.0.0=75.2  ring.1.1=81.6
+time M8: fs.0.3=123.1  fs.0.2=123.6  fs.0.3.-DFD1=3=129.4  v17.0.0=126.1  ring.1.1=117.3
+time M16: fs.0.3=160.9  fs.0.2=162.3  fs.0.3.-DFD1=3=167.5  v17.0.0=160.7  ring.1.1=150.6
+time M32: fs.0.3=268.0  fs.0.2=265.9  fs.0.3.-DFD1=3=264.2  v17.0.0=237.9  ring.1.1=214.7
+prof M1 ('fs', 0, 3) ctas 132: pro p50/max 2.3/2.6 A p10/50/max 30.7/31.7/32.5 B 41.0/41.5/42.8 bar 43.5 end 50.9
+prof M1 ('fs', 0, 2) ctas 132: pro p50/max 2.3/2.6 A p10/50/max 30.7/32.8/33.8 B 41.2/42.2/43.5 bar 44.0 end 51.5
+prof M1 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 2.6/2.6 A p10/50/max 31.0/31.2/32.8 B 41.2/41.5/42.5 bar 43.3 end 50.9
+prof M2 ('fs', 0, 3) ctas 132: pro p50/max 2.8/3.1 A p10/50/max 30.7/31.7/32.8 B 41.0/41.5/42.8 bar 43.5 end 49.4
+prof M2 ('fs', 0, 2) ctas 132: pro p50/max 2.8/2.8 A p10/50/max 30.5/31.7/32.3 B 40.4/41.2/42.0 bar 42.8 end 49.2
+prof M2 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 2.8/2.8 A p10/50/max 31.7/32.0/33.5 B 41.7/42.0/43.3 bar 44.0 end 49.4
+prof M4 ('fs', 0, 3) ctas 132: pro p50/max 2.7/2.8 A p10/50/max 31.2/33.0/34.0 B 41.7/43.5/44.3 bar 45.1 end 50.2
+prof M4 ('fs', 0, 2) ctas 132: pro p50/max 2.7/3.1 A p10/50/max 30.2/31.7/32.8 B 40.7/42.0/43.0 bar 44.0 end 48.9
+prof M4 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 2.6/2.8 A p10/50/max 29.7/32.3/34.3 B 40.4/42.5/45.1 bar 45.8 end 51.5
+prof M8 ('fs', 0, 3) ctas 132: pro p50/max 2.8/5.1 A p10/50/max 55.0/58.0/64.8 B 77.3/77.6/84.7 bar 85.5 end 91.1
+prof M8 ('fs', 0, 2) ctas 132: pro p50/max 2.6/2.6 A p10/50/max 53.8/55.6/60.9 B 79.1/80.4/86.3 bar 87.0 end 92.7
+prof M8 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 2.8/4.6 A p10/50/max 49.7/56.6/71.4 B 74.5/75.3/90.1 bar 90.9 end 96.3
+prof M16 ('fs', 0, 3) ctas 132: pro p50/max 3.1/4.9 A p10/50/max 90.2/94.5/96.3 B 128.0/130.3/134.1 bar 134.9 end 141.1
+prof M16 ('fs', 0, 2) ctas 132: pro p50/max 2.6/2.8 A p10/50/max 87.3/91.1/92.9 B 126.2/129.0/133.9 bar 134.7 end 141.6
+prof M16 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 3.1/4.9 A p10/50/max 79.4/94.2/100.6 B 117.2/127.0/133.1 bar 133.9 end 140.3
+prof M32 ('fs', 0, 3) ctas 132: pro p50/max 2.6/2.8 A p10/50/max 122.1/128.4/231.4 B 176.4/183.0/284.9 bar 285.7 end 291.3
+prof M32 ('fs', 0, 2) ctas 132: pro p50/max 2.3/2.6 A p10/50/max 121.6/128.9/225.3 B 174.6/182.4/278.0 bar 278.8 end 284.4
+prof M32 ('fs', 0, 3, '-DFD1=3') ctas 132: pro p50/max 2.3/2.6 A p10/50/max 110.6/118.4/209.2 B 164.1/168.3/262.7 bar 263.7 end 268.8
