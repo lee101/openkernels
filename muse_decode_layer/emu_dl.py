@@ -10,6 +10,8 @@ _m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_m)
 if os.environ.get("DL_EMU", "1") != "0":
     _m.A__DBG = ["-DWGEMU=1", "-DRSW=2"]
+if os.environ.get("DL_FUSE") is not None and hasattr(_m, "DL_FUSE"):  # v31+: glue fusion on / off
+    _m.DL_FUSE = os.environ["DL_FUSE"] != "0"
 kernel_fn = _m.kernel_fn
 
 
