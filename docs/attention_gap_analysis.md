@@ -72,3 +72,24 @@ Model: every shape costs floor @3.87 / efficiency + a fixed per-call latency F (
 1. B = 1 verify (v1 load 1.93x from the model): one key block per CTA plus a one-round-trip merge for v1s, and a shorter merge for v1f (parallel over splits and rows already; the remaining cost is the arrival atomic and the slowest split).
 2. Sliding verify B16 / B32: the same fixed-latency items (merge 4-7 us of 16-20).
 3. Verify full: consumer chain per step (latency-bound at ~1.4 us per lane step); needs more independent work per warp (QK of step i + 1 during softmax of step i), which does not fit in 112 registers as built.
+
+## 2026-10-27: gap to the 3.03 leader (we are 1.85, v66diag per-shape times)
+
+Load time = 46 x sliding + 16 x full; the score is the geomean over the 6 loads.
+
+| load | SGLang | ours | x | sliding share of ours |
+|---|---|---|---|---|
+| d1 | 1462 | 678 | 2.16 | 59 % |
+| d16 | 4453 | 2263 | 1.97 | 22 % |
+| d32 | 7619 | 3884 | 1.96 | 17 % |
+| v1 | 1648 | 911 | 1.81 | 64 % |
+| v16 | 4643 | 2865 | 1.62 | 27 % |
+| v32 | 7845 | 4826 | 1.63 | 19 % |
+
+3.03 on every load needs roughly: full B16 / B32 at ~1.2x the 4.8 TB/s floor (76 / 152 us, i.e. ~4 TB/s, about the measured 3.87 TB/s random-row gather ceiling) with sliding at 2-7 us; B = 1 at ~9-10 us sliding and ~5-8 us full. Model: sliding at a fixed 4 us and full at 1.1x / 1.3x floor gives 4.07 / 3.62; 5 us and 1.3x gives 3.38. So the leader is near the gather ceiling on full shapes and ~2-4x below our latency on sliding / B = 1.
+
+Where we are vs that target: v16f 131 vs ~80 (1.6x), v32f 244 vs ~160 (1.5x), d16f 110 / d32f 203 (1.3-1.4x); v32s 20, v16s 17, v1s 12.7, v1f 20.5, d1f 17.4 vs ~5-9 (2-3x); d16s 10.9, d32s 14, d1s 8.7 (1.5-2.5x).
+
+The common limiter on all six verify shapes is the attnp consumer step (~1.5 us per 64-key lane step, a serial chain; v66 ablations): v16f / v32f directly, and v1s / v1f / v16s / v32s through 4-10 steps per lane plus prolog (~2.3 us) and merge tail (~3-5 us). Per SM the step's resource floors are ~1200 issue cycles and 1024 MUFU cycles per 4-warpgroup round vs ~2900 measured, so overlap (ping-pong, FP8 PV, more concurrent chains) is worth up to ~2x there. Decode full (fdec 2.9-3.3 TB/s) is closest to the ceiling.
+
+TASK.md levers: FP8 P / V is allowed (queries may be E4M3; FA3 with an FP8 cache runs PV in FP8), so v67 FP8 PV is legal. No prepare step and "fresh inputs: don't cache anything derived from data", so no KV relayout or cached page-table products. Cache rows are a random permutation (reference.generate_input randperm), so every key is a 128 B random gather: the 3.87 TB/s ceiling stands. The graph's fixed ~4 us is subtracted on both sides; a raw seq -> page table -> KV chain is ~1.2-1.7 us after that, so a sliding shape could reach ~3-4 us.
