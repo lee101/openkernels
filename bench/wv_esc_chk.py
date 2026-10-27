@@ -29,7 +29,7 @@ for (key, bm), geos in m.WVB.items():
         plan = m._wvplan(st, key, w, geo)
         if plan is None:
             print(key, bm, geo, "plan None"); continue
-        TN, QS, S, NWG, HL, C12 = geo
+        TN, QS, S, NWG, HL, C12 = geo[:6]
         BM, tpb, NA = 64 * NWG, NWG * 4, 2 if HL else 1
         pk, e = plan[1], plan[2]
         mats = [w.to(torch.bfloat16), (w - w.to(torch.bfloat16).float()).to(torch.bfloat16)] if HL else [w]
