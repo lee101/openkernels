@@ -25,6 +25,10 @@ def prepare(w):
     if os.environ.get("DL_G1") is not None:  # force the MoE g1 path at M1 (DL_G1="" or "-DDQHI")
         st["moe"]["tune"][1] = ("g1", 0, 0, os.environ["DL_G1"])
         print("DL_G1", st["moe"]["tune"], flush=True)
+    if os.environ.get("DL_GK") is not None:  # force the MoE gk path at M8 / M16 (DL_GK="-DSW=4 -DKS2=2" etc.)
+        for b in (8, 16):
+            st["moe"]["tune"][b] = ("gk", 0, 0, os.environ["DL_GK"])
+        print("DL_GK", st["moe"]["tune"], flush=True)
     print("DLPREP %.1fs state %.2f GB peak %.2f GB (above the %.2f GB before)" % (time.time() - t0, (torch.cuda.memory_allocated() - m0) / 2**30,
           (torch.cuda.max_memory_allocated() - m0) / 2**30, m0 / 2**30), flush=True)
     return st
