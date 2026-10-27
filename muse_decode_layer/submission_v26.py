@@ -11811,6 +11811,15 @@ def kernel_fn(data, st):
     return _kernel_fn19(data, st)
 
 
+# MoE builds pruned to what can win in the layer (judge v25 DLMOE, MoE v46d tune / WD): v17 KSF 0 (v0), fs f1s3 (M32 pin),
+# g1 FENCE1 (v46d M1 pick), gk SW 4 / KS2 2 (v46d M8 / M16 pick), wx RPW 2 + NCW 16 N8STEP (v25 M128 / M256), ring L(0) / L(1) (r1 / r1n)
+DL_PRUNE = True
+if DL_PRUNE:
+    M_V17_KSF = (0,)
+    M_FS_CFG = ((1, 3, ""),)
+    if "M_G_CFG" in globals(): M_G_CFG = ("-DFENCE1",)
+    if "M_K_CFG" in globals(): M_K_CFG = ("-DSW=4 -DKS2=2",)
+    if "M_WX_CFG" in globals(): M_WX_CFG = (("-DRPW=2",), ("-DNCW=16", "-DN8STEP"))
 DL_PIN = {32: ("fs", 1, 3, "")}  # MoE bucket -> config (judge v22 vs v23 decode32: fs f1s3 219.7 / 383.2 us vs r1 236.1 / 420.2)
 DL_PIN_MARGIN = 0.92  # keep the pin unless the in-layer tune's best is faster than the pin by more than 8%
 for _c in DL_PIN.values():
@@ -11842,9 +11851,11 @@ def prepare(weights):
 
 
 def _precompile():
-    import threading
+    import threading, time
+    t0 = time.time()
     th = [threading.Thread(target=f) for f in [A__ext, lambda: M__extL(0), lambda: M__extL(1), _gext, P__ext, P__gvext, P__wbext] + [lambda k=k: M__extS(k) for k in M_V17_KSF] + [lambda c=c: M__extF(*c) for c in M_FS_CFG] + ([lambda c=c: M__extX(c) for c in M_WX_CFG] if "M__extX" in globals() else []) + [lambda c=c: M__extG(c) for c in globals().get("M_G_CFG", ())] + [lambda c=c: M__extK(c) for c in globals().get("M_K_CFG", ())]]
     for t in th:
         t.start()
     for t in th:
         t.join()
+    print("DLCOMPILE %.1fs (%d extension builds)" % (time.time() - t0, len(th)), flush=True)
