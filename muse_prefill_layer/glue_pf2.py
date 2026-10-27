@@ -1183,6 +1183,27 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* tm, int c
                :: "r"(dst), "l"((uint64_t)tm), "r"(c0), "r"(c1), "r"(bar) : "memory");
 }
 #endif
+#if TMA
+// 2-CTA clusters (multicast token tiles): the token tile of a stage is loaded once by rank 0 into both CTAs' smem; each consumer warp
+// releases a slot on its own and on the peer's empty barrier, so a producer's empty wait means both CTAs are done with the slot
+__device__ __forceinline__ uint32_t cta_rank() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
+__device__ __forceinline__ void mbarrive_peer(uint32_t local) {
+  uint32_t ra;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(local), "r"(cta_rank() ^ 1u));
+  asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" :: "r"(ra) : "memory");
+}
+__device__ __forceinline__ void cluster_sync() { asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void tma2d_mc(uint32_t dst, const CUtensorMap* tm, int c0, int c1, uint32_t bar, uint16_t mask) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1, {%2, %3}], [%4], %5;\n"
+               :: "r"(dst), "l"((uint64_t)tm), "r"(c0), "r"(c1), "r"(bar), "h"(mask) : "memory");
+}
+#endif
+template <int MC> __device__ __forceinline__ void relslot(uint32_t b) {
+  mbarrive(b);
+#if TMA
+  if constexpr (MC) mbarrive_peer(b);
+#endif
+}
 // stage-ready barrier: on Hopper the TMA transaction barrier (weights bulk + token-tile tensor copy), emulated: the cp.async full barrier
 template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) {
 #if TMA
@@ -1207,7 +1228,7 @@ template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) 
     wg_commit();                                                                                                                     \
     if (K) {                                                                                                                         \
       wg_wait<1>();                                                                                                                  \
-      if (lane == 0) mbarrive((uint32_t)__cvta_generic_to_shared(&sm->empty[(qq - 1) % C::NS]));                                     \
+      if (lane == 0) relslot<MC>((uint32_t)__cvta_generic_to_shared(&sm->empty[(qq - 1) % C::NS]));                                  \
     }                                                                                                                                \
     PT(c_c);                                                                                                                         \
     dq_half(k2, k3, ky, s1);                                                                                                         \
@@ -1231,7 +1252,7 @@ template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) 
     PADD(pc, 4, 1);                                                                                                                  \
   }
 
-template <int NT, int NCW>
+template <int NT, int NCW, int MC>
 __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint32_t bbase0, uint32_t sbase0, int q, const Hdr h, int wi,
                                       int tid, Pc& pc, float* scr) {
   using C = Cfg<NT, NCW>;
@@ -1247,7 +1268,7 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
   }
   for (int ks = 0; ks < h.nks; ks++) W4STEP(ks);
   wg_wait<0>();
-  if (lane == 0) mbarrive((uint32_t)__cvta_generic_to_shared(&sm->empty[(q + h.nks - 1) % C::NS]));
+  if (lane == 0) relslot<MC>((uint32_t)__cvta_generic_to_shared(&sm->empty[(q + h.nks - 1) % C::NS]));
   PT(c_e0);
   const int g = lane >> 2, t4 = lane & 3;
   const float gs = p.g[h.e];
@@ -1267,7 +1288,9 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
 
 // NT = BNMAX, NCW = 4: full token tiles + remainders > 32, 256-row blocks; NT = 32, NCW = 1: remainders <= 32, 64-row blocks.
 // tm: the token rows (A [rows, 4096] bf16) as a TMA tensor with a (64 K x NT rows) SW128 box
-template <int NT, int NCW>
+// MC: launched as 2-CTA clusters; cluster c takes pair tiles c, c + clusters, ... (static), a pair tile = (expert, token tile, 256-row
+// block, K part) with rank r on its 128-row half; rank 0 multicasts the token tile to both CTAs
+template <int NT, int NCW, int MC = 0>
 __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(P p, const __grid_constant__ CUtensorMap tm) {
   using C = Cfg<NT, NCW>;
   constexpr int NS = C::NS, LA = C::LA, NPT = C::NPT;
@@ -1282,7 +1305,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
   const uint32_t bbase0 = (uint32_t)__cvta_generic_to_shared(sm0), sbase0 = bbase0 + NS * C::BT;
   Sm<NS>* sm = (Sm<NS>*)(sm0 + NS * C::BT + NS * C::WB);
   const int tid = threadIdx.x;
-  const int nrb = p.nrb256 * (4 / NCW);
+  const int nrb = p.nrb256 * (4 / NCW), nrbq = MC ? nrb / 2 : nrb;  // row blocks per token tile; MC queues pairs of them
 #ifdef W4PROF
   const unsigned long long t_start = clk(), n_start = gns();
 #endif
@@ -1290,7 +1313,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
   if (tid == 0) {
     for (int i = 0; i < NS; i++) {
       mbinit((uint32_t)__cvta_generic_to_shared(&sm->full[i]), NPT);
-      mbinit((uint32_t)__cvta_generic_to_shared(&sm->empty[i]), 4 * NCW);  // one arrival per consumer warp after its wgmmas completed
+      mbinit((uint32_t)__cvta_generic_to_shared(&sm->empty[i]), 4 * NCW * (MC ? 2 : 1));  // one arrival per consumer warp (both CTAs if MC)
       mbinit((uint32_t)__cvta_generic_to_shared(&sm->wbar[i]), 1);
     }
 #if TMA
@@ -1305,7 +1328,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     // this launch's share of the expert's tokens: c % lomod (the tokens not covered by a wider launch), in tsz-token tiles; a
     // full-only launch takes no remainder tile; the remainder kernel (NT 32) takes a <= 32-token remainder
     const int cc = p.lomod ? c % p.lomod : c, full = cc / p.tsz, rem = cc % p.tsz;
-    const int nt = (NT == 32 ? (rem > 0 && rem <= 32 ? 1 : 0) : full + (!p.fullonly && rem > 32 ? 1 : 0)) * nrb * p.ksplit;
+    const int nt = (NT == 32 ? (rem > 0 && rem <= 32 ? 1 : 0) : full + (!p.fullonly && rem > 32 ? 1 : 0)) * nrbq * p.ksplit;
     int ntr = 0;
     for (int j = 0; j < 32; j++) { const int rj = __shfl_sync(0xffffffffu, rk, j), nj = __shfl_sync(0xffffffffu, nt, j); if (rj == lane) ntr = nj; }
     int v = ntr;
@@ -1315,6 +1338,9 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     if (lane == 0) sm->cum[0] = 0;
   }
   __syncthreads();
+#if TMA
+  if constexpr (MC) cluster_sync();  // the peer's barriers are initialized before any remote arrival or multicast
+#endif
   const int total = sm->cum[32];
   const int nks = KST / p.ksplit;
   if (tid >= 128 * NCW) {  // producer
@@ -1327,15 +1353,23 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     // one thread: per stage one bulk copy of the NVFP4 chunk + one tensor copy of the token tile onto the stage's transaction barrier
     if (pt == 0) {
       int s = 0;
-      for (;;) {
-        const int u = atomicAdd(p.ctr, 1);
-        if (u >= total || *(volatile int*)&g_w4err) {
-          if (atomicAdd(p.ctr + 1, 1) == (int)gridDim.x - 1) { p.ctr[0] = 0; p.ctr[1] = 0; __threadfence(); }
-          break;
+      const int rank = MC ? (int)cta_rank() : 0;
+      for (int it = 0;; it++) {
+        int u;
+        if constexpr (MC) {
+          u = (int)(blockIdx.x >> 1) + it * (int)(gridDim.x >> 1);
+          if (u >= total || *(volatile int*)&g_w4err) break;
+        } else {
+          u = atomicAdd(p.ctr, 1);
+          if (u >= total || *(volatile int*)&g_w4err) {
+            if (atomicAdd(p.ctr + 1, 1) == (int)gridDim.x - 1) { p.ctr[0] = 0; p.ctr[1] = 0; __threadfence(); }
+            break;
+          }
         }
         int r = 0;
         while (sm->cum[r + 1] <= u) r++;
-        const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrb, rb = v2 % nrb;
+        const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrbq;
+        const int rb = MC ? (v2 % nrbq) * 2 + rank : v2 % nrbq;
         const int st0 = e ? p.offs[e - 1] : 0, cnt0 = p.offs[e] - st0, cnt = p.lomod ? cnt0 % p.lomod : cnt0, sh = cnt0 - cnt;
         const int t0 = NT == 32 ? cnt / p.tsz : tt;
         const int row0 = st0 + sh + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
@@ -1348,7 +1382,11 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
           const uint32_t wb = (uint32_t)__cvta_generic_to_shared(&sm->wbar[slot]);
           expect_tx(wb, C::WB + C::BT);
           bulk(sbase0 + slot * C::WB, wsrc + (size_t)ks * WCH, C::WB, wb);
-          tma2d(bbase0 + slot * C::BT, &tm, (kh * nks + ks) * 64, row0, wb);
+          if constexpr (MC) {
+            if (rank == 0) tma2d_mc(bbase0 + slot * C::BT, &tm, (kh * nks + ks) * 64, row0, wb, (uint16_t)3);
+          } else {
+            tma2d(bbase0 + slot * C::BT, &tm, (kh * nks + ks) * 64, row0, wb);
+          }
           PT(p_b);
           PADD(pc, 1, p_b - p_a); PADD(pc, 4, 1);
         }
@@ -1378,7 +1416,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       }
       int r = 0;
       while (sm->cum[r + 1] <= u) r++;
-      const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrb, rb = v2 % nrb;
+      const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrbq, rb = v2 % nrbq;
       const int st0 = e ? p.offs[e - 1] : 0, cnt0 = p.offs[e] - st0, cnt = p.lomod ? cnt0 % p.lomod : cnt0, sh = cnt0 - cnt;
       const int t0 = NT == 32 ? cnt / p.tsz : tt;
       const int row0 = st0 + sh + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
@@ -1418,7 +1456,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       PWAIT(pc.v[0], rdy<NS>(sm, slot), (q / NS) & 1);
       const Hdr h = sm->hdr[slot];
       if (h.tile < 0 || *(volatile int*)&g_w4err) break;
-      ctile<NT, NCW>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+      ctile<NT, NCW, MC>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
       q += h.nks;
     }
 #ifdef W4PROF
@@ -1429,12 +1467,17 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     }
 #endif
   }
+#if TMA
+  if constexpr (MC) cluster_sync();  // no CTA leaves while its peer may still arrive on its barriers
+#endif
 }
 
 static int g_nsm = 0;
 #define KBIG w4g_k<BNMAX, 4>
 #define KWIDE w4g_k<2 * BNMAX, 2>
 #define KSMALL w4g_k<32, 1>
+#define KWIDEMC w4g_k<2 * BNMAX, 2, 1>
+static int g_ncl = 0;
 static void w4g_init() {
   if (g_nsm) return;
   int dev; cudaGetDevice(&dev);
@@ -1442,6 +1485,16 @@ static void w4g_init() {
   cudaFuncSetAttribute(KBIG, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_need<BNMAX, 4>());
   cudaFuncSetAttribute(KWIDE, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_need<2 * BNMAX, 2>());
   cudaFuncSetAttribute(KSMALL, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_need<32, 1>());
+#if HAS_WG_HOST
+  cudaFuncSetAttribute(KWIDEMC, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_need<2 * BNMAX, 2>());
+  cudaLaunchConfig_t cfg = {};
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = 2; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+  cfg.gridDim = dim3(g_nsm); cfg.blockDim = dim3(Cfg<2 * BNMAX, 2>::NTHR); cfg.dynamicSmemBytes = smem_need<2 * BNMAX, 2>(); cfg.attrs = at; cfg.numAttrs = 1;
+  if (cudaOccupancyMaxActiveClusters(&g_ncl, KWIDEMC, &cfg) != cudaSuccess) g_ncl = 0;
+  cudaGetLastError();
+  g_ncl = std::min(g_ncl, g_nsm / 2);
+#endif
 }
 static PFN_cuTensorMapEncodeTiled_v12000 g_enc = nullptr;
 // A [rows, 4096] bf16 as a 2D TMA tensor, box 64 K x box rows, 128-B swizzle (the wgmma K-major SW128 layout); rows past the end read 0
@@ -1480,8 +1533,20 @@ void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, 
       (int)(out.size(0) / ksplit), (int)ksplit, BNMAX, 0, 0};
   auto st = at::cuda::getCurrentCUDAStream();
   P q = p;
+  const bool mc = mode >= 3 && HAS_WG_HOST && g_ncl > 0;
+  if (mode >= 3) mode -= 2;
   if (cls & 1) {
-    if (mode >= 1) {
+    if (mode >= 1 && mc) {
+#if HAS_WG_HOST
+      q.tsz = 2 * BNMAX; q.fullonly = mode == 2;
+      cudaLaunchConfig_t cfg = {};
+      cudaLaunchAttribute at[1];
+      at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = 2; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+      cfg.gridDim = dim3(2 * g_ncl); cfg.blockDim = dim3(Cfg<2 * BNMAX, 2>::NTHR); cfg.dynamicSmemBytes = smem_need<2 * BNMAX, 2>();
+      cfg.stream = st; cfg.attrs = at; cfg.numAttrs = 1;
+      TORCH_CHECK(cudaLaunchKernelEx(&cfg, KWIDEMC, q, tmap(A.data_ptr(), A.size(0), 2 * BNMAX)) == cudaSuccess, "w4g cluster launch");
+#endif
+    } else if (mode >= 1) {
       q.tsz = 2 * BNMAX; q.fullonly = mode == 2;
       KWIDE<<<g_nsm, Cfg<2 * BNMAX, 2>::NTHR, smem_need<2 * BNMAX, 2>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 2 * BNMAX));
     } else {
@@ -1498,6 +1563,7 @@ void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, 
     KSMALL<<<g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 32));
   }
 }
+int64_t w4g_ncl() { w4g_init(); return g_ncl; }
 int64_t w4g_smem() { return (int64_t)(smem_need<BNMAX, 4>() * 1000000 + smem_need<32, 1>()); }
 """
 
@@ -1529,9 +1595,9 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v12" + ("h" if hop else "e") + ("p" if prof else ""),
-                                        cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t);",
-                                        cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
+            _w4gmod[prof] = load_inline("pf2_w4g_v13" + ("h" if hop else "e") + ("p" if prof else ""),
+                                        cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl();",
+                                        cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err", "w4g_ncl"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
             print("pf2 w4g build failed", str(e)[-1500:], flush=True)
             _w4gmod[prof] = None
@@ -1666,7 +1732,8 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
     pr = torch.randn((T, 4096), device=dev).to(torch.bfloat16)
     loc, lid, tw, cnt = _prof_routes(T, prof, dev, 11)
     path = ("w4", 0, "a", ks2 | (wide << 2))
-    tsz = 256 if wide == 1 else 128
+    bm = (0, 1, 2, 1, 2)[wide]
+    tsz = 256 if bm == 1 else 128
     d = _moe_pre(path, loc, lid, cnt, T, st)
     w = st["w4"]
     R = T * 8
@@ -1678,7 +1745,7 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
     c = w["ctr"][16:24]
     nr = int(cnt.sum())
     cnth = cnt.cpu()
-    big_r = int(sum(int(x) - ((int(x) % (256 if wide == 2 else 1 << 30)) % tsz if (int(x) % (256 if wide == 2 else 1 << 30)) % tsz <= 32 else 0) for x in cnth))
+    big_r = int(sum(int(x) - ((int(x) % (256 if bm == 2 else 1 << 30)) % tsz if (int(x) % (256 if bm == 2 else 1 << 30)) % tsz <= 32 else 0) for x in cnth))
     tm = {"rlist": (lambda: _moe_pre(path, loc, lid, cnt, T, st), 0),
           "gnorm": (lambda: g.gathnorm(pr, d["lst"], d["offs"], st["g_pre_expert_norm"], A), 0),
           "w13": (lambda: _w4gemm(A, d["offs"], w["w13"], w["g13"], c, wide=wide), nr * 8192),
@@ -1698,7 +1765,7 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
         except Exception as e:
             out.append(f"{k} failed {str(e)[:80]}")
     ne = int((cnt > 0).sum())
-    print(f"pf2 w4diag T{T} ks2 {ks2} {('n128', 'wide n256', 'mixed n256 + n128')[wide]} routes {nr} experts {ne} (us): " + ", ".join(out), flush=True)
+    print(f"pf2 w4diag T{T} ks2 {ks2} {('n128', 'wide n256', 'mixed n256 + n128', 'wide n256 cluster', 'mixed cluster')[wide]} routes {nr} experts {ne} (us): " + ", ".join(out), flush=True)
     pe = _w4g(True)
     if pe is not None:
         fr = []
@@ -1726,7 +1793,7 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
             torch.cuda.synchronize()
             v = pb.tolist()
             mhz.append(f"{lab} {v[5] / max(1, v[6]) * 1e3:.0f} MHz")
-        print(f"pf2 w4prof T{T} {('n128', 'wide', 'mixed')[wide]}: " + "; ".join(fr) + f"; w13 clock " + ", ".join(mhz) + f" (watchdog {pe.w4g_err(1)})", flush=True)
+        print(f"pf2 w4prof T{T} {('n128', 'wide', 'mixed', 'wide-cluster', 'mixed-cluster')[wide]}: " + "; ".join(fr) + f"; w13 clock " + ", ".join(mhz) + f" (watchdog {pe.w4g_err(1)})", flush=True)
     torch.cuda.empty_cache()
 
 
@@ -1757,9 +1824,10 @@ W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in pr
 # 16K: pf22diag measured w4 wide in the judge's layer 4-5% faster on every first-turn shape than the big path the tune picked (its
 # [context + MoE] graph rates w4 ~0.6 ms worse there); mixed split-1 is the best w4 mode standalone (5190 vs wide 5273 vs big ~5540).
 # Pinned when its error check passes; the watchdog still drops it
-MOE_PIN = {16384: ("w4", 0, "a", 1 | (2 << 2))}
+W4MODES = (0, 1, 2, 3, 4)  # w4g tilings: n128, wide, mixed, wide-cluster, mixed-cluster
+MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf22diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf24diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
@@ -1767,7 +1835,7 @@ MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a"
 
 def _mname(k):
     if k[0] in ("w4", "h4"):
-        return k[0] + (str(k[1]) + k[2] if k[0] == "h4" else "") + f"k{max(1, k[3] & 3)}" + ("", "w", "m")[k[3] >> 2]
+        return k[0] + (str(k[1]) + k[2] if k[0] == "h4" else "") + f"k{max(1, k[3] & 3)}" + ("", "w", "m", "wc", "mc")[k[3] >> 2]
     return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in ("q", "h") else "") + ("", "o", "d")[k[3]]
 
 
@@ -1869,7 +1937,7 @@ def _moe_tune(st, fl, sink):
                 x @ x
             del x
             base = [dflt] + ([("mar", 0, "a", 0)] if hasmar and MARLIN_MIN < T <= MARLIN_MAX else []) + [("q", 0, v, 0) for v in vs] \
-                + [("big", 0, "a", o) for o in (0, 1)] + ([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1, 2)] if st.get("w4") is not None else [])
+                + [("big", 0, "a", o) for o in (0, 1)] + ([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in W4MODES] if st.get("w4") is not None else [])
             for c in base:
                 add(c)
             rounds(base, TUNE_R1)
@@ -1878,7 +1946,7 @@ def _moe_tune(st, fl, sink):
             bo = (pick([("big", 0, "a", o) for o in (0, 1)]) or ("big", 0, "a", 0))[3]
             hy = [("h", thr, bv, bo) for thr in HTHR] + [("h", 384, bv, 2)]
             if st.get("w4") is not None:
-                bk = (pick([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1, 2)]) or ("w4", 0, "a", 1))[3]
+                bk = (pick([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in W4MODES]) or ("w4", 0, "a", 1))[3]
                 hy += [("h4", thr, bv, bk) for thr in W4THR]
             for c in hy:
                 add(c)
@@ -1906,13 +1974,16 @@ def _moe_tune(st, fl, sink):
             if T in W4FORCE and st.get("w4") is not None:
                 st["mv"][T] = W4FORCE[T]
                 print(f"pf2 moe T{T}: forced {_mname(W4FORCE[T])} (diag: in-layer measurement)", flush=True)
-            elif T in MOE_PIN and st.get("w4") is not None and err.get(MOE_PIN[T], 1.0) < 2e-2:
-                st["mv"][T] = MOE_PIN[T]
-                print(f"pf2 moe T{T}: pinned {_mname(MOE_PIN[T])} (err {err[MOE_PIN[T]]:.0e}; the context graph under-rates w4 at this size)", flush=True)
+            elif T in MOE_PIN and st.get("w4") is not None:
+                for pin in MOE_PIN[T]:  # preference order; the first whose error check passed
+                    if err.get(pin, 1.0) < 2e-2:
+                        st["mv"][T] = pin
+                        print(f"pf2 moe T{T}: pinned {_mname(pin)} (err {err[pin]:.0e}; the context graph under-rates w4 at this size)", flush=True)
+                        break
             if st.get("w4") is not None:
                 if W4DIAG:
                     for pf in MOE_PROF[T][:1]:
-                        for md in (0, 1, 2):
+                        for md in W4MODES:
                             _w4_diag(st, fl, sink, T, pf, dev, bk & 3, md)
                 if st["w4"]["ext"].w4g_err(1):
                     print(f"pf2 w4g watchdog fired at T{T}: w4 paths disabled", flush=True)
