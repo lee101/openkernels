@@ -1140,12 +1140,12 @@ template <int N> __device__ __forceinline__ void wg_wait() {
 template <int NT, int NCW> struct Cfg {
   static constexpr int NPT = NCW == 4 ? 128 : 32;                 // producer threads (a whole warpgroup when registers are rebalanced)
   static constexpr int NTHR = 128 * NCW + NPT;
-  static constexpr int NS = EMU_NS ? EMU_NS : (NCW == 4 ? 7 : 6);  // ring stages
+  static constexpr int NS = EMU_NS ? EMU_NS : (NCW == 4 ? 7 : 5);  // ring stages
   static constexpr int LA = EMU_NS ? 0 : (NCW == 4 ? 4 : 3);       // full arrival this many stages behind issue
   static constexpr int WB = NCW * 3072;                            // weight bytes per stage (16 rows x 64 K x (codes + scales) per warp)
   static constexpr int BT = NT * 128;                              // token tile bytes per stage
   static constexpr int BM = 64 * NCW;
-  static constexpr int MINB = NCW == 4 ? 1 : 4;
+  static constexpr int MINB = NCW == 4 ? 1 : 6;  // remainder kernel: 6 CTAs / SM (pf18: 4) for more light-expert tiles in flight
   static_assert(NS >= LA + 2, "ring depth");
 };
 template <int NS> struct Sm { unsigned long long full[NS], empty[NS], wbar[NS]; Hdr hdr[NS]; int order[32], cum[33]; int tnext; };
@@ -1497,7 +1497,7 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v8" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v9" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t);",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -1708,7 +1708,7 @@ def _prof_routes(T, prof, dev, seed):
 
 
 W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in prepare() (Hopper only)
-W4DIAG = False  # pf18diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf19diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
@@ -1841,7 +1841,7 @@ def _moe_tune(st, fl, sink):
             print(f"pf2 moe T{T} coarse (us, MoE = graph - context {ctx_m * 1e3:.0f}): "
                   + " ".join(f"{_mname(c)} {(med(c) - ctx_m) * 1e3:.0f}" for c in coarse)
                   + "".join(f" {_mname(c)} err {e:.0e}" for c, e in err.items() if e >= 2e-2), flush=True)
-            final = list(dict.fromkeys([dflt] + coarse[:5]))
+            final = list(dict.fromkeys([dflt] + coarse[:5] + [c for c in graphs if c[0] == "w4"]))  # w4 always reaches the final rounds
             for c in final:
                 times[c] = []
             rounds(final, TUNE_R2)
