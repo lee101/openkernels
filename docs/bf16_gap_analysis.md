@@ -89,3 +89,25 @@ Examples: qkv m32 13.7 to 11.0 gives +0.77%; o m32 6.6 to 5.0 gives +0.45%; both
 - `wgs` (swap-AB wgmma on plain BF16 W, split-K over S plain CTAs through the wgr workspace + counter, S 1 stores BF16 directly) as prepare-timed candidates for o / qkv / unpooler / pooler at m32 and o / qkv at m16 (v24diag adds m8 and wider geometry lists). A candidate is adopted only if it is 2% faster than the best v22 candidate after re-timing (WSMARGIN 0.98). v24diag prints a `WD <layer> m<bucket> pick <name> | v12 <us> old <best v22 candidate> <us> | new <best wgs> <us>` line for every shape.
 - If `wgs` streams well on the judge: a c12 variant (decoder warps writing the SW128 A tile) for qkv m32 and o m32, which would also open the m16 shapes.
 - Not worth it: hand-written m256 GEMMs; any more router work.
+
+## 5. Results of v24 / v25 and status (parked)
+
+Judge prepare-time numbers (µs, new kernel vs best v22 candidate):
+
+| shape | bf16 wgs (v24diag) | c12 wgq (v25diag) | v22 best |
+|---|---|---|---|
+| qkv m8 | 11.71 | 13.76 | 9.38-9.63 |
+| qkv m16 | 11.78 | 13.86 | 8.86-9.02 |
+| qkv m32 | 12.03 | 14.34 | 11.26-11.74 |
+| o m8 | 4.96 | 6.78 | 4.22-4.32 |
+| o m16 | 5.02 | 7.01 | 4.45-4.67 |
+| o m32 | 5.22-5.38 | - | v12 5.31-5.66 |
+| pooler m32 | 18.72 | 21.73 | 15.42-15.87 |
+| unpooler m32 | 19.33 | 21.25 | 15.42-15.74 |
+
+Judge scores: v24diag 1.4527, v25diag 1.4379, both noise against v22's 1.459. v22 stays.
+
+- bf16 wgs does not depend on m (qkv 11.7-12.0 µs from m8 to m32) and streams BF16 at about 3.1 TB/s. The c12 GEMV reaches about 3.0 TB/s on 0.75x the bytes and wins everywhere except o m32, where the margin is marginal.
+- c12 wgq is 2-4 µs slower than bf16 wgs even though it reads 25% fewer bytes, so it is decode-bound. Four decoder warps per CTA give one warp per scheduler and no latency hiding. Per 16x64 unit: 3 lds.v4, 4 x 9-op decode, escape patch, 16 swizzled sts32, which is roughly 150+ cycles of dependent latency, and each warp handles 2 units per chunk.
+- Best remaining idea: wgq with 8-12 decoder warps (or decoders double-buffered across 2 units). If that made it purely stream-bound at the wgs rate, the estimate is qkv m32 about 9.5 µs (-1.8 µs vs 11.26) and o m32 about 4.3 µs (-1.0 µs). That is about +0.75% geomean, all on decode 32. m8/m16 would not win: the GEMV is already at the c12 stream rate there. **Below the 1% bar, so not proposed.**
+- No other lever found above 1%. m128/256 are at cuBLAS (about 72% of tensor peak at m256), the router is done, and the d1/v1 small shapes sit 1.5-2.9 µs above their floors from per-kernel cold-start latency, which SGLang pays as well. The per-call judge offset (about 1.3-1.5 µs over prepare time) is the same for one-kernel SGLang calls, so it is not launch count. v22 already issues exactly one kernel per call on all 30 shapes.
