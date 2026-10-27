@@ -205,3 +205,79 @@ Tuner bias (prepare vs layer, ring at T753):
 - So the prepare tune over-reads the ring by 30-130 µs with ±50 µs noise, and it picked w4k2 at T753 where the layer loses ~50-100 µs.
 - `qa` is the first candidate timed at each T (it is also the reference), straight after the LT / compile phase. Clocks are ramping, and
   inputs are cold from the read-only L2 flush, while in the layer the MoE inputs were just written by pooler / routing.
+
+## 7. What does 2.0 take? (pf28diag, 2026-10-28)
+
+Leader 2.025; ours pf28diag 1.4586 (turn 1 1.28, turn 4 1.49, first turn 1.63). Sources: `profiles/submission_pf28diag.2cf8c28a845e4ac6.*`,
+scratch `pfx/gap2.py` (scenarios), `pfx/budget.py`. FLOPs: dense = qkv + o + pooler + unpooler (94.4 M weights); MoE = routes x 3 x 4096² x 2
+(routes ≈ 1340 / 5430 / 29.7K); attention = 4 x q x kv x 1024 (+ causal block). TASK.md floor = max(bytes / 4.8 TB/s, FLOPs / 989 TF).
+
+Achieved rates in the judge's layer (TFLOP/s, effective, incl. the component's glue):
+
+| shape | MoE | attention (FA3 FP8) | dense (cuBLAS nvjet) |
+|---|---|---|---|
+| T753 (turn 1) | **245** | 204 sliding / 641 full | 765-820 |
+| T3012 (turn 4) | **470** | 421 / 649 | 710-765 |
+| 16K (first turn) | 550-675 | 486 sliding / 645-660 full | 785-797 |
+
+Per-load ceiling at the TASK floors (everything at 989 TF / 4.8 TB/s): turn 1 3.85x, turn 4 2.96x, first turn 2.86x SGLang. Every load
+can reach 2.0 in principle; first turn and turn 4 only with every component at ≥ 70% of peak.
+
+Scenarios (from the pf28diag per-component times; each changes only what it names):
+
+| scenario | turn 1 | turn 4 | first turn | geomean |
+|---|---|---|---|---|
+| now (pf28diag) | 1.28 | 1.49 | 1.63 | 1.458 |
+| turn MoE 400 / 1000 µs | 1.51 | 1.58 | 1.63 | 1.576 |
+| turn MoE 300 / 850 µs | 1.72 | 1.69 | 1.63 | 1.682 |
+| MoE at 650 TF everywhere (+ glue 25 / 60 / 300 µs) | 1.90 | 1.65 | 1.64 | 1.729 |
+| turn MoE 300 / 850 + attention 1.4x + resid/other 0.6x | 1.97 | 1.86 | 1.76 | 1.863 |
+| turn MoE 250 / 750 + 16K MoE 650 TF + attention 1.4x + glue 0.6x | 2.21 | 1.96 | 1.77 | 1.973 |
+| MoE 800 TF + attention 1.4x + dense 850 + glue 0.6x | 2.45 | 2.06 | 1.92 | 2.131 |
+| all at the 989-TF floors | 3.24 | 2.50 | 2.36 | 2.674 |
+
+What 2.0 needs, per component:
+- **Turn MoE: T753 ≤ ~250 µs (now 550), T3012 ≤ ~750 µs (now 1160).** This is the one component far from its floor (T753: 136 µs of FLOPs
+  at 989 TF, 90-135 µs of weight bytes for 15-23 experts). Alone it takes us to ~1.7.
+- **Attention ~1.4x faster than FA3 on full shapes** (FA3 FP8 hdim 64 runs 640-660 TF; ~990 is its MUFU exp ceiling). Worth ~+4%.
+- **Glue (resid, router, small kernels) ~0.6x.** Worth ~+3%.
+- **Dense** is already at 710-820 TF with cuBLAS; 850 is the most anyone gets on H100/H200 BF16. ≤ +1%.
+- With dense and FA3 equal to SGLang's (the same libraries), 2.0 is only reachable with the turn MoE near 250 / 750 µs **and** a faster
+  attention **and** the glue cut. Physically possible (every target ≤ ~75% of peak, above the byte floors); no single component gets there.
+
+Why T753 MoE is at 245 TF (pf28 layer, turn 1 sliding: `w4g<128,4>` 290, `w4g<32,1>` 176, `w4g<256,2>` 88 µs; standalone w4diag on the
+scored profile: W13 big 195-208 µs at 417-440 TF, W13 small 99-110 µs at 42-48 TF, W2 big 110-116, W2 small 56-61):
+- **The remainder kernel is a third of the MoE** (~170 µs, both GEMMs). It re-streams the weights of every touched expert (heavy experts
+  too, for their ≤ 32-token remainder), at ~2.5 TB/s, after the big kernel already streamed the heavy experts' weights.
+- **Big tiles run 420-440 TF at T753 vs 620-660 at 16K**: 32 row blocks x 1-3 token tiles per heavy expert is ~1.1-1.5 waves on 132 SMs,
+  plus pipeline fill on a 64-step K loop.
+- The three launches serialize; light (bandwidth-bound) and heavy (compute-bound) tiles never overlap.
+
+What TASK.md allows (checked against the rules):
+- **FP8 activations for the dense projections: no.** "BF16 wherever SGLang's kernel keeps BF16": SGLang's qkv / o / pooler / unpooler are
+  BF16 cuBLAS and BF16 weights must stay BF16. The same holds for the MoE (SGLang runs W4A16 Marlin), so no FP8 or FP4 MMA there either.
+- **Attention variants: only kernel efficiency.** Queries may be FP8 E4M3 (FA3 already does), the cache stays FP8, and "every key": no
+  top-k, sparse, block skipping or value skipping. Causal masking is already exploited by FA3 (it only matters on the ctx-0 shape; on turn
+  shapes the causal block is 0.5% of the work). The sliding window is already restricted to 2048 keys by FA3 (sliding attention is
+  31-283 µs, ≤ 3% of those shapes). Nothing structural is left.
+- **Fusing o / qkv with norms: allowed, small.** qkprep, ongate, resa and resb are already single fused kernels at ~91% of their byte
+  floor. Folding them into the GEMM epilogues saves one bf16 write + read per element: ≤ 1% per load.
+- **Skipping mathematically unnecessary work: nothing found.** Weights are random Gaussian / random NVFP4. The input stream has a low-rank
+  mean + rank-4 structure, but it is statistical (fresh noise per row), so exploiting it is approximate, not exact. There are no repeated
+  rows. Unpooler slicing applies only to T ≤ 8.
+
+Candidates, by estimated geomean gain:
+
+| # | candidate | est. gain | cost / risk |
+|---|---|---|---|
+| 1 | Turn MoE weight-stationary: per (expert, 256-row block), one CTA dequantizes once and runs every token tile of that expert (n256 + the ≤ 32 remainder) on the same weights, or at least schedules the big and remainder tiles of one block adjacently so the second read hits L2. T753 550 → ~350-400, T3012 1160 → ~1000 | +5-8% | medium (wide-mode registers are at 232; an n32 remainder accumulator needs +16) |
+| 2 | Balance big tiles at T753 / T3012 (BM 128 or stream-K over K for the heavy experts; one persistent launch for big + remainder tiles, heavy first) | +3-5% | medium |
+| 3 | Own FP8 attention with packed `ex2.approx.f16x2` (2 exps per MUFU op; P is rounded to FP8 anyway) to get past FA3's exp ceiling: 1.3-1.4x on full shapes | +3-4% | large, accuracy-checked |
+| 4 | PDL on our own kernels (w4g prefetches its first weight stages before `griddepcontrol.wait`; ~20 kernels per turn shape, ~2-4 µs of ramp each) | +1-2% | small-medium; cuBLAS / FA3 launches don't participate |
+| 5 | Router [hi; lo] fused into the pooler GEMM at T753 (one N = 4608 GEMM; turn 1 router is 25-80 µs) | ~+1% | small (FP32 router output from a BF16 GEMM: a CUTLASS / own GEMM) |
+| 6 | resa / resb / ongate / qkprep folded into the GEMM epilogues | ≤ +1% | medium |
+| 7 | Dense GEMMs above cuBLAS | ≤ +1% | not worth it |
+
+Honest read: 1-2 together reach ~1.65-1.7; adding 3-5 gives ~1.8-1.85. 2.0 needs all of that at the optimistic end, or something we
+have not found. A leader at 2.025 is most likely far ahead on the turn MoE (T753 ~250 µs, which is where SGLang's Marlin at ~740-1000 µs
+leaves the most room: turn 1 alone could then be ~2.2-2.5) and probably on attention or glue too.

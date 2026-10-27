@@ -1055,6 +1055,9 @@ W4G_CUDA = r"""
 #ifndef W4MC
 #define W4MC 0
 #endif
+#ifndef W4REMN
+#define W4REMN 0
+#endif
 #ifndef EMU_NS
 #define EMU_NS 0
 #endif
@@ -1506,7 +1509,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       const Hdr h = sm->hdr[slot];
       if (h.tile < 0 || *(volatile int*)&g_w4err) break;
       // remainder tiles (<= 32 tokens): the narrowest wgmma that covers them (RS n32 costs about as much tensor time as n64)
-      if constexpr (NT == 32) {
+      if constexpr (NT == 32 && W4REMN) {
         if (h.ntok <= 8) ctile<NT, NCW, MC, 8>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
         else if (h.ntok <= 16) ctile<NT, NCW, MC, 16>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
         else ctile<NT, NCW, MC>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
@@ -1652,7 +1655,7 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v17" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v18" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, torch::Tensor, torch::Tensor); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl();",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err", "w4g_ncl"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -1897,7 +1900,7 @@ W4MODES = (0, 1, 2)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster
 MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
 W2SS = False  # pf26 W2-epilogue sums of squares + comb_ss for split-1 (judge: ~+110 us on W2 vs -80 comb at 16K; off)
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf28diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf29diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
