@@ -1055,10 +1055,18 @@ __device__ __forceinline__ void mbwait(uint32_t b, uint32_t ph) {
   }
 }
 __device__ __forceinline__ unsigned long long clk() { unsigned long long t; asm volatile("mov.u64 %0, %clock64;" : "=l"(t)); return t; }
+// W4PROF phase accumulators (clock64 cycles), 16 per kernel class: consumer warps (lane 0) 0 wait-full, 1 dequant (smem loads + ALU),
+// 2 wgmma fence -> issue -> wait_group 0, 3 epilogue, 4 stages, 5 span; producer (thread 0) 8 wait-empty, 9 issue (hdr + TMA + cp.async +
+// commit), 10 TMA wait at the full arrival (exposed TMA latency), 11 cp.async wait + fence + arrive, 12 stages, 13 span
+struct Pc { unsigned long long v[6]; };
 #ifdef W4PROF
 #define PWAIT(acc, b, ph) do { const unsigned long long c0_ = clk(); mbwait(b, ph); acc += clk() - c0_; } while (0)
+#define PT(x) const unsigned long long x = clk()
+#define PADD(pc, i, d) (pc).v[i] += (d)
 #else
 #define PWAIT(acc, b, ph) mbwait(b, ph)
+#define PT(x)
+#define PADD(pc, i, d)
 #endif
 __device__ __forceinline__ void cp16(uint32_t s, const void* g) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(g) : "memory"); }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
@@ -1145,14 +1153,15 @@ template <int NT, int NCW> constexpr size_t smem_need() {
 
 template <int NT, int NCW>
 __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint32_t bbase0, const uint8_t* stg0, uint32_t sbase0, int q,
-                                      const Hdr h, int wi, int tid, unsigned long long& wfull, float* scr) {
+                                      const Hdr h, int wi, int tid, Pc& pc, float* scr) {
   using C = Cfg<NT, NCW>;
   float acc[NT / 2];
   const int lt = tid & 127, w = lt >> 5, lane = tid & 31;
   const int woff = (wi * 4 + w) * 768;
   for (int ks = 0; ks < h.nks; ks++) {
     const int qq = q + ks, slot = qq % C::NS;
-    if (ks) PWAIT(wfull, (uint32_t)__cvta_generic_to_shared(&sm->full[slot]), (qq / C::NS) & 1);
+    if (ks) PWAIT(pc.v[0], (uint32_t)__cvta_generic_to_shared(&sm->full[slot]), (qq / C::NS) & 1);
+    PT(c_a);
     const uint32_t wa = sbase0 + slot * C::WB + woff;
     uint32_t c0, c1, c2, c3, sx, sy;
     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3) : "r"(wa + lane * 16));
@@ -1169,13 +1178,17 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
       a[kk][3] = bmul(((qv >> 5) & 0x01C001C0u) | ((qv << 5) & 0x80008000u), sB);
     }
     const uint64_t db = gdesc(bbase0 + slot * C::BT);
+    PT(c_b);
     wg_fence();
 #pragma unroll
     for (int kk = 0; kk < 4; kk++) wgm<NT>(acc, a[kk], db + 2 * kk, ks | kk, scr);
     wg_commit();
     wg_wait<0>();
+    PT(c_c);
+    PADD(pc, 1, c_b - c_a); PADD(pc, 2, c_c - c_b); PADD(pc, 4, 1);
     if (lane == 0) mbarrive((uint32_t)__cvta_generic_to_shared(&sm->empty[slot]));
   }
+  PT(c_e);
   const int g = lane >> 2, t4 = lane & 3;
   const float gs = p.g[h.e];
   __nv_bfloat16* ob = p.out + ((size_t)h.kh * p.rows + h.row0 + 2 * t4) * p.nout + h.rb * C::BM + wi * 64 + 16 * w + g;
@@ -1188,6 +1201,8 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
         __nv_bfloat16* o = ob + (size_t)(8 * j + e2) * p.nout;
         o[0] = __float2bfloat16(acc[4 * j + e2] * gs); o[8] = __float2bfloat16(acc[4 * j + 2 + e2] * gs);
       }
+  PT(c_f);
+  PADD(pc, 3, c_f - c_e);
 }
 
 // NT = BNMAX, NCW = 4: full token tiles + remainders > 32, 256-row blocks; NT = 32, NCW = 1: remainders <= 32, 64-row blocks
@@ -1211,7 +1226,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
 #ifdef W4PROF
   const unsigned long long t_start = clk();
 #endif
-  unsigned long long wwait = 0;
+  Pc pc = {{0, 0, 0, 0, 0, 0}};
   if (tid == 0) {
     for (int i = 0; i < NS; i++) {
       mbinit((uint32_t)__cvta_generic_to_shared(&sm->full[i]), NPT);
@@ -1265,7 +1280,8 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       const __nv_bfloat16* xsrc = p.A + (size_t)row0 * 4096 + kh * nks * 64;
       for (int ks = 0; ks < nks; ks++, s++) {
         const int slot = s % NS;
-        if (s >= NS) PWAIT(wwait, (uint32_t)__cvta_generic_to_shared(&sm->empty[slot]), ((s / NS) - 1) & 1);
+        if (s >= NS) PWAIT(pc.v[0], (uint32_t)__cvta_generic_to_shared(&sm->empty[slot]), ((s / NS) - 1) & 1);
+        PT(p_a);
         if (pt == 0) sm->hdr[slot] = Hdr{u, e, rb, row0, ntok, kh, nks, 0};
         const uint32_t wb = (uint32_t)__cvta_generic_to_shared(&sm->wbar[slot]);
 #if TMA
@@ -1280,14 +1296,19 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
           if (row < ntok) cp16(swz(bb + row * 128 + c * 16), xsrc + (size_t)row * 4096 + ks * 64 + c * 8);
         }
         cp_commit();
+        PT(p_b);
+        PADD(pc, 1, p_b - p_a); PADD(pc, 4, 1);
         if (s >= LA) {
           const int t = s - LA, ts = t % NS;
 #if TMA
-          mbwait((uint32_t)__cvta_generic_to_shared(&sm->wbar[ts]), (t / NS) & 1);
+          PWAIT(pc.v[2], (uint32_t)__cvta_generic_to_shared(&sm->wbar[ts]), (t / NS) & 1);
 #endif
+          PT(p_c);
           cp_wait<LA>();
           fence_async();
           mbarrive((uint32_t)__cvta_generic_to_shared(&sm->full[ts]));
+          PT(p_d);
+          PADD(pc, 3, p_d - p_c);
         }
       }
     }
@@ -1305,7 +1326,10 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     if (pt == 0) sm->hdr[slot].tile = -1;
     mbarrive((uint32_t)__cvta_generic_to_shared(&sm->full[slot]));
 #ifdef W4PROF
-    if (pt == 0 && p.prof) { atomicAdd(p.prof + 2, wwait); atomicAdd(p.prof + 3, clk() - t_start); }
+    if (pt == 0 && p.prof) {
+      for (int i = 0; i < 5; i++) atomicAdd(p.prof + 8 + i, pc.v[i]);
+      atomicAdd(p.prof + 13, clk() - t_start);
+    }
 #endif
   } else {
     // 640 threads x 96 registers at launch: producer 128 x 32 + consumers 512 x 112 = 61440 (acc 64 + 16 A-fragment registers)
@@ -1315,14 +1339,17 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     const int wi = tid >> 7;
     for (int q = 0;;) {
       const int slot = q % NS;
-      PWAIT(wwait, (uint32_t)__cvta_generic_to_shared(&sm->full[slot]), (q / NS) & 1);
+      PWAIT(pc.v[0], (uint32_t)__cvta_generic_to_shared(&sm->full[slot]), (q / NS) & 1);
       const Hdr h = sm->hdr[slot];
       if (h.tile < 0 || *(volatile int*)&g_w4err) break;
-      ctile<NT, NCW>(p, sm, bbase0, stg0, sbase0, q, h, wi, tid, wwait, scr);
+      ctile<NT, NCW>(p, sm, bbase0, stg0, sbase0, q, h, wi, tid, pc, scr);
       q += h.nks;
     }
 #ifdef W4PROF
-    if ((tid & 31) == 0 && p.prof) { atomicAdd(p.prof + 0, wwait); atomicAdd(p.prof + 1, clk() - t_start); }
+    if ((tid & 31) == 0 && p.prof) {
+      for (int i = 0; i < 5; i++) atomicAdd(p.prof + i, pc.v[i]);
+      atomicAdd(p.prof + 5, clk() - t_start);
+    }
 #endif
   }
 }
@@ -1352,7 +1379,7 @@ void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, 
       (int)(out.size(0) / ksplit), (int)ksplit};
   if (cls & 1) KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), at::cuda::getCurrentCUDAStream()>>>(p);
   p.ctr += 2;
-  if (p.prof) p.prof += 4;
+  if (p.prof) p.prof += 16;
   if (cls & 2) KSMALL<<<g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), at::cuda::getCurrentCUDAStream()>>>(p);
 }
 int64_t w4g_smem() { return (int64_t)(smem_need<BNMAX, 4>() * 1000000 + smem_need<32, 1>()); }
@@ -1559,13 +1586,17 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2):
     if pe is not None:
         fr = []
         for name, X, Wp, gg, ks in (("w13", A, w["w13"], w["g13"], 1), ("w2", I, w["w2"], w["g2"], ks2)):
-            pb = torch.zeros(8, dtype=torch.int64, device=dev)
+            pb = torch.zeros(32, dtype=torch.int64, device=dev)
             _w4gemm(X, d["offs"], Wp, gg, c, ks, 3, pb, pe)
             torch.cuda.synchronize()
             v = pb.tolist()
-            for cls, o in (("big", 0), ("small", 4)):
-                if v[o + 1] and v[o + 3]:
-                    fr.append(f"{name}{cls} consumer wait-full {v[o] / v[o + 1]:.2f} producer wait-empty {v[o + 2] / v[o + 3]:.2f}")
+            for cls, o in (("big", 0), ("small", 16)):
+                cn, pn = max(1, v[o + 4]), max(1, v[o + 12])
+                if v[o + 5] and v[o + 13]:
+                    fr.append(f"{name}{cls}: consumer/stage wait {v[o] / cn:.0f} dq {v[o + 1] / cn:.0f} mma {v[o + 2] / cn:.0f} cyc, epilogue "
+                              f"{v[o + 3] / max(1, v[o + 5]) * 100:.1f}% span, wait-full {v[o] / v[o + 5]:.2f}; producer/stage wait-empty "
+                              f"{v[o + 8] / pn:.0f} issue {v[o + 9] / pn:.0f} tma-wait {v[o + 10] / pn:.0f} cpwait+arrive {v[o + 11] / pn:.0f} cyc "
+                              f"({v[o + 4]} warp-stages, {v[o + 12]} producer stages)")
         print(f"pf2 w4prof T{T}: " + "; ".join(fr) + f" (watchdog {pe.w4g_err(1)})", flush=True)
 
 
@@ -1593,7 +1624,7 @@ def _prof_routes(T, prof, dev, seed):
 
 
 W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in prepare() (Hopper only)
-W4DIAG = False  # pf16diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf17diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
@@ -1605,72 +1636,151 @@ def _mname(k):
     return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in ("q", "h") else "") + ("", "o", "d")[k[3]]
 
 
+TUNE_R1, TUNE_R2 = 3, 7  # coarse / final interleaved rounds
+
+
+def _tune_ctx(st, T, dev):
+    """mini-layer context replayed before every timed MoE: pooler GEMM (its output is the MoE input) and the [hi|lo] router GEMM +
+    routing into scratch, as kernel_fn runs them; so inputs are L2-hot and the GPU busy, as in the judge's layer"""
+    g = _pf2()
+    h = torch.randn((T, 8192), device=dev).to(torch.bfloat16)
+    ids = torch.empty((T, 8), dtype=torch.int32, device=dev); l2, d2 = torch.empty_like(ids), torch.empty_like(ids)
+    tw2 = torch.empty((T, 8), dtype=torch.float32, device=dev); c2 = torch.empty(32, dtype=torch.int32, device=dev)
+    ls = torch.zeros(1, dtype=torch.int32, device=dev)
+
+    def ctx():
+        pr = _dmm(h, st, "pooler")
+        g.routing2(_mm32(h, st["rhl_t"]), st["router_bias"], ls, ids, l2, d2, tw2, c2)
+        return pr
+    return ctx
+
+
+def _capture(f, pool):
+    g = torch.cuda.CUDAGraph(); s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        f(); torch.cuda.synchronize()
+        with torch.cuda.graph(g, pool=pool):
+            f()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    return g
+
+
 def _moe_tune(st, fl, sink):
-    """per scored size, on routes with the scored per-expert load profile: ring builds, big (with/without the w2-dequant overlap), Marlin
-    (turn sizes), then hybrid splits with the best ring build; default (pf11's pick) kept unless >3% faster"""
+    """per scored size, on routes with the scored per-expert load profiles, each candidate timed as [mini-layer context + MoE] CUDA graphs:
+    warm-up, then interleaved rounds with a rotating start (coarse rounds over the base set, then the hybrids, then TUNE_R2 final rounds
+    over the 5 best + the default); medians and spreads (half the inter-quartile range) per candidate; switch from the default (pf11's
+    pick) only if the median gain is > 3% and > the two spreads"""
     dev = st["o"].device
     vs = [v for v in QV if _qx(v) is not None]
     hasmar = st.get("bank") is not None and _marlin_mods() is not None
     for T in MOE_T:
         try:
-            pr = torch.randn((T, 4096), device=dev).to(torch.bfloat16)
+            ctx = _tune_ctx(st, T, dev)
             rs = [_prof_routes(T, pf, dev, 5 + i) for i, pf in enumerate(MOE_PROF[T])]
             dflt = MOE_DFLT.get(T, ("big", 0, "a", 0))
-            refs = [_moe_main(dflt, pr, loc, lid, tw, _moe_pre(dflt, loc, lid, cnt, T, st), st) for loc, lid, tw, cnt in rs]
-            res = {}
+            pool = torch.cuda.graph_pool_handle()
 
-            def run(path):
-                if path in res:
+            def fn(path, r):
+                loc, lid, tw, cnt = r
+                return lambda: _moe_main(path, ctx(), loc, lid, tw, _moe_pre(path, loc, lid, cnt, T, st), st)
+            refs = [fn(dflt, r)() for r in rs]
+            torch.cuda.synchronize()
+            graphs, err, times = {}, {}, {}
+            gctx = _capture(lambda: ctx(), pool)
+
+            def add(path):
+                if path in graphs or path in err:
                     return
                 try:
-                    tot, err = 0.0, 0.0
-                    for (loc, lid, tw, cnt), ref in zip(rs, refs):
-                        d = _moe_pre(path, loc, lid, cnt, T, st)
-                        f = lambda: _moe_main(path, pr, loc, lid, tw, d, st)
-                        out = f()
+                    e = 0.0
+                    for r, ref in zip(rs, refs):
+                        out = fn(path, r)()
                         torch.cuda.synchronize()
-                        err = max(err, float((out.float() - ref.float()).norm() / ref.float().norm()))
-                        tot += min(_gtm(f, fl, sink, 7), _gtm(f, fl, sink, 7))
-                        del out, d
-                    res[path] = (tot / len(rs) if err < 2e-2 else 1e9, err)
-                except Exception as e:
-                    print(f"pf2 moe T{T} {path} failed: {str(e)[-200:]}", flush=True)
-                    res[path] = (1e9, 1.0)
-            run(dflt)
-            if hasmar and MARLIN_MIN < T <= MARLIN_MAX:
-                run(("mar", 0, "a", 0))
-            for v in vs:
-                run(("q", 0, v, 0))
-            for o in (0, 1):
-                run(("big", 0, "a", o))
-            bv = min(vs, key=lambda v: res[("q", 0, v, 0)][0])
-            bo = min((0, 1), key=lambda o: res[("big", 0, "a", o)][0])
-            for thr in HTHR:
-                run(("h", thr, bv, bo))
-            bt = min(HTHR, key=lambda t: res[("h", t, bv, bo)][0])
-            run(("h", bt, bv, 2))
+                        e = max(e, float((out.float() - ref.float()).norm() / ref.float().norm()))
+                        del out
+                    err[path] = e
+                    if e < 2e-2:
+                        graphs[path] = [_capture(fn(path, r), pool) for r in rs]
+                        times[path] = []
+                except Exception as ex:
+                    print(f"pf2 moe T{T} {_mname(path)} failed: {str(ex)[-200:]}", flush=True)
+                    err[path] = 1.0
+
+            def rounds(cands, n):
+                cands = [c for c in cands if c in graphs]
+                for gr in [gctx] + [x for c in cands for x in graphs[c]]:  # warm-up
+                    gr.replay()
+                torch.cuda.synchronize()
+                for i in range(n):
+                    k = i % max(1, len(cands))
+                    for c in cands[k:] + cands[:k]:
+                        t = 0.0
+                        for gr in graphs[c]:
+                            sink.copy_(fl.sum()); a = torch.cuda.Event(True); b = torch.cuda.Event(True)
+                            a.record(); gr.replay(); b.record(); torch.cuda.synchronize(); t += a.elapsed_time(b)
+                        times[c].append(t / len(graphs[c]))
+
+            def med(c):
+                v = sorted(times[c][-TUNE_R2:]) if len(times[c]) > TUNE_R2 else sorted(times[c])
+                return v[len(v) // 2] if v else 1e9
+
+            def spread(c):
+                v = sorted(times[c][-TUNE_R2:]) if len(times[c]) > TUNE_R2 else sorted(times[c])
+                return (v[(3 * len(v)) // 4] - v[len(v) // 4]) / 2 if len(v) > 1 else 0.0
+            x = torch.randn((8192, 8192), device=dev).to(torch.bfloat16)
+            for _ in range(20):  # clocks up before the first round
+                x @ x
+            del x
+            base = [dflt] + ([("mar", 0, "a", 0)] if hasmar and MARLIN_MIN < T <= MARLIN_MAX else []) + [("q", 0, v, 0) for v in vs] \
+                + [("big", 0, "a", o) for o in (0, 1)] + ([("w4", 0, "a", k2) for k2 in (1, 2)] if st.get("w4") is not None else [])
+            for c in base:
+                add(c)
+            rounds(base, TUNE_R1)
+            pick = lambda cs: min((c for c in cs if c in graphs), key=med, default=None)
+            bv = (pick([("q", 0, v, 0) for v in vs]) or ("q", 0, "a", 0))[2]
+            bo = (pick([("big", 0, "a", o) for o in (0, 1)]) or ("big", 0, "a", 0))[3]
+            hy = [("h", thr, bv, bo) for thr in HTHR] + [("h", 384, bv, 2)]
             if st.get("w4") is not None:
-                for k2 in (1, 2):
-                    run(("w4", 0, "a", k2))
-                bk = min((1, 2), key=lambda k2: res[("w4", 0, "a", k2)][0])
-                for thr in W4THR:
-                    run(("h4", thr, bv, bk))
+                bk = (pick([("w4", 0, "a", k2) for k2 in (1, 2)]) or ("w4", 0, "a", 1))[3]
+                hy += [("h4", thr, bv, bk) for thr in W4THR]
+            for c in hy:
+                add(c)
+            rounds(hy, TUNE_R1)
+            ctx_t = []
+            for _ in range(TUNE_R1):
+                sink.copy_(fl.sum()); a = torch.cuda.Event(True); b = torch.cuda.Event(True)
+                a.record(); gctx.replay(); b.record(); torch.cuda.synchronize(); ctx_t.append(a.elapsed_time(b))
+            ctx_m = sorted(ctx_t)[len(ctx_t) // 2]
+            coarse = sorted((c for c in graphs), key=med)
+            print(f"pf2 moe T{T} coarse (us, MoE = graph - context {ctx_m * 1e3:.0f}): "
+                  + " ".join(f"{_mname(c)} {(med(c) - ctx_m) * 1e3:.0f}" for c in coarse)
+                  + "".join(f" {_mname(c)} err {e:.0e}" for c, e in err.items() if e >= 2e-2), flush=True)
+            final = list(dict.fromkeys([dflt] + coarse[:5]))
+            for c in final:
+                times[c] = []
+            rounds(final, TUNE_R2)
+            best = min(final, key=med)
+            gain = med(dflt) - med(best)
+            ok = best != dflt and gain > 0.03 * (med(dflt) - ctx_m) and gain > spread(best) + spread(dflt)
+            st["mv"][T] = best if ok else dflt
+            print(f"pf2 moe T{T} final x{TUNE_R2} (MoE us median +- spread, err): "
+                  + " ".join(f"{_mname(c)} {(med(c) - ctx_m) * 1e3:.0f}+-{spread(c) * 1e3:.0f} {err[c]:.0e}" for c in sorted(final, key=med))
+                  + f" -> {_mname(st['mv'][T])}", flush=True)
+            if st.get("w4") is not None:
                 if W4DIAG:
                     for pf in MOE_PROF[T][:1]:
-                        _w4_diag(st, fl, sink, T, pf, dev, bk)
+                        _w4_diag(st, fl, sink, T, pf, dev, max(1, bk))
                 if st["w4"]["ext"].w4g_err(1):
                     print(f"pf2 w4g watchdog fired at T{T}: w4 paths disabled", flush=True)
-                    for k in res:
-                        if k[0] in ("w4", "h4"):
-                            res[k] = (1e9, 1.0)
+                    if st["mv"][T][0] in ("w4", "h4"):
+                        st["mv"][T] = dflt
                     st["w4"] = None
-            best = min(res, key=lambda k: res[k][0])
-            st["mv"][T] = best if res[best][0] < res[dflt][0] * 0.97 else dflt
-            print(f"pf2 moe T{T} (us, err): " + " ".join(f"{_mname(k)} {v[0] * 1e3:.0f} {v[1]:.0e}" for k, v in sorted(res.items(), key=lambda kv: kv[1][0]))
-                  + f" -> {_mname(st['mv'][T])}", flush=True)
-            del pr, rs, refs
+            del graphs, gctx, refs, rs
         except Exception as e:
             print(f"pf2 moe T{T} failed: {e}", flush=True)
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
