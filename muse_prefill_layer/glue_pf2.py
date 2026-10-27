@@ -1781,7 +1781,7 @@ def _moe_w4(g, pr, loc, tw, offs, lst, pos, st, add, ks2=1, wide=0):
     I = _w4gemm(A, offs, w["w13"], w["g13"], w["ctr"][0:8], wide=wide, swiglu=1)  # SwiGLU fused into the W13 epilogue
     del A
     y = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
-    if ks2 == 1:  # per-route sums of squares from the W2 epilogue; the combine is a plain weighted gather
+    if ks2 == 1 and W2SS:  # per-route sums of squares from the W2 epilogue; the combine is a plain weighted gather
         ss = torch.zeros(R, dtype=torch.float32, device=dev)
         Y = _w4gemm(I, offs, w["w2"], w["g2"], w["ctr"][8:16], 1, wide=wide, ss=ss, gw=st["g_post_expert_norm"])
         del I
@@ -1895,8 +1895,9 @@ W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in pr
 # Pinned when its error check passes; the watchdog still drops it
 W4MODES = (0, 1, 2)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster variants: no win, built only with -DW4MC=1)
 MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
+W2SS = False  # pf26 W2-epilogue sums of squares + comb_ss for split-1 (judge: ~+110 us on W2 vs -80 comb at 16K; off)
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf27diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf28diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
