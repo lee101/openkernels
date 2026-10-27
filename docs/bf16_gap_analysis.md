@@ -111,3 +111,72 @@ Judge scores: v24diag 1.4527, v25diag 1.4379, both noise against v22's 1.459. v2
 - c12 wgq is 2-4 µs slower than bf16 wgs even though it reads 25% fewer bytes, so it is decode-bound. Four decoder warps per CTA give one warp per scheduler and no latency hiding. Per 16x64 unit: 3 lds.v4, 4 x 9-op decode, escape patch, 16 swizzled sts32, which is roughly 150+ cycles of dependent latency, and each warp handles 2 units per chunk.
 - Best remaining idea: wgq with 8-12 decoder warps (or decoders double-buffered across 2 units). If that made it purely stream-bound at the wgs rate, the estimate is qkv m32 about 9.5 µs (-1.8 µs vs 11.26) and o m32 about 4.3 µs (-1.0 µs). That is about +0.75% geomean, all on decode 32. m8/m16 would not win: the GEMV is already at the c12 stream rate there. **Below the 1% bar, so not proposed.**
 - No other lever found above 1%. m128/256 are at cuBLAS (about 72% of tensor peak at m256), the router is done, and the d1/v1 small shapes sit 1.5-2.9 µs above their floors from per-kernel cold-start latency, which SGLang pays as well. The per-call judge offset (about 1.3-1.5 µs over prepare time) is the same for one-kernel SGLang calls, so it is not launch count. v22 already issues exactly one kernel per call on all 30 shapes.
+
+## 6. Against the new leader (1.637, 12% ahead of v22's 1.459)
+
+### Precision: no FP8 route
+
+TASK.md, Rules:
+> **Weights.** ... don't store them at a different precision: ... BF16 weights stay BF16, or smaller, losslessly. ... The router's FP32 weights may run as a BF16 hi + lo pair with FP32 accumulation.
+> **Activations.** BF16 wherever SGLang's kernel keeps BF16.
+
+Probe rows (x has a single power-of-two entry) must reproduce weight columns within 0.1%, so any lossy weight format fails outright. FP8 x is also out (activations stay BF16). The m128/m256 tensor floor is therefore the BF16 one (989 TFLOP/s dense). Beating cuBLAS there has to come from bytes (lossless compression) and from occupancy and tiling, not from precision.
+
+### Lossless compression is already near the limit
+
+Exponent entropy of the generator's weights (all five matrices): 2.54 bits. That gives an ideal of (8 raw sign+mantissa bits + 2.54) / 16 = **0.659 of BF16**. Our c12 is 0.75 (3-bit offset over a 16-exponent window, 99.993% coverage). A fixed 11-bit code (8-exponent window) covers only 98.65%, so 1.35% of values become escapes: about 14 per 16x64 unit, against 0.07 today. A Huffman/DFloat11-style code reaches about 0.67, but needs table decode at more than 3.9 TB/s of output. Worth at most 0.75 to 0.67 = -11% of bytes on the stream-bound shapes, and it would have to come with a decoder at least as fast as today's 9-op one. Not the first lever.
+
+### What 1.637 implies (first-principles model, scratch scen2.py / scen3.py)
+
+Model: m <= 32 non-router shapes at c12 bytes / 3.9 TB/s + 1.5 µs; router at its FP32 bytes / 3.9 TB/s + 1.5 µs (+1 µs at m >= 128); m128/m256 at max(c12 bytes / 3.9 TB/s, 2mnK at 75% of 989 TF) + 2 µs. The 1.5 µs fixed cost matches our best shapes (pooler m1: 13.95 µs = 50.3 MB at 4.0 TB/s + 1.5).
+
+| scenario | gm | d1 | d16 | d32 | v1 | v16 | v32 |
+|---|---|---|---|---|---|---|---|
+| ours v22 | 1.459 | 1.62 | 1.56 | 1.28 | 1.96 | 1.26 | 1.21 |
+| m <= 32 shapes at c12 floor + 1.5 | 1.556 | 1.72 | 1.62 | 1.57 | 2.14 | 1.26 | 1.21 |
+| + router at its floor | 1.599 | 1.74 | 1.65 | 1.64 | 2.19 | 1.29 | 1.25 |
+| + m128 c12 GEMM | 1.660 | 1.74 | 1.65 | 1.64 | 2.19 | 1.62 | 1.25 |
+| + m256 c12 GEMM | 1.673 | 1.74 | 1.65 | 1.64 | 2.19 | 1.62 | 1.32 |
+| everything, a 0.70-ratio code | 1.733 | | | | | | |
+
+Single levers from v22 (everything else unchanged):
+
+| lever | gm |
+|---|---|
+| qkv m32 13.67 to 9.3 | 1.478 (+1.3%) |
+| pooler + unpooler m32 17.0/16.6 to 14.6 | 1.478 (+1.3%) |
+| o m32 6.62 to 4.7 | 1.467 (+0.5%) |
+| all four m32 shapes at the floor | 1.509 (+3.4%) |
+| qkv m128 15.35 to 10 | 1.479 (+1.4%) |
+| pooler/unpooler m128 19.6/18.7 to 15 | 1.491 (+2.2%) |
+| router at its floor (all m) | 1.497 (+2.6%) |
+| qkv m256 17.7 to 12.5 | 1.475 (+1.1%) |
+
+**1.637 is what a submission gets by running every shape within about 1.5 µs of its c12 / FP32 streaming floor and beating cuBLAS on m128 with compressed weights.** The leader must be winning mainly on:
+- d32 (we are 1.28; the model gives 1.64),
+- v16 (we are 1.26; 1.62 with an m128 compressed GEMM),
+- the router everywhere (each router shape is 1-5 µs above 1.5 µs + bytes),
+- less so v32, which is tensor-bound at m256: about 1.32 at most.
+
+Nothing needs FP8 or an exploit.
+
+### Why our m32 and m128 kernels miss, and the common fix
+
+- The c12 GEMV (`gv`, mma.sync, decoded A in registers) streams at 3.5-4.0 TB/s up to m16. At m32, each warp does 16 HMMA and loads 4 KB of x per 1.5 KB weight unit from L1 (x re-read N/16 times), so it falls to 2.3-3.3 TB/s.
+- The wgmma kernels lost for separate reasons:
+  - `wgs` (bf16) streams at only 3.1 TB/s on 1.33x the bytes.
+  - `wgq` (c12) decodes in 4 separate warps through smem and is latency-bound.
+  - `wgd`/`wgc` at m128: TMA ring with 128 B-row boxes and a single producer.
+- Fix: **wgmma RS**. Every consumer warp keeps the gv weight path (register-direct c12 loads, 9-op decode into mma-order A registers: exactly the wgmma RS A-fragment layout for its 16 rows). The tokens are the wgmma N side (n32 at m32, n128 at m128), from a TMA x tile in smem that the whole CTA shares. One `wgmma m64nNk16` per k16 step per warpgroup replaces 4 (m32) or 16 (m128) HMMAs per warp. x is read once per CTA per chunk instead of once per 16-row tile, and weights never touch smem. This also avoids wgq's decoder hand-off.
+
+### Proposed builds (not started; estimates are judge µs)
+
+1. **`gvw` m32: wgmma-RS c12 GEMV for qkv / pooler / unpooler / o at m32.** CTA = NWG x 64 weight rows (each warp 16 rows, gv-style register ring of c12 units), x tile 32 tokens x 64 k via TMA (one 4 KB stage per chunk, ring of 4-6), split-K by the wgr workspace + counter where N / BM < 132.
+   - Per-SM work at qkv m32: 140 units x (3 loads + 36 decode ops + 4 wgmma issues) is about 1.4 µs of issue. Stream: 28.3 MB at 3.6-3.9 TB/s.
+   - Estimate: qkv 9.5 µs (now 13.67), pooler/unpooler 14.8 (17.0/16.6), o 4.8 (6.62). **+3.0-3.4% gm.**
+   - Risk: the wgmma RS operand layout (A registers must stay untouched until wgmma.wait; ptxas C7515-style serialization) and register pressure (ring + 16 accumulators at n32). Medium.
+2. **`gvw` m128 (same kernel, TN = 128, accumulators 64 per thread): pooler / unpooler / qkv / o at m128.** Tensor time at 75% peak: pooler/unpooler 11.7 µs; c12 stream 12.9 µs.
+   - Estimate: pooler/unpooler about 15 µs (now 19.6/18.7), qkv about 10 (15.35, split-K over S = 7 with 18 row blocks of 128), o about 5.5 (6.65). **+3.0-3.6% gm.**
+   - Risk: higher. It needs 75% of tensor peak from RS wgmma with decode in the same warps (decode for 508K values per SM is about 3.4 µs of issue), and three previous GEMM attempts lost to nvjet.
+
+Together that is about +6-7% (to about 1.55-1.56). The router to its floor (+2.6%) is the next lever after these. The c12 hi + lo router lost on the H200 in v14 (6-8 vs 4.7 µs) as a mma.sync GEMV; the same wgmma-RS path would be the retry.
