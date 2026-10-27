@@ -1,5 +1,5 @@
 # okc: problem=muse_moe_w4a16
-"""v48: v47 + gk small-M variants (KS2 1: each CTA's W2 row tiles are its output rows, y stays in smem, 2 grid barriers like g1; PPS 2: one 4608 B box / barrier per two contiguous pieces), absent token slots read a zero row (no tensor-core toggling on padding columns), lean gk tails (y partial sums and per-route norms with all loads in flight, per-token route table, CTA row weights in smem, batched SwiGLU pass), host-side smem checks instead of device traps, SM clock in every diag line. v47: v46 + gk to M <= 32 (KS1 = 2: W13 K split over two CTA groups with x half-rows in smem, fp32 gate/up partials and a grid-wide SwiGLU pass; n-tiles up to 4 reduced 2 at a time), gk/g1 tails without serial L2 round trips (norm factors prefetched, partial sums loaded all at once), g1 load-path variants (P1: one 2304 B box per ring slot, 4 slots per warp; RT16: one reduction round at M1), fs candidates retired. v46: v45 + "gk" path for 3 <= M <= 16 (CUDA_K): g1's structure with all M activation rows in smem (B fragments by LDS, n-tiles of 8 tokens per dequant), 16 warps = tile groups of SW warps that split K of each tile (SW-way reduction behind a group-local named barrier), W2 K split over KS2 CTA groups with inter staged per group (chunked by whole experts when it does not fit) and fp32 y partials in global, then every CTA owns ~32 output rows: partial sums, sum-of-squares exchange, norm + combine (3 grid barriers, no atomics). g1 FENCE1 variant (one __threadfence before the grid barrier instead of one per reduction round); DQHI dropped. v45: v44 + "g1" decode path for M <= 2 (CUDA_G): every warp owns one 256-K slice of every weight row of its CTA (activation slice in registers, one 16-way smem reduction per tile), W13 over a contiguous tile range of all local experts -> inter in global -> grid barrier (the ring keeps streaming W2) -> W2 by output row tiles over all experts with full K (no fp32 atomics) -> per-route sum-of-squares exchange -> norm + combine of the CTA's rows. Tune on 3 judge-generator routings per bucket, f1s3 restored. v44: v43 + wx with N in steps of 8 (N8STEP: less padded tensor work), wx offered from M8, wait-fraction counters (WSTAT) in the diag. v43: wx with one ring of 4-chunk group slots (activation tiles loaded 4 chunks at a time, like the weights) and a 16-consumer-warp variant (4 warpgroups x 1 m64 block, 256-row units). v42: v41 with split weight / activation rings (4-chunk weight TMA slots, deeper weight stream) and an RPW 2 candidate (256-row units). v41: v37 + one-pass-per-expert wgmma RS expert GEMM (CUDA_X "wx": 128-row units over all of an expert's tokens, N <= 256, 64-K chunk slots of TMA weights + gathered pre-swizzled activations, CUTLASS-order RS pipeline) as a tuned candidate for M >= 32. v37: v36 + MT2 only for CTAs whose segments all have <= 8 tokens, cost weights 30/45/76 from H200 per-granule data, phase-A issue cursor without per-stage divisions, branch-free B prefetch. v36: v35 + MT2 (two W13 tiles per warp share activation loads) + wait/class diagnostics. v35: v34 + last-arriver combine option (LASTA: no grid barrier). v34: v30 + fused split-K path (fs) for M <= 32: each CTA owns ~1 32-column inter granule per active expert,
+"""v52: v48 + wx WXG2 (one wgmma group per 64-K chunk: the chunk's 4 words dequantized into one of two A register sets, 4 x RPW wgmmas, commit, wait_group 1; one smem descriptor per slot plus constant offsets; sm_90a SASS 28 -> 23.5 instructions per word at NCW 16, 23.7 -> 21.5 at RPW 2) as wx candidates, r1 as the tune incumbent (2% rule), slow builds first in a wider prepare pool, unpicked g1 / gk shapes dropped from the build. v48: v47 + gk small-M variants (KS2 1: each CTA's W2 row tiles are its output rows, y stays in smem, 2 grid barriers like g1; PPS 2: one 4608 B box / barrier per two contiguous pieces), absent token slots read a zero row (no tensor-core toggling on padding columns), lean gk tails (y partial sums and per-route norms with all loads in flight, per-token route table, CTA row weights in smem, batched SwiGLU pass), host-side smem checks instead of device traps, SM clock in every diag line. v47: v46 + gk to M <= 32 (KS1 = 2: W13 K split over two CTA groups with x half-rows in smem, fp32 gate/up partials and a grid-wide SwiGLU pass; n-tiles up to 4 reduced 2 at a time), gk/g1 tails without serial L2 round trips (norm factors prefetched, partial sums loaded all at once), g1 load-path variants (P1: one 2304 B box per ring slot, 4 slots per warp; RT16: one reduction round at M1), fs candidates retired. v46: v45 + "gk" path for 3 <= M <= 16 (CUDA_K): g1's structure with all M activation rows in smem (B fragments by LDS, n-tiles of 8 tokens per dequant), 16 warps = tile groups of SW warps that split K of each tile (SW-way reduction behind a group-local named barrier), W2 K split over KS2 CTA groups with inter staged per group (chunked by whole experts when it does not fit) and fp32 y partials in global, then every CTA owns ~32 output rows: partial sums, sum-of-squares exchange, norm + combine (3 grid barriers, no atomics). g1 FENCE1 variant (one __threadfence before the grid barrier instead of one per reduction round); DQHI dropped. v45: v44 + "g1" decode path for M <= 2 (CUDA_G): every warp owns one 256-K slice of every weight row of its CTA (activation slice in registers, one 16-way smem reduction per tile), W13 over a contiguous tile range of all local experts -> inter in global -> grid barrier (the ring keeps streaming W2) -> W2 by output row tiles over all experts with full K (no fp32 atomics) -> per-route sum-of-squares exchange -> norm + combine of the CTA's rows. Tune on 3 judge-generator routings per bucket, f1s3 restored. v44: v43 + wx with N in steps of 8 (N8STEP: less padded tensor work), wx offered from M8, wait-fraction counters (WSTAT) in the diag. v43: wx with one ring of 4-chunk group slots (activation tiles loaded 4 chunks at a time, like the weights) and a 16-consumer-warp variant (4 warpgroups x 1 m64 block, 256-row units). v42: v41 with split weight / activation rings (4-chunk weight TMA slots, deeper weight stream) and an RPW 2 candidate (256-row units). v41: v37 + one-pass-per-expert wgmma RS expert GEMM (CUDA_X "wx": 128-row units over all of an expert's tokens, N <= 256, 64-K chunk slots of TMA weights + gathered pre-swizzled activations, CUTLASS-order RS pipeline) as a tuned candidate for M >= 32. v37: v36 + MT2 only for CTAs whose segments all have <= 8 tokens, cost weights 30/45/76 from H200 per-granule data, phase-A issue cursor without per-stage divisions, branch-free B prefetch. v36: v35 + MT2 (two W13 tiles per warp share activation loads) + wait/class diagnostics. v35: v34 + last-arriver combine option (LASTA: no grid barrier). v34: v30 + fused split-K path (fs) for M <= 32: each CTA owns ~1 32-column inter granule per active expert,
 streams its W13 rows and the matching W2 column slice back to back (no W13->W2 grid dependency, no tile queue), fp32 red into
 a self-cleaning accumulator, one grid barrier, per-token norm + combine. v30: per-M choice (autotuned in prepare on the judge GPU) between v28 and the ring path below with K split 1-8 and
 lookahead-1 queue fetch. v29: M <= MBIG runs v28 (v17 per-warp rings, rotation-free dequant) on the v22 weight layout; M > MBIG runs CUDA_L (v22
@@ -1956,7 +1956,7 @@ def _extF(ksf=0, smax=3, extra=""):
     if k not in _modF:
         wpc = 16 if _big() else 8
         fl = ([] if "-DWPC=" in extra else ["-DWPC=%d" % wpc]) + ["-DSMAX=%d" % smax] + (["-DKSF=%d" % ksf] if ksf else []) + extra.replace("+", " ").split() + [d for d in _DBG if not d.startswith("-DCFG=")]
-        _modF[k] = load_inline("moe_w4a16_v48F" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modF[k] = load_inline("moe_w4a16_v52F" + "".join(fl).replace("-", "_").replace("=", ""),
                                cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                cuda_sources=CUDA_F, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
     return _modF[k]
@@ -2422,14 +2422,14 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 """
 _modG = {}
 GS_MAX = 2       # g1 for M <= GS_MAX (<= 2 tokens per expert)
-G_CFG = ("-DFENCE1 -DRT=16", "-DFENCE1")  # g1 candidates (FENCE1: one fence before the grid barrier; P1: one 2304 B box per slot; RT=16: one reduction round at M1)
+G_CFG = ("-DFENCE1 -DRT=16",)  # g1 candidates (FENCE1: one fence before the grid barrier; P1: one 2304 B box per slot; RT=16: one reduction round at M1)
 DIAGG = False    # prepare(): g1 per-CTA timeline (PROF build) + bytes-in-flight estimate + per-load timing at M1
 
 
 def _extG(extra=""):
     if extra not in _modG:
         fl = extra.replace("+", " ").split() + [d for d in _DBG if not d.startswith("-DCFG=")]
-        _modG[extra] = load_inline("moe_w4a16_v48G" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modG[extra] = load_inline("moe_w4a16_v52G" + "".join(fl).replace("-", "_").replace("=", ""),
                                    cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                    cuda_sources=CUDA_G, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
     return _modG[extra]
@@ -3078,7 +3078,7 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 _modK = {}
 GK_MAX = 32      # gk for M <= GK_MAX (activations of all tokens, or of half of K, in smem)
 GK_MIN = 1
-K_CFG = ("-DSW=4 -DKS2=2", "-DSW=4 -DKS2=4", "-DSW=4 -DKS1=2 -DKS2=4 -DMAXM=32", "-DSW=4 -DKS2=1 -DMAXM=2 -DPPS=2", "-DSW=4 -DKS2=1 -DMAXM=8")  # tile-group width x W13 / W2 K splits (MAXM 16 unless given)
+K_CFG = ("-DSW=4 -DKS2=2", "-DSW=4 -DKS2=1 -DMAXM=8")  # tile-group width x W13 / W2 K splits (MAXM 16 unless given)
 K32_MIN = 12     # smallest M offered the MAXM 32 variant
 
 
@@ -3090,7 +3090,7 @@ DIAGK = False    # prepare(): gk per-CTA timeline (PROF build) at M8 / M16 on ju
 def _extK(extra=""):
     if extra not in _modK:
         fl = extra.replace("+", " ").split() + [d for d in _DBG if not d.startswith("-DCFG=")]
-        _modK[extra] = load_inline("moe_w4a16_v48K" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modK[extra] = load_inline("moe_w4a16_v52K" + "".join(fl).replace("-", "_").replace("=", ""),
                                    cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                    cuda_sources=CUDA_K, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
     return _modK[extra]
@@ -3114,7 +3114,7 @@ def _diagK(state):
     flush = torch.empty(2 ** 27, device=dev); sink = torch.empty((), device=dev)
     G = torch.cuda.get_device_properties(dev).multi_processor_count
     prof = torch.zeros(G * 16, dtype=torch.int64, device=dev)
-    runs = [(1, K_CFG[3]), (1, K_CFG[4]), (1, K_CFG[0]), (2, K_CFG[3]), (8, K_CFG[4]), (8, K_CFG[0]), (16, K_CFG[0]), (24, K_CFG[2]), (32, K_CFG[2])]
+    runs = [(1, K_CFG[1]), (8, K_CFG[1]), (16, K_CFG[0])]
     for M, x in runs:
         for sd in range(2):
             data = _synth(M, 900 + 7 * sd + M, dev)
@@ -3248,6 +3248,10 @@ __device__ __forceinline__ void bulk(uint32_t dst, const void* src, uint32_t n, 
 __device__ __forceinline__ uint64_t gdesc(uint32_t saddr) {  // K-major SW128: LBO 16, SBO 1024
   return (uint64_t)((saddr & 0x3FFFF) >> 4) | ((uint64_t)1 << 16) | ((uint64_t)64 << 32) | (1ull << 62);
 }
+__device__ __forceinline__ uint64_t gdesc_add(uint64_t d, uint32_t off) {
+  const uint32_t lo = (uint32_t)d + (off >> 4), hi = (uint32_t)(d >> 32);
+  return ((uint64_t)hi << 32) | lo;
+}
 __device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
 __device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
 template <int K> __device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(K) : "memory"); }
@@ -3329,6 +3333,7 @@ template <> __device__ __forceinline__ void fence_acc<48>(float* d) {
 #else
 // sm_80/86 emulation: each warp runs mma.sync for its 16 rows on the same swizzled B tile
 __device__ __forceinline__ uint64_t gdesc(uint32_t saddr) { return saddr; }
+__device__ __forceinline__ uint64_t gdesc_add(uint64_t d, uint32_t off) { return d + off; }
 __device__ __forceinline__ void wg_fence() {}
 __device__ __forceinline__ void wg_commit() {}
 template <int K> __device__ __forceinline__ void wg_wait() {}
@@ -3477,6 +3482,70 @@ __device__ __forceinline__ void group(float (&acc)[RPW][N / 2], uint32_t (&A)[RP
   ps_ = s;
 }
 
+#ifdef WXG2
+// WXG2: one wgmma group per 64-K chunk instead of per k16 step. The chunk's 4 words are dequantized into one of two A register
+// sets (chunk parity), then fence, 4 x RPW wgmmas, commit, wait_group 1 (retires the previous chunk: its A set is free for the
+// next chunk, which is dequantized while this chunk's wgmmas run). One descriptor per slot (+ constant chunk / step offsets),
+// one warpgroup arrive / depbar per chunk: ~6 fewer instructions per word than the per-k16-step order.
+template <int N, bool FG>
+__device__ __forceinline__ void group2(float (&acc)[RPW][N / 2], uint32_t (&A)[2][RPW][4][4], int& qs, int& ps_,
+                                       uint32_t sbase, uint32_t full, uint32_t empty, int wid, int lane, long long& wcy) {
+  const int s = qs % NSL;
+#ifdef WSTAT
+  const long long w0 = clock64();
+#endif
+  mbwait(full + s * 8, (qs / NSL) & 1);
+#ifdef WSTAT
+  wcy += clock64() - w0;
+#endif
+  qs++;
+  const uint32_t sb = sbase + s * GSB;
+  const uint64_t d0 = gdesc(sb);
+#pragma unroll
+  for (int cc = 0; cc < WCH; cc++) {
+    uint32_t (&As)[RPW][4][4] = A[cc & 1];
+#pragma unroll
+    for (int r = 0; r < RPW; r++) {
+      const uint32_t wb = sb + ASB + (((wid >> 3) * RPW + r) * WCH + cc) * WREC + (wid & 7) * REC;
+      const uint4 w = lds128(wb + lane * 16);
+      const uint32_t s16 = lds16(wb + 512 + lane * 2);
+      const uint32_t sA = sc2(s16, 0x4040), sB = sc2(s16, 0x4141);
+      const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const uint32_t qq = ww[j];
+#if defined(NOCOMP)
+        As[r][j][0] = qq ^ sA; As[r][j][1] = qq ^ sB; As[r][j][2] = qq + sA; As[r][j][3] = qq + sB;
+#else
+        As[r][j][0] = bmul(qq & 0x81C081C0u, sA);
+        As[r][j][1] = bmul(((qq << 3) & 0x01C001C0u) | ((qq << 1) & 0x80008000u), sB);
+        As[r][j][2] = bmul((qq << 6) & 0x81C081C0u, sA);
+        As[r][j][3] = bmul(((qq >> 5) & 0x01C001C0u) | ((qq << 5) & 0x80008000u), sB);
+#endif
+      }
+    }
+#if defined(NOMMA) || defined(NOCOMP)
+#pragma unroll
+    for (int r = 0; r < RPW; r++)
+#pragma unroll
+      for (int j = 0; j < 4; j++) acc[r][j] += __uint_as_float((As[r][j][0] ^ As[r][j][1] ^ As[r][j][2] ^ As[r][j][3] ^ (uint32_t)gdesc_add(d0, cc * XB + j * 32)) & 0x3fffffffu);
+#else
+#pragma unroll
+    for (int r = 0; r < RPW; r++) fence_acc<N>(acc[r]);
+    wg_fence();
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int r = 0; r < RPW; r++) wg_rs<N>(acc[r], As[r][j], gdesc_add(d0, cc * XB + j * 32), (FG && cc == 0 && j == 0) ? 0 : 1);
+    wg_commit();
+    wg_wait<1>();
+#endif
+    if (!FG && cc == 0) mbarrive(empty + ps_ * 8);  // the previous slot's last chunk has retired (every consumer lane arrives)
+  }
+  ps_ = s;
+}
+#endif
+
 template <int N>
 __device__ __forceinline__ void unit(const P& p, const Sm* sm, const uint16_t* list, uint32_t sbase, uint32_t full, uint32_t empty,
                                      int& qs, int wid, int lane, const Hdr& h0, long long& wcy) {
@@ -3490,9 +3559,16 @@ __device__ __forceinline__ void unit(const P& p, const Sm* sm, const uint16_t* l
 #pragma unroll
     for (int i = 0; i < N / 2; i++) acc[r][i] = 0.f;
 #endif
+#ifdef WXG2
+  uint32_t A2[2][RPW][4][4];
+  group2<N, true>(acc, A2, qs, ps_, sbase, full, empty, wid, lane, wcy);
+#pragma unroll 1
+  for (int c4 = 1; c4 < NCH / WCH; c4++) group2<N, false>(acc, A2, qs, ps_, sbase, full, empty, wid, lane, wcy);
+#else
   group<N, true>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane, wcy);
 #pragma unroll 1
   for (int c4 = 1; c4 < NCH / WCH; c4++) group<N, false>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane, wcy);
+#endif
   wg_wait<0>();
 #pragma unroll
   for (int r = 0; r < RPW; r++) fence_acc<N>(acc[r]);
@@ -3769,7 +3845,7 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 
 # ---- v41: one-pass-per-expert wgmma RS expert GEMM (CUDA_X) --------------------------------------------------------
 _modX = {}
-WX_CFG = (("-DRPW=2",), ("-DNCW=16",), ("-DNCW=16", "-DN8STEP"))  # 256-row units, N <= 64: 2 warpgroups x 2 m64 blocks, or 4 warpgroups x 1 (4 warps / scheduler)
+WX_CFG = (("-DRPW=2",), ("-DNCW=16", "-DN8STEP"), ("-DRPW=2", "-DWXG2"), ("-DNCW=16", "-DWXG2"), ("-DNCW=16", "-DN8STEP", "-DWXG2"))  # 256-row units, N <= 64: 2 warpgroups x 2 m64 blocks, or 4 warpgroups x 1 (4 warps / scheduler)
 WX_ABL = ("-DNOCOMP", "-DNOMMA", "-DWSTAT")  # diag (NCW 16): stream only / dequant without mma / wait-cycle counters
 WX_MIN = 8      # smallest M bucket that tries it (hot experts need >= 16 tokens for the one-pass dequant to pay)
 DIAGW = False   # prepare(): per-load timing of the wx path against the best other candidate + M256 ablations
@@ -3784,7 +3860,7 @@ def _extX(extra=()):
     if key not in _modX:
         dfl = [] if _big() else ["-DTPX=16", "-DNSL=2"]
         fl = dfl + list(_DBG) + list(extra)
-        _modX[key] = load_inline("moe_w4a16_v48X" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modX[key] = load_inline("moe_w4a16_v52X" + "".join(fl).replace("-", "_").replace("=", ""),
                                  cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                  cuda_sources=CUDA_X, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + _sm90a() + fl, verbose=False)
     return _modX[key]
@@ -3839,7 +3915,7 @@ def _diagW(state):
         b = next((m for m in TUNE_M if m >= M), TUNE_M[-1])
         base = alt.get(b, tb.get(b, _default(M)))
         vs = [("wx", 0, 0, " ".join(c)) if c else ("wx", 0, 0) for c in WX_CFG]
-        if M in (32, 128, 256): vs += [("wx", 0, 0, " ".join(("-DNCW=16",) + tuple(x.split()))) for x in WX_ABL if x != "-DWSTAT"]
+        if M in (32, 128, 256): vs += [("wx", 0, 0, " ".join(("-DNCW=16", "-DWXG2") + tuple(x.split()))) for x in WX_ABL if x != "-DWSTAT"]
         acc = {c: [] for c in [base] + vs}
         for sd in range(3):
             data = _synth(M, 5000 + 31 * sd + M, dev)
@@ -3851,8 +3927,8 @@ def _diagW(state):
             try:
                 st2 = dict(state, profW=torch.zeros(8, dtype=torch.int64, device=dev))
                 dw = _synth(M, 5000 + M, dev)
-                sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWSTAT")); torch.cuda.synchronize()
-                st2["profW"].zero_(); sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWSTAT")); torch.cuda.synchronize()
+                sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWXG2", "-DWSTAT")); torch.cuda.synchronize()
+                st2["profW"].zero_(); sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWXG2", "-DWSTAT")); torch.cuda.synchronize()
                 v = st2["profW"].double().cpu().tolist()
                 line += f"  | NCW16 consumer waitFull {v[0] / max(v[1], 1):.2f} producer waitEmpty {v[2] / max(v[3], 1):.2f}"
             except Exception as ex:
@@ -3874,8 +3950,9 @@ def prepare(weights):
         w1[e] = _repack(weights["w13"][e], weights["w13_sf"][e], perm1)
         w2[e] = _repack(weights["w2"][e], weights["w2_sf"][e], perm2)
     w2f = torch.stack([_repack2(weights["w2"][e], weights["w2_sf"][e]) for e in range(min(E, 32))])
-    with ThreadPoolExecutor(8) as ex: list(ex.map(lambda f: f(), [lambda: _extL(0), lambda: _extL(1)] + [lambda k=k: _extS(k) for k in V17_KSF] + [lambda c=c: _extF(*c) for c in FS_CFG] + [lambda c=c: _extX(c) for c in WX_CFG] + [lambda x=x: _extG(x) for x in G_CFG]  + [lambda x=x: _extK(x) for x in K_CFG] + ([lambda x=x: _extK(x + " -DPROF") for x in K_CFG if x != K_CFG[1]] if DIAGK else []) + ([lambda x=x: _extG(("-DPROF " + x).strip()) for x in G_CFG] if DIAGG else [])
-                                                + ([lambda x=x: _extX(("-DNCW=16",) + tuple(x.split())) for x in WX_ABL] if DIAGW else [])
+    import os  # the slowest builds (the sm_90a wx modules) first; more workers when the host has the cores
+    with ThreadPoolExecutor(max(8, min(16, os.cpu_count() or 8))) as ex: list(ex.map(lambda f: f(), [lambda c=c: _extX(c) for c in WX_CFG] + [lambda: _extL(0), lambda: _extL(1)] + [lambda k=k: _extS(k) for k in V17_KSF] + [lambda c=c: _extF(*c) for c in FS_CFG] + [lambda x=x: _extG(x) for x in G_CFG]  + [lambda x=x: _extK(x) for x in K_CFG] + ([lambda x=x: _extK(x + " -DPROF") for x in K_CFG if x != K_CFG[1]] if DIAGK else []) + ([lambda x=x: _extG(("-DPROF " + x).strip()) for x in G_CFG] if DIAGG else [])
+                                                + ([lambda x=x: _extX(("-DNCW=16", "-DWXG2") + tuple(x.split())) for x in WX_ABL] if DIAGW else [])
                                                 + ([lambda c=c: _extF(c[0], c[1], (c[2] + " -DPROF").strip()) for c in FS_CFG] if DIAGF else [])))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
@@ -3896,7 +3973,7 @@ def prepare(weights):
     if DIAG:
         _diag(st, weights)
     el = time.time() - _T0
-    print("v48 prepare %.0fs before tuning" % el, flush=True)
+    print("v52 prepare %.0fs before tuning" % el, flush=True)
     if TUNE and FORCE is None and el < 200:
         st["tune"], st["tune_alt"] = _tune(st)
     if DIAGW and time.time() - _T0 < 250:
@@ -4136,14 +4213,14 @@ def _tune(state):
                     del gr
                 except Exception as ex:
                     res[cfg] = float("inf"); print("tune", M, cfg, "failed", ex, flush=True)
-        d = _default(M)
+        d = ("ring", 1, 0) if ("ring", 1, 0) in res else _default(M)  # incumbent: leave it only when 2% faster
         best = min(res, key=res.get)
         if res[best] > 0.98 * res.get(d, float("inf")): best = d
         table[M] = best
         ra = {c: v for c, v in res.items() if c[0] != "wx"}
         alt[M] = min(ra, key=ra.get) if ra else d
         lines.append(f"M{M}:" + ",".join(f"{_nm(c)}={res[c] / len(seeds):.0f}" for c in res) + f"->{_nm(best)}")
-    print("v48 tune " + " | ".join(lines), flush=True)
+    print("v52 tune " + " | ".join(lines), flush=True)
     torch.cuda.empty_cache()
     return table, alt
 
