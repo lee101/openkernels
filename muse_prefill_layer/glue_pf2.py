@@ -1066,7 +1066,7 @@ W4G_CUDA = r"""
 #define KST 64
 struct Hdr { int tile, e, rb, row0, ntok, kh, nks, pad; };
 struct P { const __nv_bfloat16* A; const int* offs; const uint8_t* W; const float* g; __nv_bfloat16* out; int* ctr; unsigned long long* prof;
-           int nrb256, nout, rows, ksplit, tsz, lomod, fullonly, swiglu; float* ss; const float* gw; };
+           int nrb256, nout, rows, ksplit, tsz, lomod, fullonly, swiglu; float* ss; const float* gw; int pdl; };
 
 __device__ __forceinline__ void mbinit(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(b), "r"(n)); }
 __device__ __forceinline__ void mbarrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(b) : "memory"); }
@@ -1088,6 +1088,18 @@ __device__ __forceinline__ void mbwait(uint32_t b, uint32_t ph) {
       if (i > WDOG) { atomicExch(&g_w4err, 1); return; }
     }
   }
+}
+// programmatic dependent launch (pdl bit 0: wait for the previous grid before the first load, then let the next one launch; bit 1: let
+// the next grid launch at once, wait for the previous one before exiting, so completions stay in stream order)
+__device__ __forceinline__ void pdl_wait() {
+#if TMA
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if TMA
+  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
 }
 __device__ __forceinline__ unsigned long long clk() { unsigned long long t; asm volatile("mov.u64 %0, %clock64;" : "=l"(t)); return t; }
 __device__ __forceinline__ unsigned long long gns() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
@@ -1406,6 +1418,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
 #endif
   const int total = sm->cum[32];
   const int nks = KST / p.ksplit;
+  if ((p.pdl & 2) && tid == 0) pdl_trigger();
   if (tid >= 128 * NCW) {  // producer
 #if HAS_WG
     if constexpr (NCW == 4) asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
@@ -1417,6 +1430,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     if (pt == 0) {
       int s = 0;
       const int rank = MC ? (int)cta_rank() : 0;
+      if (p.pdl & 1) { pdl_wait(); pdl_trigger(); }
       for (int it = 0;; it++) {
         int u;
         if constexpr (MC) {
@@ -1540,6 +1554,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
 #if TMA
   if constexpr (MC) cluster_sync();  // no CTA leaves while its peer may still arrive on its barriers
 #endif
+  if (p.pdl & 2) pdl_wait();
 }
 
 // w4p: one persistent launch for both expert GEMMs (W13 + SwiGLU, then W2). Units are (phase, expert, 128-row block, token tile) on one
@@ -1829,6 +1844,14 @@ static CUtensorMap tmap(const void* base, int64_t rows, int box) {
 #endif
   return m;
 }
+template <typename K>
+static void plaunch(K kern, int grid, int thr, size_t smem, cudaStream_t st, int pdl, const P& q, const CUtensorMap& tm) {
+  cudaLaunchConfig_t cfg = {};
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.gridDim = dim3(grid); cfg.blockDim = dim3(thr); cfg.dynamicSmemBytes = smem; cfg.stream = st; cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
+  TORCH_CHECK(cudaLaunchKernelEx(&cfg, kern, q, tm) == cudaSuccess, "w4g launch");
+}
 int64_t w4g_err(int64_t reset) {
   int v = 0;
   cudaMemcpyFromSymbol(&v, g_w4err, sizeof(int));
@@ -1840,14 +1863,16 @@ int64_t w4g_err(int64_t reset) {
 // cls bit 0: the wide / n128 kernels, bit 1: the remainder kernel. ctr: 2 ints per launch slot (6), prof: 16 per slot (48);
 // slots: 0 the first big kernel, 1 the mixed-mode n128 kernel, 2 the remainder kernel. out [ksplit * rows, nrb256 * 256]
 void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, torch::Tensor out, torch::Tensor ctr, torch::Tensor prof,
-         int64_t ksplit, int64_t cls, int64_t mode, int64_t swiglu, torch::Tensor ss, torch::Tensor gw) {
+         int64_t ksplit, int64_t cls, int64_t mode, int64_t swiglu, torch::Tensor ss, torch::Tensor gw, int64_t pdl) {
   w4g_init();
   P p{(const __nv_bfloat16*)A.data_ptr(), offs.data_ptr<int>(), W.data_ptr<uint8_t>(), g.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
       ctr.data_ptr<int>(), prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr, (int)W.size(1), (int)out.size(1),
       (int)(out.size(0) / ksplit), (int)ksplit, BNMAX, 0, 0, (int)swiglu, ss.numel() ? ss.data_ptr<float>() : nullptr,
-      gw.numel() ? gw.data_ptr<float>() : nullptr};
+      gw.numel() ? gw.data_ptr<float>() : nullptr, 0};
   auto st = at::cuda::getCurrentCUDAStream();
   P q = p;
+  const bool usepdl = pdl && HAS_WG_HOST;
+  int pd = usepdl ? 1 : 0;  // the first launch waits for the previous grid; the later ones run beside it
   const bool mc = mode >= 3 && HAS_WG_HOST && g_ncl > 0;
   if (mode >= 3) mode -= 2;
   if (cls & 1) {
@@ -1863,19 +1888,23 @@ void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, 
 #endif
     } else if (mode >= 1) {
       q.tsz = 2 * BNMAX; q.fullonly = mode == 2;
-      KWIDE<<<g_nsm, Cfg<2 * BNMAX, 2>::NTHR, smem_need<2 * BNMAX, 2>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 2 * BNMAX));
+      q.pdl = pd; pd = usepdl ? 2 : 0;
+      plaunch(KWIDE, g_nsm, Cfg<2 * BNMAX, 2>::NTHR, smem_need<2 * BNMAX, 2>(), st, q.pdl, q, tmap(A.data_ptr(), A.size(0), 2 * BNMAX));
     } else {
-      KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st>>>(q, tmap(A.data_ptr(), A.size(0), BNMAX));
+      q.pdl = pd; pd = usepdl ? 2 : 0;
+      plaunch(KBIG, g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st, q.pdl, q, tmap(A.data_ptr(), A.size(0), BNMAX));
     }
     if (mode == 2) {
       q = p; q.ctr += 2; q.prof = p.prof ? p.prof + 16 : nullptr; q.lomod = 2 * BNMAX;
-      KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st>>>(q, tmap(A.data_ptr(), A.size(0), BNMAX));
+      q.pdl = pd; pd = usepdl ? 2 : 0;
+      plaunch(KBIG, g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st, q.pdl, q, tmap(A.data_ptr(), A.size(0), BNMAX));
     }
   }
   if (cls & 2) {
     q = p; q.ctr += 4; q.prof = p.prof ? p.prof + 32 : nullptr;
     q.tsz = mode == 1 ? 2 * BNMAX : BNMAX; q.lomod = mode == 2 ? 2 * BNMAX : 0;
-    KSMALL<<<g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 32));
+    q.pdl = pd;
+    plaunch(KSMALL, g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), st, q.pdl, q, tmap(A.data_ptr(), A.size(0), 32));
   }
 }
 int64_t w4g_ncl() { w4g_init(); return g_ncl; }
@@ -1886,9 +1915,9 @@ void w4p(torch::Tensor A, torch::Tensor offs, torch::Tensor W13, torch::Tensor g
   unsigned long long* pr = prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr;
   int* c = ctr.data_ptr<int>();
   P a{(const __nv_bfloat16*)A.data_ptr(), offs.data_ptr<int>(), W13.data_ptr<uint8_t>(), g13.data_ptr<float>(), (__nv_bfloat16*)I.data_ptr(),
-      c, pr, (int)W13.size(1), (int)I.size(1), (int)I.size(0), 1, TMAXP, 0, 0, 1, nullptr, nullptr};
+      c, pr, (int)W13.size(1), (int)I.size(1), (int)I.size(0), 1, TMAXP, 0, 0, 1, nullptr, nullptr, 0};
   P b{(const __nv_bfloat16*)I.data_ptr(), offs.data_ptr<int>(), W2.data_ptr<uint8_t>(), g2.data_ptr<float>(), (__nv_bfloat16*)Y.data_ptr(),
-      c, pr, (int)W2.size(1), (int)Y.size(1), (int)Y.size(0), 1, TMAXP, 0, 0, 0, nullptr, nullptr};
+      c, pr, (int)W2.size(1), (int)Y.size(1), (int)Y.size(0), 1, TMAXP, 0, 0, 0, nullptr, nullptr, 0};
   PP pp{a, b, c + 8};
   w4p_k<<<g_nsm, Cfg<TMAXP, 2>::NTHR, smemp_need(), at::cuda::getCurrentCUDAStream()>>>(pp, tmap(A.data_ptr(), A.size(0), 32), tmap(I.data_ptr(), I.size(0), 32));
 }
@@ -1923,8 +1952,8 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v19" + ("h" if hop else "e") + ("p" if prof else ""),
-                                        cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, torch::Tensor, torch::Tensor); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl(); void w4p(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);",
+            _w4gmod[prof] = load_inline("pf2_w4g_v20" + ("h" if hop else "e") + ("p" if prof else ""),
+                                        cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, torch::Tensor, torch::Tensor, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl(); void w4p(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err", "w4g_ncl", "w4p"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
             print("pf2 w4g build failed", str(e)[-1500:], flush=True)
@@ -2031,14 +2060,15 @@ def _moe_main(path, pr, loc, lid, tw, d, st, wait=None):
     return _moe_big(g, pr, d["locb"], tw, d["cntb"], d["offs"], d["lst"], d["pos"], st, add, ovl)
 
 
-def _w4gemm(A, offs, Wp, g, ctr, ksplit=1, cls=3, prof=None, ext=None, wide=0, swiglu=0, ss=None, gw=None):
+def _w4gemm(A, offs, Wp, g, ctr, ksplit=1, cls=3, prof=None, ext=None, wide=0, swiglu=0, ss=None, gw=None, pdl=None):
     """out [ksplit * rows, N] = A @ W^T per expert (rows grouped by offs); ksplit 2: K halves in the two row blocks;
     swiglu (W13 packed with swiglu=True): out [rows, N / 2] = silu(gate) * up"""
     out = torch.empty((ksplit * A.shape[0], Wp.shape[1] * (128 if swiglu else 256)), dtype=torch.bfloat16, device=A.device)
     if prof is None:
         prof = torch.empty(0, dtype=torch.int64, device=A.device)
     e0 = torch.empty(0, dtype=torch.float32, device=A.device)
-    (ext or _w4g()).w4g(A, offs, Wp, g, out, ctr, prof, ksplit, cls, wide, swiglu, e0 if ss is None else ss, e0 if gw is None else gw)
+    (ext or _w4g()).w4g(A, offs, Wp, g, out, ctr, prof, ksplit, cls, wide, swiglu, e0 if ss is None else ss, e0 if gw is None else gw,
+                        int(W4PDL if pdl is None else pdl))
     return out
 
 
@@ -2157,14 +2187,20 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
           "comb": (lambda: g.combine(Y, loc, d["pos"], st["g_post_expert_norm"], tw, st["nocnt"], y, R * 4096 if ks2 == 2 else 0), 0),
           "w2+ss (ks1)": (lambda: _w4gemm(I, d["offs"], w["w2"], w["g2"], c, 1, wide=wide, ss=ssd, gw=st["g_post_expert_norm"]), nr * 4096),
           "comb_ss": (lambda: g.combine_ss(Y1, loc, d["pos"], st["g_post_expert_norm"], tw, ssd, st["nocnt"], y), 0),
-          "total": (lambda: _moe_main(path, pr, loc, lid, tw, d, st), 0)}
+          "total": (lambda: _moe_main(path, pr, loc, lid, tw, d, st), 0),
+          "total no-PDL": (lambda: _moe_main(path, pr, loc, lid, tw, d, st), -1)}
     out = []
+    global W4PDL
     for k, (f, n) in tm.items():
+        pdl0 = W4PDL
         try:
+            if n < 0:
+                W4PDL = False
             t = min(_gtm(f, fl, sink, 9), _gtm(f, fl, sink, 9))
-            out.append(f"{k} {t * 1e3:.1f}" + (f" ({n * 4096 * 2 / t / 1e9:.0f} TF)" if n else ""))
+            out.append(f"{k} {t * 1e3:.1f}" + (f" ({n * 4096 * 2 / t / 1e9:.0f} TF)" if n > 0 else ""))
         except Exception as e:
             out.append(f"{k} failed {str(e)[:80]}")
+        W4PDL = pdl0
     ne = int((cnt > 0).sum())
     print(f"pf2 w4diag T{T} ks2 {ks2} {('n128', 'wide n256', 'mixed n256 + n128', 'wide n256 cluster', 'mixed cluster')[wide]} routes {nr} experts {ne} (us): " + ", ".join(out), flush=True)
     pe = _w4g(True) if W4DIAG_PROF else None
@@ -2225,16 +2261,17 @@ W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in pr
 # 16K: pf22diag measured w4 wide in the judge's layer 4-5% faster on every first-turn shape than the big path the tune picked (its
 # [context + MoE] graph rates w4 ~0.6 ms worse there); mixed split-1 is the best w4 mode standalone (5190 vs wide 5273 vs big ~5540).
 # Pinned when its error check passes; the watchdog still drops it
-W4MODES = (0, 1, 2, 5)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster variants: no win, built only with -DW4MC=1), 5 persistent w4p
+W4MODES = (0, 1, 2)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster variants: no win, built only with -DW4MC=1), 5 persistent w4p
 
 
 def _w4c():
     return [("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in W4MODES if wd != 5 or k2 == 1]
 MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
+W4PDL = True  # w4g launches chained with programmatic dependent launch (the 2nd / 3rd kernel of a GEMM overlaps the 1st's tail)
 W2SS = False  # pf26 W2-epilogue sums of squares + comb_ss for split-1 (judge: ~+110 us on W2 vs -80 comb at 16K; off)
-W4DIAG_MODES, W4DIAG_PROF = (2, 5), False  # diag: tilings timed standalone; W4PROF wait fractions of the w4g tilings (w4p always)
+W4DIAG_MODES, W4DIAG_PROF = (1, 2), False  # diag: tilings timed standalone; W4PROF wait fractions of the w4g tilings (w4p always)
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf30diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf31diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
