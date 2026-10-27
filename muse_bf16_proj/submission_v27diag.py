@@ -2199,30 +2199,37 @@ _WS = {w: i for i, w in enumerate(WSI)}
 _wbmod = [None]
 
 
+def _wbsrc():
+    """(extension name, CUDA source) of the sm_90a wgmma extension; also compiled for sm_90a on any box by bench/wb_compile_chk.py"""
+    ns = sorted({i[0] for i in WBI} | {i[0] for i in WRI} | {i[0] for i in WDI} | {i[0] for i in WSI} | {i[0] for i in WQI})
+    cases = "\n".join("    case %d: return wbl<%s>(p, xp, wp, wr, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WBI))
+    cases += "\n" + "\n".join("    case %d: return wrl<%s>(p, xp, wp, wr, st);" % (100 + k, ",".join(map(str, c))) for k, c in enumerate(WRI))
+    cases += "\n" + "\n".join("    case %d: return wdl<%s>(p, xp, wp, wr, st);" % (200 + k, ",".join(map(str, c))) for k, c in enumerate(WDI))
+    cases += "\n" + "\n".join("    case %d: return wsl<%s>(p, xp, wp, wr, st);" % (300 + k, ",".join(map(str, c))) for k, c in enumerate(WSI))
+    src = WBCU.replace("WBFNS", "".join(_wb_fn(n) for n in ns))
+    call = "".join(f"if constexpr (BN == {n}) wb{n}(d, bdesc(xa) + 2 * j, bdesc(wa + h * WT) + 2 * j, (c | j | h) != 0); " for n in ns)
+    src = src.replace("WBN(d, bdesc(xa) + 2 * j, bdesc(wa + h * WT) + 2 * j, (c | j | h) != 0);", "{ " + call + "}")
+    src = src.replace("@@QCASES@@", "\n".join("    case %d: return wql<%s>(p, xp, wp, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WQI)))
+    src = src.replace("WSN(d, bdesc(wa) + 2 * j, bdesc(xa) + 2 * j, (c | j) != 0);",
+                      "".join(f"if constexpr (TN == {n}) wb{n}(d, bdesc(wa) + 2 * j, bdesc(xa) + 2 * j, (c | j) != 0); " for n in ns))
+    src = src.replace("@@WVMMA@@", _wv_mma(sorted({i[0] for i in WVI})))
+    src = src.replace("@@VCASES@@", "\n".join("    case %d: return wvl<%s>(p, xp, wp, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WVI)))
+    name = "wb27_%x" % (hash(tuple(WBI) + tuple(WRI) + tuple(WDI) + tuple(WSI) + tuple(WQI) + tuple(WVI)) & 0xffffffff)
+    return name, src.replace("@@CASES@@", cases)
+
+
+WBCPP = ("int64_t wbrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);"
+         "int64_t wqrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t);"
+         "int64_t wvrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);")
+
+
 def _wbext():
     if _wbmod[0] is None:
         try:
             if torch.cuda.get_device_capability()[0] != 9:
                 raise RuntimeError("sm_90 only")
-            ns = sorted({i[0] for i in WBI})
-            ns = sorted(set(ns) | {i[0] for i in WRI} | {i[0] for i in WDI} | {i[0] for i in WSI} | {i[0] for i in WQI})
-            src = src.replace("@@WVMMA@@", _wv_mma(sorted({i[0] for i in WVI})))
-            src = src.replace("@@VCASES@@", "\n".join("    case %d: return wvl<%s>(p, xp, wp, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WVI)))  # (TN, QS, S, NWG, HL, C12)
-            cases = "\n".join("    case %d: return wbl<%s>(p, xp, wp, wr, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WBI))
-            src = WBCU.replace("WBFNS", "".join(_wb_fn(n) for n in ns))
-            call = "".join(f"if constexpr (BN == {n}) wb{n}(d, bdesc(xa) + 2 * j, bdesc(wa + h * WT) + 2 * j, (c | j | h) != 0); " for n in ns)
-            src = src.replace("WBN(d, bdesc(xa) + 2 * j, bdesc(wa + h * WT) + 2 * j, (c | j | h) != 0);", "{ " + call + "}")
-            cases += "\n" + "\n".join("    case %d: return wrl<%s>(p, xp, wp, wr, st);" % (100 + k, ",".join(map(str, c))) for k, c in enumerate(WRI))
-            cases += "\n" + "\n".join("    case %d: return wdl<%s>(p, xp, wp, wr, st);" % (200 + k, ",".join(map(str, c))) for k, c in enumerate(WDI))
-            cases += "\n" + "\n".join("    case %d: return wsl<%s>(p, xp, wp, wr, st);" % (300 + k, ",".join(map(str, c))) for k, c in enumerate(WSI))
-            src = src.replace("@@QCASES@@", "\n".join("    case %d: return wql<%s>(p, xp, wp, st);" % (k, ",".join(map(str, c))) for k, c in enumerate(WQI)))
-            src = src.replace("WSN(d, bdesc(wa) + 2 * j, bdesc(xa) + 2 * j, (c | j) != 0);",
-                              "".join(f"if constexpr (TN == {n}) wb{n}(d, bdesc(wa) + 2 * j, bdesc(xa) + 2 * j, (c | j) != 0); " for n in ns))
-            _wbmod[0] = load_inline("wb26_%x" % (hash(tuple(WBI) + tuple(WRI) + tuple(WDI) + tuple(WSI) + tuple(WQI) + tuple(WVI)) & 0xffffffff),
-                                    cpp_sources="int64_t wbrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);"
-                                                "int64_t wqrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t);"
-                                                "int64_t wvrun(int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t);",
-                                    cuda_sources=src.replace("@@CASES@@", cases), functions=["wbrun", "wqrun", "wvrun"],
+            name, src = _wbsrc()
+            _wbmod[0] = load_inline(name, cpp_sources=WBCPP, cuda_sources=src, functions=["wbrun", "wqrun", "wvrun"],
                                     extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
         except Exception as e:
             print("wb unavailable:", str(e)[:200], flush=True)
