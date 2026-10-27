@@ -29,6 +29,12 @@ def prepare(w):
         for b in (8, 16):
             st["moe"]["tune"][b] = ("gk", 0, 0, os.environ["DL_GK"])
         print("DL_GK", st["moe"]["tune"], flush=True)
+    if os.environ.get("DL_PICKS"):  # generic: "1=gk:-DSW=4 -DKS2=1 -DMAXM=8;16=gk:-DSW=4 -DKS2=2" (path:defines, path in g1/gk/wx)
+        for it in os.environ["DL_PICKS"].split(";"):
+            b, c = it.split("=", 1)
+            kind, x = c.split(":", 1)
+            st["moe"]["tune"][int(b)] = (kind, 0, 0, x)
+        print("DL_PICKS", st["moe"]["tune"], flush=True)
     print("DLPREP %.1fs state %.2f GB peak %.2f GB (above the %.2f GB before)" % (time.time() - t0, (torch.cuda.memory_allocated() - m0) / 2**30,
           (torch.cuda.max_memory_allocated() - m0) / 2**30, m0 / 2**30), flush=True)
     return st
