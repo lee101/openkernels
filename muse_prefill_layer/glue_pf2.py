@@ -1058,6 +1058,12 @@ __device__ __forceinline__ void mbwait(uint32_t b, uint32_t ph) {
   }
 }
 __device__ __forceinline__ unsigned long long clk() { unsigned long long t; asm volatile("mov.u64 %0, %clock64;" : "=l"(t)); return t; }
+__device__ __forceinline__ unsigned long long gns() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t lds32(uint32_t a) { uint32_t v; asm volatile("ld.shared.b32 %0, [%1];" : "=r"(v) : "r"(a)); return v; }
 // W4PROF phase accumulators (clock64 cycles), 16 per kernel class: consumer warps (lane 0) 0 wait-full, 1 dequant (smem loads + ALU),
 // 2 wgmma fence -> issue -> wait_group 0, 3 epilogue, 4 stages, 5 span; producer (thread 0) 8 wait-empty, 9 issue (hdr + TMA + cp.async +
 // commit), 10 TMA wait at the full arrival (exposed TMA latency), 11 cp.async wait + fence + arrive, 12 stages, 13 span
@@ -1259,6 +1265,61 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
   PADD(pc, 3, c_f0 - c_e0);
 }
 
+// remainder tiles (<= 32 tokens) on mma.sync m16n8k16: the same A fragments (the mma.sync register order), B fragments by 32-bit
+// loads from the SW128 token tile, ceil(ntok / 8) n8 tiles at run time, every warp on its own (no warpgroup sync, no wgmma group
+// retirement). pf19's n32-wgmma version ran ~19 weight values / cycle / SM (1.7 TB/s) whatever the occupancy.
+template <int NT, int NCW>
+__device__ __forceinline__ void ctile_ms(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint32_t bbase0, uint32_t sbase0, int q, const Hdr h, int wi,
+                                         int tid, Pc& pc) {
+  using C = Cfg<NT, NCW>;
+  const int lt = tid & 127, w = lt >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int woff = (wi * 4 + w) * 768;
+  const int nt = (h.ntok + 7) >> 3;
+  float acc[4][4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+  for (int ks = 0; ks < h.nks; ks++) {
+    const int qq = q + ks, slot = qq % C::NS;
+    if (ks) PWAIT(pc.v[0], rdy<C::NS>(sm, slot), (qq / C::NS) & 1);
+    PT(c_a);
+    uint32_t k0, k1, k2, k3, kx, ky;
+    dq_load(sbase0 + slot * C::WB + woff, lane, k0, k1, k2, k3, kx, ky);
+    uint32_t a01[2][4], a23[2][4];
+    dq_half(k0, k1, kx, a01);
+    dq_half(k2, k3, ky, a23);
+    const uint32_t bb = bbase0 + slot * C::BT + 4 * t;
+    PT(c_b);
+#pragma unroll
+    for (int kk = 0; kk < 4; kk++) {
+      const uint32_t* af = kk < 2 ? a01[kk] : a23[kk - 2];
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        if (j < nt) {
+          const uint32_t rb = bb + (8 * j + g) * 128 + 32 * kk;
+          mma16816(acc[j], af, lds32(swz(rb)), lds32(swz(rb + 16)));
+        }
+    }
+    __syncwarp();
+    if (lane == 0) mbarrive((uint32_t)__cvta_generic_to_shared(&sm->empty[slot]));
+    PT(c_c);
+    PADD(pc, 1, c_b - c_a); PADD(pc, 2, c_c - c_b); PADD(pc, 4, 1);
+  }
+  PT(c_e0);
+  const float gs = p.g[h.e];
+  __nv_bfloat16* ob = p.out + ((size_t)h.kh * p.rows + h.row0 + 2 * t) * p.nout + h.rb * C::BM + wi * 64 + 16 * w + g;
+  const int nl = h.ntok - 2 * t;
+#pragma unroll
+  for (int j = 0; j < 4; j++)
+#pragma unroll
+    for (int e2 = 0; e2 < 2; e2++)
+      if (j < nt && 8 * j + e2 < nl) {
+        __nv_bfloat16* o = ob + (size_t)(8 * j + e2) * p.nout;
+        o[0] = __float2bfloat16(acc[j][e2] * gs); o[8] = __float2bfloat16(acc[j][2 + e2] * gs);
+      }
+  PT(c_f0);
+  PADD(pc, 3, c_f0 - c_e0);
+}
+
 // NT = BNMAX, NCW = 4: full token tiles + remainders > 32, 256-row blocks; NT = 32, NCW = 1: remainders <= 32, 64-row blocks.
 // tm: the token rows (A [rows, 4096] bf16) as a TMA tensor with a (64 K x NT rows) SW128 box
 template <int NT, int NCW>
@@ -1278,7 +1339,7 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
   const int tid = threadIdx.x;
   const int nrb = p.nrb256 * (4 / NCW);
 #ifdef W4PROF
-  const unsigned long long t_start = clk();
+  const unsigned long long t_start = clk(), n_start = gns();
 #endif
   Pc pc = {{0, 0, 0, 0, 0, 0}};
   if (tid == 0) {
@@ -1407,13 +1468,15 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       PWAIT(pc.v[0], rdy<NS>(sm, slot), (q / NS) & 1);
       const Hdr h = sm->hdr[slot];
       if (h.tile < 0 || *(volatile int*)&g_w4err) break;
-      ctile<NT, NCW>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+      if constexpr (NCW == 1) ctile_ms<NT, NCW>(p, sm, bbase0, sbase0, q, h, wi, tid, pc);
+      else ctile<NT, NCW>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
       q += h.nks;
     }
 #ifdef W4PROF
     if ((tid & 31) == 0 && p.prof) {
       for (int i = 0; i < 5; i++) atomicAdd(p.prof + i, pc.v[i]);
       atomicAdd(p.prof + 5, clk() - t_start);
+      atomicAdd(p.prof + 6, gns() - n_start);
     }
 #endif
   }
@@ -1497,7 +1560,7 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v9" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v10" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t);",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -1677,11 +1740,57 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2):
             for cls, o in (("big", 0), ("small", 16)):
                 cn, pn = max(1, v[o + 4]), max(1, v[o + 12])
                 if v[o + 5] and v[o + 13]:
-                    fr.append(f"{name}{cls}: consumer/stage wait {v[o] / cn:.0f} dq {v[o + 1] / cn:.0f} wgmma issue+retire {v[o + 2] / cn:.0f} cyc, epilogue "
-                              f"{v[o + 3] / max(1, v[o + 5]) * 100:.1f}% span, wait-full {v[o] / v[o + 5]:.2f}; producer/stage wait-empty "
-                              f"{v[o + 8] / pn:.0f} issue {v[o + 9] / pn:.0f} tma-wait {v[o + 10] / pn:.0f} cpwait+arrive {v[o + 11] / pn:.0f} cyc "
-                              f"({v[o + 4]} warp-stages, {v[o + 12]} producer stages)")
-        print(f"pf2 w4prof T{T}: " + "; ".join(fr) + f" (watchdog {pe.w4g_err(1)})", flush=True)
+                    fr.append(f"{name}{cls}: consumer/stage wait {v[o] / cn:.0f} dq {v[o + 1] / cn:.0f} "
+                              f"{'wgmma issue+retire' if cls == 'big' else 'B loads + mma.sync'} {v[o + 2] / cn:.0f} cyc, epilogue "
+                              f"{v[o + 3] / max(1, v[o + 5]) * 100:.1f}% span, wait-full {v[o] / v[o + 5]:.2f}, SM clock {v[o + 5] / max(1, v[o + 6]) * 1e3:.0f} MHz; "
+                              f"producer/stage wait-empty {v[o + 8] / pn:.0f} issue {v[o + 9] / pn:.0f} cyc ({v[o + 4]} warp-stages, {v[o + 12]} producer stages)")
+        # SM clock of the W13 kernel right after the mini-layer context (pooler + router GEMMs) vs after the read-only L2 flush
+        ctxf = _tune_ctx(st, T, dev)
+        mhz = []
+        for lab in ("after flush", "after context"):
+            pb = torch.zeros(32, dtype=torch.int64, device=dev)
+            sink.copy_(fl.sum())
+            if lab == "after context":
+                ctxf()
+            _w4gemm(A, d["offs"], w["w13"], w["g13"], c, 1, 1, pb, pe)
+            torch.cuda.synchronize()
+            v = pb.tolist()
+            mhz.append(f"{lab} {v[5] / max(1, v[6]) * 1e3:.0f} MHz")
+        print(f"pf2 w4prof T{T}: " + "; ".join(fr) + f"; w13 clock " + ", ".join(mhz) + f" (watchdog {pe.w4g_err(1)})", flush=True)
+    # in-context penalty probe: the w4 and big MoE as graphs alone, right after the context graph (no flush between, MoE timed alone),
+    # and as one [context + MoE] graph minus the context graph (the tune's harness)
+    try:
+        ctxf = _tune_ctx(st, T, dev)
+        prc = ctxf()
+        torch.cuda.synchronize()
+
+        def tmed(fn, n=5):
+            ts = []
+            for _ in range(n):
+                sink.copy_(fl.sum()); e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True)
+                e0.record(); fn(); e1.record(); torch.cuda.synchronize(); ts.append(e0.elapsed_time(e1))
+            return sorted(ts)[n // 2] * 1e3
+        probe = []
+        g_c = _capture(ctxf, None)
+        t_c = tmed(lambda: g_c.replay())
+        for nm, path in (("w4", ("w4", 0, "a", ks2)), ("big", ("big", 0, "a", 0))):
+            dd = _moe_pre(path, loc, lid, cnt, T, st)
+            g_m = _capture(lambda: _moe_main(path, prc, loc, lid, tw, dd, st), None)
+            g_b = _capture(lambda: _moe_main(path, ctxf(), loc, lid, tw, _moe_pre(path, loc, lid, cnt, T, st), st), None)
+            t_a = tmed(lambda: g_m.replay())
+            t_b = tmed(lambda: g_b.replay()) - t_c
+            seq = []
+            for _ in range(5):
+                sink.copy_(fl.sum()); g_c.replay()
+                e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True)
+                e0.record(); g_m.replay(); e1.record(); torch.cuda.synchronize(); seq.append(e0.elapsed_time(e1))
+            probe.append(f"{nm} alone {t_a:.0f} after-context {sorted(seq)[2] * 1e3:.0f} in-context-graph {t_b:.0f}")
+            del g_m, g_b, dd
+        print(f"pf2 w4probe T{T} (us, context graph {t_c:.0f}): " + "; ".join(probe), flush=True)
+        del g_c, prc
+    except Exception as e:
+        print(f"pf2 w4probe T{T} failed: {str(e)[:200]}", flush=True)
+    torch.cuda.empty_cache()
 
 
 def _prof_routes(T, prof, dev, seed):
@@ -1708,7 +1817,7 @@ def _prof_routes(T, prof, dev, seed):
 
 
 W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in prepare() (Hopper only)
-W4DIAG = False  # pf19diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf20diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
