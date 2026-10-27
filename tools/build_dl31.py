@@ -1,4 +1,4 @@
-"""build muse_decode_layer/submission_v31.py: build_dl28 (default attention v69f / MoE v48) + glue fused into the GEMV
+"""build muse_decode_layer/submission_v31.py: build_dl28 (default attention v69f / MoE v52, wx pruned to v52's WXG2 picks) + glue fused into the GEMV
 epilogues behind DL_FUSE: o-proj -> resid1, pooler -> rmsg, unpooler -> resid2. At every exit of the gv kernel the
 last-arriving CTA (per token block, self-cleaning counter) runs the row epilogue; a single CTA per token block only pays at T = 1,
 so DL_FUSE_T = (1,).
@@ -32,7 +32,7 @@ VAR = "b"
 POL = {"a": "{k: T <= 8 for k in _PDLX}", "b": "{k: T <= 8 for k in _PDLX}", "c": "{k: k != 'moe' for k in _PDLX}"}[VAR]
 LATE = int(VAR == "b")
 ATTN = R / (sys.argv[1] if len(sys.argv) > 1 else "muse_attention_decode/submission_v69f.py")
-MOE = R / (sys.argv[2] if len(sys.argv) > 2 else "muse_moe_w4a16/submission_v48.py")
+MOE = R / (sys.argv[2] if len(sys.argv) > 2 else "muse_moe_w4a16/submission_v52.py")
 out_dl = R / (sys.argv[3] if len(sys.argv) > 3 else "muse_decode_layer/submission_v31.py")
 TMP = Path(tempfile.mkdtemp())
 
@@ -558,7 +558,7 @@ if DL_PRUNE:
     M_FS_CFG = ((1, 3, ""),)
     if "M_G_CFG" in globals(): M_G_CFG = ()
     if "M_K_CFG" in globals(): M_K_CFG = ("-DSW=4 -DKS2=1 -DMAXM=8", "-DSW=4 -DKS2=2")
-    if "M_WX_CFG" in globals(): M_WX_CFG = (("-DRPW=2",), ("-DNCW=16",))
+    if "M_WX_CFG" in globals(): M_WX_CFG = (("-DNCW=16", "-DWXG2"), ("-DNCW=16", "-DN8STEP", "-DWXG2"))  # v52d M128 / M256 picks
 DL_PIN = {32: ("fs", 1, 3, "")}  # MoE bucket -> config (judge v22 vs v23 decode32: fs f1s3 219.7 / 383.2 us vs r1 236.1 / 420.2)
 DL_PIN_MARGIN = 0.92  # keep the pin unless the in-layer tune's best is faster than the pin by more than 8%
 for _c in DL_PIN.values():
