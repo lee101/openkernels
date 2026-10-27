@@ -771,7 +771,7 @@ def prepare(weights):
             if ext is not None:
                 w13, g13 = _w4pack(weights["w13"], weights["w13_sf"], weights["w13_gs"])
                 w2, g2 = _w4pack(weights["w2"], weights["w2_sf"], weights["w2_gs"])
-                st["w4"] = {"ext": ext, "w13": w13, "g13": g13, "w2": w2, "g2": g2, "ctr": torch.zeros(16, dtype=torch.int32, device=dev)}
+                st["w4"] = {"ext": ext, "w13": w13, "g13": g13, "w2": w2, "g2": g2, "ctr": torch.zeros(24, dtype=torch.int32, device=dev)}
                 torch.cuda.synchronize()
                 print(f"pf2 w4g packed in {time.time() - t0:.1f}s, smem {ext.w4g_smem()}", flush=True)
         except Exception as e:
@@ -1034,7 +1034,7 @@ W4G_CUDA = r"""
 #define KST 64
 struct Hdr { int tile, e, rb, row0, ntok, kh, nks, pad; };
 struct P { const __nv_bfloat16* A; const int* offs; const uint8_t* W; const float* g; __nv_bfloat16* out; int* ctr; unsigned long long* prof;
-           int nrb256, nout, rows, ksplit, tsz; };
+           int nrb256, nout, rows, ksplit, tsz, lomod, fullonly; };
 
 __device__ __forceinline__ void mbinit(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(b), "r"(n)); }
 __device__ __forceinline__ void mbarrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(b) : "memory"); }
@@ -1302,8 +1302,10 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
     int rk = 0;
     for (int j = 0; j < 32; j++) { const int cj = __shfl_sync(0xffffffffu, c, j); rk += (cj > c) || (cj == c && j < lane); }
     sm->order[rk] = lane;
-    const int full = c / p.tsz, rem = c % p.tsz;
-    const int nt = (NT == 32 ? (rem > 0 && rem <= 32 ? 1 : 0) : full + (rem > 32 ? 1 : 0)) * nrb * p.ksplit;
+    // this launch's share of the expert's tokens: c % lomod (the tokens not covered by a wider launch), in tsz-token tiles; a
+    // full-only launch takes no remainder tile; the remainder kernel (NT 32) takes a <= 32-token remainder
+    const int cc = p.lomod ? c % p.lomod : c, full = cc / p.tsz, rem = cc % p.tsz;
+    const int nt = (NT == 32 ? (rem > 0 && rem <= 32 ? 1 : 0) : full + (!p.fullonly && rem > 32 ? 1 : 0)) * nrb * p.ksplit;
     int ntr = 0;
     for (int j = 0; j < 32; j++) { const int rj = __shfl_sync(0xffffffffu, rk, j), nj = __shfl_sync(0xffffffffu, nt, j); if (rj == lane) ntr = nj; }
     int v = ntr;
@@ -1334,9 +1336,9 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
         int r = 0;
         while (sm->cum[r + 1] <= u) r++;
         const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrb, rb = v2 % nrb;
-        const int st0 = e ? p.offs[e - 1] : 0, cnt = p.offs[e] - st0;
+        const int st0 = e ? p.offs[e - 1] : 0, cnt0 = p.offs[e] - st0, cnt = p.lomod ? cnt0 % p.lomod : cnt0, sh = cnt0 - cnt;
         const int t0 = NT == 32 ? cnt / p.tsz : tt;
-        const int row0 = st0 + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
+        const int row0 = st0 + sh + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
         const uint8_t* wsrc = p.W + ((size_t)(e * p.nrb256 + rb / (4 / NCW)) * KST + kh * nks) * WCH + (rb % (4 / NCW)) * (NCW * 3072);
         for (int ks = 0; ks < nks; ks++, s++) {
           const int slot = s % NS;
@@ -1377,9 +1379,9 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       int r = 0;
       while (sm->cum[r + 1] <= u) r++;
       const int e = sm->order[r], v = u - sm->cum[r], kh = v % p.ksplit, v2 = v / p.ksplit, tt = v2 / nrb, rb = v2 % nrb;
-      const int st0 = e ? p.offs[e - 1] : 0, cnt = p.offs[e] - st0;
+      const int st0 = e ? p.offs[e - 1] : 0, cnt0 = p.offs[e] - st0, cnt = p.lomod ? cnt0 % p.lomod : cnt0, sh = cnt0 - cnt;
       const int t0 = NT == 32 ? cnt / p.tsz : tt;
-      const int row0 = st0 + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
+      const int row0 = st0 + sh + t0 * p.tsz, ntok = min(NT, cnt - t0 * p.tsz);
       const uint8_t* wsrc = p.W + ((size_t)(e * p.nrb256 + rb / (4 / NCW)) * KST + kh * nks) * WCH + (rb % (4 / NCW)) * (NCW * 3072);
       const __nv_bfloat16* xsrc = p.A + (size_t)row0 * 4096 + kh * nks * 64;
       for (int ks = 0; ks < nks; ks++, s++) {
@@ -1466,19 +1468,35 @@ int64_t w4g_err(int64_t reset) {
   if (reset) { const int z = 0; cudaMemcpyToSymbol(g_w4err, &z, sizeof(int)); }
   return v;
 }
-// cls bit 0: the big kernel, bit 1: the remainder kernel; ctr: 4 ints (2 per kernel); out [ksplit * rows, nrb256 * 256];
-// wide: the big kernel is 2 consumer warpgroups x m64n256 (128 weight rows, 256-token tiles) instead of 4 x m64n128
+// mode 0: n128 kernel (4 WG x m64n128) + remainder kernel; 1: wide kernel (2 WG x m64n256, 256-token tiles) + remainder kernel;
+// 2: wide kernel on the full 256-token tiles only, n128 kernel on each expert's c % 256 leftover, remainder kernel on its <= 32 rest.
+// cls bit 0: the wide / n128 kernels, bit 1: the remainder kernel. ctr: 2 ints per launch slot (6), prof: 16 per slot (48);
+// slots: 0 the first big kernel, 1 the mixed-mode n128 kernel, 2 the remainder kernel. out [ksplit * rows, nrb256 * 256]
 void w4g(torch::Tensor A, torch::Tensor offs, torch::Tensor W, torch::Tensor g, torch::Tensor out, torch::Tensor ctr, torch::Tensor prof,
-         int64_t ksplit, int64_t cls, int64_t wide) {
+         int64_t ksplit, int64_t cls, int64_t mode) {
   w4g_init();
   P p{(const __nv_bfloat16*)A.data_ptr(), offs.data_ptr<int>(), W.data_ptr<uint8_t>(), g.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
       ctr.data_ptr<int>(), prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr, (int)W.size(1), (int)out.size(1),
-      (int)(out.size(0) / ksplit), (int)ksplit, (int)(wide ? 2 * BNMAX : BNMAX)};
-  if ((cls & 1) && wide) KWIDE<<<g_nsm, Cfg<2 * BNMAX, 2>::NTHR, smem_need<2 * BNMAX, 2>(), at::cuda::getCurrentCUDAStream()>>>(p, tmap(A.data_ptr(), A.size(0), 2 * BNMAX));
-  if ((cls & 1) && !wide) KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), at::cuda::getCurrentCUDAStream()>>>(p, tmap(A.data_ptr(), A.size(0), BNMAX));
-  p.ctr += 2;
-  if (p.prof) p.prof += 16;
-  if (cls & 2) KSMALL<<<g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), at::cuda::getCurrentCUDAStream()>>>(p, tmap(A.data_ptr(), A.size(0), 32));
+      (int)(out.size(0) / ksplit), (int)ksplit, BNMAX, 0, 0};
+  auto st = at::cuda::getCurrentCUDAStream();
+  P q = p;
+  if (cls & 1) {
+    if (mode >= 1) {
+      q.tsz = 2 * BNMAX; q.fullonly = mode == 2;
+      KWIDE<<<g_nsm, Cfg<2 * BNMAX, 2>::NTHR, smem_need<2 * BNMAX, 2>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 2 * BNMAX));
+    } else {
+      KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st>>>(q, tmap(A.data_ptr(), A.size(0), BNMAX));
+    }
+    if (mode == 2) {
+      q = p; q.ctr += 2; q.prof = p.prof ? p.prof + 16 : nullptr; q.lomod = 2 * BNMAX;
+      KBIG<<<g_nsm, Cfg<BNMAX, 4>::NTHR, smem_need<BNMAX, 4>(), st>>>(q, tmap(A.data_ptr(), A.size(0), BNMAX));
+    }
+  }
+  if (cls & 2) {
+    q = p; q.ctr += 4; q.prof = p.prof ? p.prof + 32 : nullptr;
+    q.tsz = mode == 1 ? 2 * BNMAX : BNMAX; q.lomod = mode == 2 ? 2 * BNMAX : 0;
+    KSMALL<<<g_nsm * Cfg<32, 1>::MINB, Cfg<32, 1>::NTHR, smem_need<32, 1>(), st>>>(q, tmap(A.data_ptr(), A.size(0), 32));
+  }
 }
 int64_t w4g_smem() { return (int64_t)(smem_need<BNMAX, 4>() * 1000000 + smem_need<32, 1>()); }
 """
@@ -1511,7 +1529,7 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v11" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v12" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t);",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -1630,12 +1648,12 @@ def _moe_w4(g, pr, loc, tw, offs, lst, pos, st, add, ks2=1, wide=0):
     w = st["w4"]
     A = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.gathnorm(pr, lst, offs, st["g_pre_expert_norm"], A)
-    Hh = _w4gemm(A, offs, w["w13"], w["g13"], w["ctr"][0:4], wide=wide)
+    Hh = _w4gemm(A, offs, w["w13"], w["g13"], w["ctr"][0:8], wide=wide)
     del A
     I = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev)
     g.act2(Hh, offs, I)
     del Hh
-    Y = _w4gemm(I, offs, w["w2"], w["g2"], w["ctr"][4:8], ks2, wide=wide)
+    Y = _w4gemm(I, offs, w["w2"], w["g2"], w["ctr"][8:16], ks2, wide=wide)
     del I
     y = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
     g.combine(Y, loc, pos, st["g_post_expert_norm"], tw, add, y, R * 4096 if ks2 == 2 else 0)
@@ -1648,19 +1666,19 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
     pr = torch.randn((T, 4096), device=dev).to(torch.bfloat16)
     loc, lid, tw, cnt = _prof_routes(T, prof, dev, 11)
     path = ("w4", 0, "a", ks2 | (wide << 2))
-    tsz = 256 if wide else 128
+    tsz = 256 if wide == 1 else 128
     d = _moe_pre(path, loc, lid, cnt, T, st)
     w = st["w4"]
     R = T * 8
     A = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev); g.gathnorm(pr, d["lst"], d["offs"], st["g_pre_expert_norm"], A)
-    Hh = _w4gemm(A, d["offs"], w["w13"], w["g13"], w["ctr"][0:4], wide=wide)
+    Hh = _w4gemm(A, d["offs"], w["w13"], w["g13"], w["ctr"][0:8], wide=wide)
     I = torch.empty((R, 4096), dtype=torch.bfloat16, device=dev); g.act2(Hh, d["offs"], I)
-    Y = _w4gemm(I, d["offs"], w["w2"], w["g2"], w["ctr"][4:8], ks2, wide=wide)
+    Y = _w4gemm(I, d["offs"], w["w2"], w["g2"], w["ctr"][8:16], ks2, wide=wide)
     y = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
-    c = w["ctr"][8:12]
+    c = w["ctr"][16:24]
     nr = int(cnt.sum())
     cnth = cnt.cpu()
-    big_r = int(sum(int(x) - (int(x) % tsz if int(x) % tsz <= 32 else 0) for x in cnth))
+    big_r = int(sum(int(x) - ((int(x) % (256 if wide == 2 else 1 << 30)) % tsz if (int(x) % (256 if wide == 2 else 1 << 30)) % tsz <= 32 else 0) for x in cnth))
     tm = {"rlist": (lambda: _moe_pre(path, loc, lid, cnt, T, st), 0),
           "gnorm": (lambda: g.gathnorm(pr, d["lst"], d["offs"], st["g_pre_expert_norm"], A), 0),
           "w13": (lambda: _w4gemm(A, d["offs"], w["w13"], w["g13"], c, wide=wide), nr * 8192),
@@ -1680,27 +1698,27 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
         except Exception as e:
             out.append(f"{k} failed {str(e)[:80]}")
     ne = int((cnt > 0).sum())
-    print(f"pf2 w4diag T{T} ks2 {ks2} {'wide n256' if wide else 'n128'} routes {nr} experts {ne} (us): " + ", ".join(out), flush=True)
+    print(f"pf2 w4diag T{T} ks2 {ks2} {('n128', 'wide n256', 'mixed n256 + n128')[wide]} routes {nr} experts {ne} (us): " + ", ".join(out), flush=True)
     pe = _w4g(True)
     if pe is not None:
         fr = []
         for name, X, Wp, gg, ks in (("w13", A, w["w13"], w["g13"], 1), ("w2", I, w["w2"], w["g2"], ks2)):
-            pb = torch.zeros(32, dtype=torch.int64, device=dev)
+            pb = torch.zeros(48, dtype=torch.int64, device=dev)
             _w4gemm(X, d["offs"], Wp, gg, c, ks, 3, pb, pe, wide=wide)
             torch.cuda.synchronize()
             v = pb.tolist()
-            for cls, o in (("big", 0), ("small", 16)):
+            for cls, o in (("big", 0), ("n128-leftover", 16), ("small", 32)):
                 cn, pn = max(1, v[o + 4]), max(1, v[o + 12])
                 if v[o + 5] and v[o + 13]:
                     fr.append(f"{name}{cls}: consumer/stage wait {v[o] / cn:.0f} dq {v[o + 1] / cn:.0f} "
-                              f"{'wgmma issue+retire' if cls == 'big' else 'B loads + mma.sync'} {v[o + 2] / cn:.0f} cyc, epilogue "
+                              f"wgmma issue+retire {v[o + 2] / cn:.0f} cyc, epilogue "
                               f"{v[o + 3] / max(1, v[o + 5]) * 100:.1f}% span, wait-full {v[o] / v[o + 5]:.2f}, SM clock {v[o + 5] / max(1, v[o + 6]) * 1e3:.0f} MHz; "
                               f"producer/stage wait-empty {v[o + 8] / pn:.0f} issue {v[o + 9] / pn:.0f} cyc ({v[o + 4]} warp-stages, {v[o + 12]} producer stages)")
         # SM clock of the W13 kernel right after the mini-layer context (pooler + router GEMMs) vs after the read-only L2 flush
         ctxf = _tune_ctx(st, T, dev)
         mhz = []
         for lab in ("after flush", "after context"):
-            pb = torch.zeros(32, dtype=torch.int64, device=dev)
+            pb = torch.zeros(48, dtype=torch.int64, device=dev)
             sink.copy_(fl.sum())
             if lab == "after context":
                 ctxf()
@@ -1708,7 +1726,7 @@ def _w4_diag(st, fl, sink, T, prof, dev, ks2, wide=0):
             torch.cuda.synchronize()
             v = pb.tolist()
             mhz.append(f"{lab} {v[5] / max(1, v[6]) * 1e3:.0f} MHz")
-        print(f"pf2 w4prof T{T} {'wide' if wide else 'n128'}: " + "; ".join(fr) + f"; w13 clock " + ", ".join(mhz) + f" (watchdog {pe.w4g_err(1)})", flush=True)
+        print(f"pf2 w4prof T{T} {('n128', 'wide', 'mixed')[wide]}: " + "; ".join(fr) + f"; w13 clock " + ", ".join(mhz) + f" (watchdog {pe.w4g_err(1)})", flush=True)
     torch.cuda.empty_cache()
 
 
@@ -1736,7 +1754,8 @@ def _prof_routes(T, prof, dev, seed):
 
 
 W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in prepare() (Hopper only)
-W4DIAG = False  # pf21diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
+W4DIAG = False  # pf22diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
@@ -1744,7 +1763,7 @@ MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a"
 
 def _mname(k):
     if k[0] in ("w4", "h4"):
-        return k[0] + (str(k[1]) + k[2] if k[0] == "h4" else "") + f"k{max(1, k[3] & 3)}" + ("w" if k[3] >> 2 else "")
+        return k[0] + (str(k[1]) + k[2] if k[0] == "h4" else "") + f"k{max(1, k[3] & 3)}" + ("", "w", "m")[k[3] >> 2]
     return k[0] + (str(k[1]) if k[0] == "h" else "") + (k[2] if k[0] in ("q", "h") else "") + ("", "o", "d")[k[3]]
 
 
@@ -1846,7 +1865,7 @@ def _moe_tune(st, fl, sink):
                 x @ x
             del x
             base = [dflt] + ([("mar", 0, "a", 0)] if hasmar and MARLIN_MIN < T <= MARLIN_MAX else []) + [("q", 0, v, 0) for v in vs] \
-                + [("big", 0, "a", o) for o in (0, 1)] + ([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1)] if st.get("w4") is not None else [])
+                + [("big", 0, "a", o) for o in (0, 1)] + ([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1, 2)] if st.get("w4") is not None else [])
             for c in base:
                 add(c)
             rounds(base, TUNE_R1)
@@ -1855,7 +1874,7 @@ def _moe_tune(st, fl, sink):
             bo = (pick([("big", 0, "a", o) for o in (0, 1)]) or ("big", 0, "a", 0))[3]
             hy = [("h", thr, bv, bo) for thr in HTHR] + [("h", 384, bv, 2)]
             if st.get("w4") is not None:
-                bk = (pick([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1)]) or ("w4", 0, "a", 1))[3]
+                bk = (pick([("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in (0, 1, 2)]) or ("w4", 0, "a", 1))[3]
                 hy += [("h4", thr, bv, bk) for thr in W4THR]
             for c in hy:
                 add(c)
@@ -1880,11 +1899,14 @@ def _moe_tune(st, fl, sink):
             print(f"pf2 moe T{T} final x{TUNE_R2} (MoE us median +- spread, err): "
                   + " ".join(f"{_mname(c)} {(med(c) - ctx_m) * 1e3:.0f}+-{spread(c) * 1e3:.0f} {err[c]:.0e}" for c in sorted(final, key=med))
                   + f" -> {_mname(st['mv'][T])}", flush=True)
+            if T in W4FORCE and st.get("w4") is not None:
+                st["mv"][T] = W4FORCE[T]
+                print(f"pf2 moe T{T}: forced {_mname(W4FORCE[T])} (diag: in-layer measurement)", flush=True)
             if st.get("w4") is not None:
                 if W4DIAG:
                     for pf in MOE_PROF[T][:1]:
-                        _w4_diag(st, fl, sink, T, pf, dev, bk & 3, 0)
-                        _w4_diag(st, fl, sink, T, pf, dev, bk & 3, 1)
+                        for md in (0, 1, 2):
+                            _w4_diag(st, fl, sink, T, pf, dev, bk & 3, md)
                 if st["w4"]["ext"].w4g_err(1):
                     print(f"pf2 w4g watchdog fired at T{T}: w4 paths disabled", flush=True)
                     if st["mv"][T][0] in ("w4", "h4"):
