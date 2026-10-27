@@ -1754,6 +1754,10 @@ def _prof_routes(T, prof, dev, seed):
 
 
 W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in prepare() (Hopper only)
+# 16K: pf22diag measured w4 wide in the judge's layer 4-5% faster on every first-turn shape than the big path the tune picked (its
+# [context + MoE] graph rates w4 ~0.6 ms worse there); mixed split-1 is the best w4 mode standalone (5190 vs wide 5273 vs big ~5540).
+# Pinned when its error check passes; the watchdog still drops it
+MOE_PIN = {16384: ("w4", 0, "a", 1 | (2 << 2))}
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
 W4DIAG = False  # pf22diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
@@ -1902,6 +1906,9 @@ def _moe_tune(st, fl, sink):
             if T in W4FORCE and st.get("w4") is not None:
                 st["mv"][T] = W4FORCE[T]
                 print(f"pf2 moe T{T}: forced {_mname(W4FORCE[T])} (diag: in-layer measurement)", flush=True)
+            elif T in MOE_PIN and st.get("w4") is not None and err.get(MOE_PIN[T], 1.0) < 2e-2:
+                st["mv"][T] = MOE_PIN[T]
+                print(f"pf2 moe T{T}: pinned {_mname(MOE_PIN[T])} (err {err[MOE_PIN[T]]:.0e}; the context graph under-rates w4 at this size)", flush=True)
             if st.get("w4") is not None:
                 if W4DIAG:
                     for pf in MOE_PROF[T][:1]:
