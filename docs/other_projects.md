@@ -121,3 +121,45 @@ Bench scripts/artifacts: /vfast/data/imgopt (zbench.sh, zq4.sh, lqv.sh, qrun.sh,
   (prod-deploys memory), rebuild for the target arch, then md5-compare same-seed images (expected identical).
 - sdmaster-opt ggml_rms_norm_ch adds an op_params flag to GGML_OP_RMS_NORM; only CUDA and CPU implement it (sd.cpp uses it only on
   those backends).
+
+## LLM decode pass 2 (2026-10-27, local 3090 Ti sm_86) — llama.cpp-opt branch perf/decode-kernels @5749d573b (on top of e49c629b7, not pushed/deployed)
+- Served LLMs (omniserve-native repo config): main gateway = gemma-roleplay-v2-q8_0.gguf (Gemma-4 E4B arch, Q8_0), KV q8_0 + FA (forced), ctx 4096, 1 context, LLM_PERMITS 1 => batch-1 decode; swap profiles Boulesis 26B-A4B Q4_K_S (+MTP Q8_0), G4 31B IQ4_XS. Qwen3-4B / Qwen3-VL-8B Q4_K_M are sd.cpp text encoders, not llama.cpp decode; daisy has no llama.cpp. Proxies: gemma-4-E4B-it-Q8_0 (same arch/quant), Qwen3-4B-Instruct-2507-Q4_K_M (Q4_K/Q6_K GEMVs).
+- Commits (default behaviour bit-identical):
+  - d330b3acd q8_1 activations from producers (rms_norm[+mul[+add[+scalar mul]]], gelu*mul, hadamard fwht) so mmvq skips quantize_q8_1 (Q/K/V share one copy); head_prep kernel = rms_norm[*w] -> rope neox -> hadamard (+ the KV SET_ROWS, q8_0/f16/f32) per head; GELU in the unary*mul fusion.
+  - 2829bfff1 two-slot persistent q8_1 cache; q8_1 output from the fused gate/up GLU GEMV (last-block quantize; opt-in since 5749d573b).
+  - 61ed999b5 graph_optimize moves K/V MUL_MATs next to Q (same src1/type/K), one mmvq launch for all three.
+  - e0aab0399 opt-in FA flags (below).
+  - 5749d573b fixes an in-place race in the multi-block rms_norm+q8 kernel present in d330b3acd..e0aab0399 (gemma post-norms are allocated in place; md5 over 200 tokens did not catch it, 8K-token decode KLD did) => deploy the branch head only; adds opt-in GGML_CUDA_MMVQ_NW_TUNE.
+- nsys (tg128, per-position median, us/token, gemma-4-E4B q8_0 KV, depth 0): e49c629b7 -> 5749d573b: total 8051 -> 7392, kernels 1394 -> 754. GEMV 5882 -> 5837 (302 -> 254 launches; SWA Q+K+V 7.7+3.3+3.3 -> 11.6), quantize_q8_1 378 -> 68 (301 -> 44), rms_norm 658 -> 529 (302 -> 212), rope/hadamard/set_rows 345 -> 346 (246 -> 132), elementwise 250 -> 69 (180 -> 49), FA 537 -> 543. Depth 4096 FA is 936 us/token (global D=512 layers: dequant of all K/V to f16 + MMA every token).
+- tg128 t/s (llama-bench -fa 1 -ctk/-ctv q8_0, GRAPH_OPT unset, 3 interleaved rounds, shared GPU):
+  - gemma-4-E4B Q8_0: d0 117.2 -> 126.1 (+7.6%); d4096 109.2 -> 119.0 (+9.0%); d16384 97.9 -> 105.7 (+8.0%).
+    + FA flags: 128.5 / 124.1 / 118.7; + FA flags + NW_TUNE: 130.0 / 126.0 / 119.4 (+10.9% / +15.4% / +22%).
+  - Qwen3-4B Q4_K_M: d0 207.0 -> 224.4 (+8.4%), + NW_TUNE 238.5 (+15.2%); d4096 173.4 -> 184.6, + NW_TUNE 192.6.
+  - batched decode aggregate t/s (llama-batched-bench npp 256 ntg 64, npl 1/2/4/8, gemma): 110.1/215.1/411.1/665.3 -> 118.9/231.2/427.0/698.8 (+8/+7.5/+3.9/+5%); FA flags 122.5/232.5/436.0/695.8.
+- Parity (default settings): greedy md5 over 200 tokens identical vs e49c629b7 for gemma (q8_0 KV 86c3a50c79b6, f16 KV e672e90a70b3, FA off f3a8046e0811, CUDA graphs off, GRAPH_OPT=1) and Qwen3-4B (q8_0 335e61bc3ba0, f16 825ff9939efd); 1500-token continuation of a 1000-token prompt md5 3d1c8fa99533 identical in 3/3 runs each. Stronger check: llama-perplexity -ub 1 (8192 decode tokens, ctx 4096, Shakespeare, --kl-divergence vs e49c629b7 logits): KLD 0 / same-top 100% in 7 of 8 gemma runs and the Qwen run; one gemma run showed Δp RMS 0.002% (KLD 1e-6, no top-1 change) — not reproduced in 7 reruns, cause not found.
+- Opt-in, not bit-identical (quality = KLD over the same 8192 decode tokens vs an f16-KV MMA prefill reference; for scale f16 vs q8_0 KV differ by KLD 0.0065 on gemma, 0.0024 on Qwen):
+  - GGML_CUDA_FA_VEC512=1 (gemma global layers D=512 q8_0: vec kernel on the quantized cache) + GGML_CUDA_FA_VEC_SPLIT=1 (vec kernel KV tiles of 128 instead of D): FA kernel time/token d0 533 -> 432 us, d4096 948 -> 559 us. KLD vs ref: baseline decode 0.00488, FA flags 0.00408 (closer to the reference; same-top 96.53 -> 96.68%).
+  - GGML_CUDA_MMVQ_NW_TUNE=1: 5 warps instead of 4 at one column when K splits into whole iterations (K=2560: Q4_K/Q6_K 10 superblocks, Q8_0 80 blocks). Qwen Q4_K gate/up 42.5 -> 37.3 us. KLD vs ref: gemma 0.00497 (baseline 0.00488, within ±0.00024), Qwen 0.00458 (baseline 0.00495; same-top 96.36 -> 96.90%). SPLIT is a no-op on Qwen (D=128) at these depths.
+- Not kept: chained post-norm + next pre-norm in one kernel (5.1 us vs 2.6 + 2.2, and not bit-identical); GLU q8_1 output default-on (fence/atomic tail ~= saved launch, opt-in GGML_CUDA_GLU_Q8=1).
+- GRAPH_OPT=1 on gemma-4: the QKV concurrency events never validate (overlapping write ranges), but the interleaved node order stays and breaks the Q/K norm fusions (1048 -> 1096 kernels/token on the pre-pass build). Leave GRAPH_OPT unset for gemma.
+- Off switches (all default on): GGML_CUDA_NO_NORM_Q8, GGML_CUDA_NO_HEAD_PREP, GGML_CUDA_NO_HEAD_SET_ROWS, GGML_CUDA_NO_MMVQ_MULTI.
+- Remaining per token (gemma d0, 7.4 ms): GEMV 5.84 ms (gate/up 2.6 at ~87% of 1008 GB/s, down/O 1.68, lm_head 0.75 at 94%); Q8_0 rows are 34-byte blocks (2-byte aligned loads) — a repacked aligned Q8_0 layout is the next big lever but changes weight storage. Norms 0.53 ms (in-place post-norms need the single-block kernel, 2.96 us). FA vec at short depth is latency-bound (8 blocks/token/layer without SPLIT).
+- Deploy (user decides; nothing deployed): port e49c629b7..5749d573b onto /sdb-disk/code/llama.cpp-omniserve-opt (perf/decode-kernels-20261024 already has the two earlier commits), build sm_120 (changed files compile for sm_120 with CUDA 12.9), validate with the same md5 recipe on the 5090 (expect identical with flags unset) plus ideally the -ub 1 KLD run. Flags to consider in the drop-in after review: GGML_CUDA_FA_VEC512=1 GGML_CUDA_FA_VEC_SPLIT=1 (gemma, largest gain at 4K ctx); NW_TUNE only matters for K-quant models.
+
+### Q8_0 aligned repack (2026-10-28, local 3090 Ti) — llama.cpp-opt branch perf/q8-repack @7f327f636 (on 5749d573b, pushed to `lee`, not deployed)
+- Load-time repack of Q8_0 MUL_MAT weights (ne0 % 256 == 0, ne0 >= 1024) into a CUDA<n>_Q8R buffer type: each row keeps its 34*nb bytes as [32*nb quants][nb fp16 scales], so quants are 32-byte aligned. mmvq reads them with 8-byte loads (pseudo type GGML_TYPE_Q8_0R, same thread->block/chunk mapping and sum order as Q8_0 => bit-identical). MMQ gets its own Q8_0R instance with a 4-byte-aligned tile loader. set/get_tensor convert, so host readers still see plain Q8_0. supports_op keeps every other op off repacked tensors, LoRA tensors go to the default buffer, and any other MUL_MAT path unpacks to a pool buffer. Default on, GGML_CUDA_Q8_REPACK=0 disables. Same VRAM, load time unchanged (~2 s warm).
+- Parity: greedy md5 over 200 tokens is identical to 5749d573b for gemma-4-E4B q8_0 KV (86c3a50c79b6), f16 KV (e672e90a70b3) and FA off (f3a8046e0811). llama-perplexity logits files with -ub 1/4/7/512 (repack on vs off) are byte-identical. Qwen3-4B Q4_K_M has no Q8_0 weights, so it is a no-op (335e61bc3ba0).
+- nsys, gemma-4-E4B tg128 d0, us/token, per-position median (5749d573b -> repack):
+  - fused gate/up: 2652 -> 2558 (63.2 -> 60.9 us/call, 881 -> 915 GB/s = 91% of 1008).
+  - down/O: 1681 -> 1675 (down 31.3 -> 31.1 us = 89%; O 7.5 us = ~74%, latency/launch bound).
+  - lm_head: 752 -> 752 (94%).
+  - QKV multi: 314 -> 310.
+  - other small GEMVs: about unchanged. proj (K=256) is excluded: the small-K variant was slower repacked.
+  - Totals: GEMV 5772 -> 5668 (-104 us, -1.8%); all kernels 7380 -> 7273 us/token (-1.4%).
+- tg128 t/s (llama-bench, 6x5 interleaved samples, max): d0 125.3 -> 127.9 (+2%). d4096 and pp64/pp512 were inside the noise: other jobs held the GPU at 95-100% intermittently and the host was at load ~28. Prefill MMQ kernel time is about -2% on nsys. An earlier runtime-tagged loader inside the Q8_0 MMQ kernel cost the plain Q8_0 path ~4%, which is why the repacked layout has its own instance.
+- Finding: 2-byte-aligned loads were not the bottleneck. The big GEMVs already ran at 88-94% of peak (L1 merges the 16-bit loads into full sectors). Tried and dropped:
+  - a 16-byte paired layout for the 4-warp mapping: same decode, ~2x MMQ sector waste (prefill -20%);
+  - prefetching tail blocks;
+  - L1::no_allocate loads.
+  What remains is per-kernel fixed cost on small GEMVs (O, QKV, inp_gate: ~1.5 us each). Only fusion, or PDL on sm_90+/sm_120, removes it.
+- Deploy notes: port 7f327f636 onto the live tree after the decode-kernels commits. It adds q8r.cu/.cuh, a new MMQ instance file and llama loader/adapter hooks. Build for sm_120 and validate with the md5 recipe (expect identical, flag on and off). The gain on the 5090 is unmeasured and probably similar or smaller. GGML_CUDA_Q8_REPACK=0 is the rollback switch with no rebuild. Risk areas: tensor-parallel/2-D set_tensor paths assert on repacked tensors (not used by omniserve), and the MTP Q8_0 draft model will also be repacked.
