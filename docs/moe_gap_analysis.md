@@ -154,3 +154,27 @@ What a lossless repack could remove:
 - Activation B loads (0.5, gk): registers instead of smem need a 256-K slice per warp (16-way reductions per tile, the g1 shape), which g1 already is (no faster at M1).
 
 Best layout estimate: 16 (core) + ~0.5 (paired scale prep) + ~0.8 (loads) + ~1.5 (overhead) = ~18.8 per word vs 22.0 now: -14.5%, below the 15% bar, and its largest part (slot overhead) already failed to convert to speed in PPS 2. Not built. The scale entropy is 3.71 bits (31 distinct values, top 16 cover 98.7%), codes are exactly 4.00 bits: a 4-bit scale index saves ~5.5% of bytes but costs ~0.5-1 instruction per word on an issue-bound consumer.
+
+## Load-path floor and dequant alternatives (v54d / v55 notes)
+
+v54d stream bench (no compute, cold L2, hit experts' W13 + W2): 1D cp.async.bulk units >= 16 KB reach 4.29-4.36 TB/s (d32, 538 MB: 123-125 us) and 4.39-4.43 (v16, 793 MB: 179-181 us) at any depth 3-8 and 1 or 2 CTAs/SM; 2D TMA boxes 16-64 KB 3.96-4.02 (about 8% less); a single producer thread with 2-4 KB units 1.0-2.0 (issue-bound on one thread: not the gk / g1 shape, where 16 warps each run their own ring). wx's NOCOMP (no dequant, no mma) is within ~4% of the 1D floor (M32 129 vs 124, M128 185 vs 179): its load path is fine; the gap is consumer issue / energy. v55d adds the 16-warp small-unit shape (16w: 2.3-9.2 KB units, 1-4 in flight per warp) to answer whether gk's load pattern itself loses bandwidth, and the wx consumers' SM clock.
+
+Dequant alternatives:
+- Block scale into the activations: impossible (the scale is per output row x 16-K block; activations are per K). Into the accumulator: needs the k16 steps aligned to blocks and 4 FFMA per mma per n-tile (N / 2 per wgmma thread), and the per-register multiply is still needed for the e2m1 exponent bias: placed e2m1 bits are only an affine image of the value for normal codes (the 0 / 0.5 codes break any OR-in exponent bias), and the 15 distinct values {0, +-0.5, ..., +-6} are not an affine image of any 4-bit index (span 24 half-steps > 16), so no magic-number integer trick either. HMUL2 x 4 per word (bias + block scale in one multiply) is the minimum.
+- PRMT LUT: a 3-bit magnitude selects a byte of an 8-byte table in two registers; bf16 needs a high byte and a low byte per value (2 tables), then interleaving into bf16x2 (1 PRMT per register), sign bits merged (1 LOP3 per register) and the block scale still multiplied (HMUL2 per register): ~17-18 per 8 weights vs 15 now. Marlin's fp4 -> bf16 (mask, shift, merge with the sign: ~3 per register) lands at the same ~11-12 integer ops plus the scale multiply.
+- Moving dequant to the producer warp(s): the same instructions issue from the same 4 schedulers; it only adds warps, and gk NW 20 showed more warps lowering the clock (1497 vs ~1650 MHz) under the power cap. Expected neutral unless the consumers are latency-bound rather than issue / power bound (v55d's wx clock line checks this for wx).
+
+## What the 2.62 leader implies, and formulations below ~17 instructions per word (v55d notes)
+
+v55d: 16-warp rings of 2.2-9 KB units stream at 4.21-4.35 TB/s (gk's load shape is fine); wx consumers run at 1755-1771 MHz (not power-throttled). Our consumers sit at ~75% of the stream rate everywhere at ~22 instructions per weight word.
+
+Floors at 4.35 TB/s (d1 17, d16 79, d32 124, v1 54, v16 179, v32 161 us) against SGLang (79.5, 192.9, 205.6, 141.7, 476.8, 635.2) give a floor geomean of ~2.84. The leader's 2.62 is ~92% of that, i.e. roughly every load at ~92% of the stream floor: about d1 18.5, d16 86, d32 135, v1 59, v16 195, v32 175 us (we: 30.0, 118, 163, 81, 233, 273). Some compute-heavy load could be slower only if others sit at the floor; there is no slack for a 75% load.
+
+Issue arithmetic at 1.77 GHz: 22 instructions per word on 4 schedulers is ~6.1 TB/s at 100% issue efficiency; we reach ~3.3-3.6, i.e. ~55-60% of issue capacity, not pipe-bound (ALU-pipe bound ~7 TB/s) and not memory-bound. More warps (gk NW 20, r1 c16) did not raise it.
+
+Candidates for < ~17 per word:
+- fp16 instead of bf16 MMA: the dequant cost is identical (the 11-op placement and the per-register multiply are the same for fp16 targets; brute force gives 11 for both), and converting activations away from bf16 conflicts with "Activations BF16 wherever SGLang keeps BF16" (Marlin keeps bf16). No gain.
+- Producer-side dequant into smem + SS wgmma: total instructions do not drop (same 15 dequant + an STS per 2 words + proxy fence / barrier), and smem traffic becomes write 2 B + tensor read 2 B per weight = ~7x the HBM bytes: at 4.3 TB/s that is ~130 B/clk/SM, the whole smem bandwidth. Not viable.
+- 2 CTAs/SM: same instruction count, more warps; equivalent to the NW 20 / c16 experiments (no gain).
+- No lossless re-encoding, LUT (PRMT) or accumulator-scale formulation found below 15 integer + multiply ops per word (see the sections above).
+So the remaining gap is issue efficiency (scheduling / dependency stalls at ~22 per word), not instruction count or bytes; closing it needs per-instruction stall data (ncu) we do not have on the judge GPU.
