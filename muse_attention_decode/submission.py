@@ -1727,12 +1727,16 @@ template <int NL, int X>
 __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   constexpr int RS = PRS;
   constexpr bool FS = X & 4, L2H = X & 64, MRG = true, BAL = X & 256, PCV = X & 128, ACV = X & 1024, PEX = X & 2048,
-                 SSI = (X & 8192) && !(X & 256), PFP = X & 16384, EQ = X & 32768;  // EQ: query / own-key rows loaded before the CTA barrier  // PFP (sliding): L2-prefetch the likely window's page table first  // SSI (full layers): splits over the page table's capacity, so the producer's
+                 SSI = (X & 8192) && !(X & 256), PFP = X & 16384, EQ = X & 32768,
+                 NOSR = X & 65536, CFM = X & 131072, EINC = X & 262144;  // EINC: consumer setmaxnreg.inc right after the barrier (v58)  // NOSR: no setmaxnreg (launch-bound registers); CFM: closed-form split map  // EQ: query / own-key rows loaded before the CTA barrier  // PFP (sliding): L2-prefetch the likely window's page table first  // SSI (full layers): splits over the page table's capacity, so the producer's
                                                   // page-table loads do not wait for seq; lanes past the context idle  // PEX: 1/4 of the fast-path exps on the FMA pipe  // ACV: V e4m3 -> f16 on the ALU
   auto cv = [&](uint32_t w, bool hi) -> uint32_t { return AP_NOCVT ? w : (ACV ? e2h_alu(w, hi) : e2h(hi ? w >> 16 : w)); };
   const float vsc_ = f.vscale * (ACV ? 256.f : 1.f);
   // PCV: the producer also converts V to f16 (and places the block's own keys), so the consumers' step is wait, QK, softmax, PV
   constexpr uint32_t LS = RS * 16384 + 8192 + 32768 + 2048 + (PCV ? 2048 : 0);  // per lane: ring, Q, V f16 (2 heads x 2), page table, own rows
+#ifdef PROF
+  const long long ck_e = clock64(); const unsigned long long gt_e = gtm2();
+#endif
   PS(0);
   const int wg = threadIdx.x >> 7;
   const bool prod = wg == 2 * NL;
@@ -1743,13 +1747,34 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     const int lane_ = threadIdx.x & 31, G = gridDim.x * NL, gl = blockIdx.x * NL + LN;
     int kb_ = 0;
     if (lane_ < a.B) { const int sq = a.seq[lane_]; kb_ = sq + 8 - (a.window ? max(0, sq - a.window + 1) : 0); }
-    const int K = __reduce_add_sync(0xffffffffu, kb_), mxk = __reduce_max_sync(0xffffffffu, kb_);
-    int lo = max((K + G - 1) / G, (mxk + a.nsplit - 1) / a.nsplit), hi = max(lo, mxk);
-    while (lo < hi) {
-      const int c = (lo + hi) >> 1;
-      if ((int)__reduce_add_sync(0xffffffffu, lane_ < a.B ? (kb_ + c - 1) / c : 0) <= G) hi = c; else lo = c + 1;
+    const int K = max(1, (int)__reduce_add_sync(0xffffffffu, kb_)), mxk = __reduce_max_sync(0xffffffffu, kb_);
+    int nl;
+    if constexpr (CFM) {  // closed form: 1 + floor(keys (G - B) / K) splits each (sum <= G, leftover <= B lanes), then one more
+      // split each for the `left` requests with the most keys per split (rank by exact 64-bit cross products, ties by index);
+      // simulated on 2000 agentic batches (B 16 / 32): the same largest chunk as the exact search, without its ~9 halvings
+      nl = lane_ < a.B ? min(a.nsplit, 1 + (int)(((unsigned long long)kb_ * (unsigned)max(0, G - a.B)) / (unsigned)K)) : 0;
+      const int left = G - (int)__reduce_add_sync(0xffffffffu, nl);
+      int rk = 0;
+#pragma unroll 4
+      for (int j = 0; j < 32; j++) {
+        const int kj = __shfl_sync(0xffffffffu, kb_, j), nj = __shfl_sync(0xffffffffu, nl, j);
+        if (j < a.B && lane_ < a.B) {
+          const unsigned long long lhs = (unsigned long long)kj * (unsigned)nl, rhs = (unsigned long long)kb_ * (unsigned)nj;
+          rk += lhs > rhs || (lhs == rhs && j < lane_);
+        }
+      }
+      if (lane_ < a.B && rk < left && nl < a.nsplit) nl += 1;
+    } else {
+      // smallest chunk c with sum ceil(keys / c) <= G: it lies in [K / G, K / (G - B)] (sum ceil(k / c) <= K / c + B, so the upper
+      // end is feasible): ~9 halvings instead of ~17, the same map
+      int lo = max((K + G - 1) / G, (mxk + a.nsplit - 1) / a.nsplit);
+      int hi = G > a.B ? max(lo, (K + G - a.B - 1) / (G - a.B)) : max(lo, mxk);
+      while (lo < hi) {
+        const int c = (lo + hi) >> 1;
+        if ((int)__reduce_add_sync(0xffffffffu, lane_ < a.B ? (kb_ + c - 1) / c : 0) <= G) hi = c; else lo = c + 1;
+      }
+      nl = lane_ < a.B ? (kb_ + lo - 1) / lo : 0;
     }
-    const int nl = lane_ < a.B ? (kb_ + lo - 1) / lo : 0;
     int pre = nl;
 #pragma unroll
     for (int o2 = 1; o2 < 32; o2 <<= 1) { const int v2 = __shfl_up_sync(0xffffffffu, pre, o2); if (lane_ >= o2) pre += v2; }
@@ -1809,10 +1834,20 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     }
   }
 #ifdef PROF
+  const long long ck_b0 = clock64(); const unsigned long long gt_b0 = gtm2();
   unsigned long long st4[4] = {0, 0, 0, 0};  // prologue sub-stamps (producer: start, seq landed, page table landed, first KV issued;
                                             // consumer: start, query tile written, own keys done, first step's data)
 #endif
   __syncthreads();
+#ifdef PROF
+  const long long ck_b1 = clock64(); const unsigned long long gt_b1 = gtm2();
+  // entry -> before the barrier -> after it -> after setmaxnreg (role 0 consumer tid 0, role 1 producer thread 0 of the lane)
+  auto prolog_rec = [&](int role, unsigned long long gts) {
+    unsigned long long* q = f.prof + 65536 + 4096 + ((blockIdx.x * NL + LN) * 2 + role) * 8;
+    const long long cks = clock64();
+    q[0] = gt_e; q[1] = gt_b0; q[2] = gt_b1; q[3] = gts; q[4] = ck_b0 - ck_e; q[5] = ck_b1 - ck_b0; q[6] = cks - ck_b1; q[7] = 1;
+  };
+#endif
   const int nk = seq + t0 + lt;
   const int k0 = SSI ? 0 : (a.window ? max(0, seq + t0 - a.window + 1) : 0), span = SSI ? a.maxp * a.ps : nk - k0;
   const int ks = k0 + (int)((long long)span * sp / nsp), ke0 = k0 + (int)((long long)span * (sp + 1) / nsp);
@@ -1820,7 +1855,7 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   const int nb = max(0, (ke - ks + 63) >> 6);
   if (prod) {
 #if HAS_WG
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
+    if (!NOSR) asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
 #endif
     const int pt = threadIdx.x & 63;
     if ((NL == 1 && (threadIdx.x & 127) >= 64) || spare) return;
@@ -1829,6 +1864,7 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
 #endif
 #ifdef PROF
     st4[0] = gtm2();
+    if (f.prof && pt == 0) prolog_rec(1, st4[0]);
     { int sq_; asm volatile("mov.b32 %0, %1;" : "=r"(sq_) : "r"(seq)); st4[1] = gtm2() + (sq_ & 0x80000000 ? 1 : 0); }
 #endif
     const int* ptb = a.pt + (size_t)b * a.maxp;
@@ -1968,13 +2004,14 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     return;
   }
 #if HAS_WG
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 112;\n" ::: "memory");
+  if (EINC && !NOSR) asm volatile("setmaxnreg.inc.sync.aligned.u32 112;\n" ::: "memory");
 #endif
   if (spare) return;
   const int tid = threadIdx.x - 256 * LN, wt = tid & 127, h = tid >> 7, w = wt >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wbar = 9 + wg;
 #ifdef PROF
   st4[0] = gtm2();
+  if (f.prof && tid == 0) prolog_rec(0, st4[0]);
 #endif
   // query rows: row qr_ (token qr_ >> 3, q head 8 h + (qr_ & 7)), half wt & 1: RMSNorm, RoPE at seq + token, E4M3
   {
@@ -2069,6 +2106,9 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
   fence_async();
   asm volatile("bar.sync %0, 128;\n" :: "r"(wbar) : "memory");
   PS(2);
+#if HAS_WG
+  if (!EINC && !NOSR) asm volatile("setmaxnreg.inc.sync.aligned.u32 112;\n" ::: "memory");  // late: after the query prologue
+#endif
 #if AW_MS
   const uint64_t dOnes = (uint64_t)((ones & 0x3FFFF) >> 4) | ((uint64_t)(128 >> 4) << 16) | ((uint64_t)(256 >> 4) << 32);
   float lacc[4];
@@ -2382,6 +2422,15 @@ __global__ void __launch_bounds__(128 * (2 * NL + 1), 1) attnp(A a, WF f) {
     if (tid == 0 && atomicAdd(f.cnt + nbq + bq, 1) == nmg - 1) { f.cnt[bq] = 0; f.cnt[nbq + bq] = 0; }
   }
 }
+__global__ void gtres_k(unsigned long long* o) {  // globaltimer step sizes (ns) and the clock64 cycles between steps
+  unsigned long long p, t; long long c = clock64(), c2;
+  asm volatile("mov.u64 %0, %globaltimer;" : "=l"(p));
+  for (int n = 0; n < 16;) {
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    if (t != p) { c2 = clock64(); o[2 * n] = t - p; o[2 * n + 1] = (unsigned long long)(c2 - c); p = t; c = c2; n++; }
+  }
+}
+void gt_res(torch::Tensor o) { gtres_k<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>((unsigned long long*)o.data_ptr()); }
 template <int NL, int X>
 static void apf(int g, int smw, cudaStream_t st, const A& a, const WF& f) {
   static bool o = false;
@@ -2389,10 +2438,15 @@ static void apf(int g, int smw, cudaStream_t st, const A& a, const WF& f) {
   attnp<NL, X><<<g, 128 * (2 * NL + 1), smw, st>>>(a, f);
 }
 static void ap_x(int nl, int x, int g, int smw, cudaStream_t st, const A& a, const WF& f) {
-  if (nl == 1) { if (x & 32768) apf<1, 32836>(g, smw, st, a, f); else if (x & 8192) apf<1, 8260>(g, smw, st, a, f); else if (x & 2048) apf<1, 2372>(g, smw, st, a, f); else if (x & 1024) apf<1, 1348>(g, smw, st, a, f); else if (x & 128) apf<1, 452>(g, smw, st, a, f); else if (x & 256) apf<1, 324>(g, smw, st, a, f); else if (x & 64) apf<1, 68>(g, smw, st, a, f); else apf<1, 4>(g, smw, st, a, f); return; }
+  if (nl == 1) { if (x & 131072) apf<1, 131396>(g, smw, st, a, f); else if (x & 32768) apf<1, 32836>(g, smw, st, a, f); else if (x & 8192) apf<1, 8260>(g, smw, st, a, f); else if (x & 2048) apf<1, 2372>(g, smw, st, a, f); else if (x & 1024) apf<1, 1348>(g, smw, st, a, f); else if (x & 128) apf<1, 452>(g, smw, st, a, f); else if (x & 256) apf<1, 324>(g, smw, st, a, f); else if (x & 64) apf<1, 68>(g, smw, st, a, f); else apf<1, 4>(g, smw, st, a, f); return; }
   switch (x) {
     case 8260: apf<2, 8260>(g, smw, st, a, f); break;
     case 32836: apf<2, 32836>(g, smw, st, a, f); break;
+    case 98372: apf<2, 98372>(g, smw, st, a, f); break;
+    case 65604: apf<2, 65604>(g, smw, st, a, f); break;
+    case 131396: apf<2, 131396>(g, smw, st, a, f); break;
+    case 294980: apf<2, 294980>(g, smw, st, a, f); break;
+    case 262212: apf<2, 262212>(g, smw, st, a, f); break;
     case 16452: apf<2, 16452>(g, smw, st, a, f); break;
     case 8196: apf<2, 8196>(g, smw, st, a, f); break;
     case 1348: apf<2, 1348>(g, smw, st, a, f); break;
@@ -4553,9 +4607,9 @@ _NSDIV = 128
 VDEF = (-1, 256, 8, 32, 0, 1)
 # v48 x39 bits: 64 L2::128B prefetch hint on the K/V row copies (each warpgroup copies only its head's 64 B half of a 128 B
 # row, so without it DRAM sees 64 B gathers), 256 full-layer splits balanced over the batch's total keys (grid = resident CTAs)
-VCFG = {(1, True): (-1, 128, 8, 1 << 30, 8, 1), (1, False): (-2, 304, 128, 1 << 30, 68, 1),  # v1f: attnp, 264 lanes, 128 grouped mergers  # (new-kernel V 7/14/15 trip ptxas 12.9 here)
-        (16, True): (-2, 128, 8, 1 << 30, 32836, 1), (32, True): (-2, 256, 8, 1 << 30, 32836, 1),  # x 32768: early query loads
-        (16, False): (-2, 256, 8, 1 << 30, 324, 1), (32, False): (-2, 256, 8, 1 << 30, 324, 1)}
+VCFG = {(1, True): (-1, 128, 8, 1 << 30, 8, 1), (1, False): (-2, 304, 128, 1 << 30, 262212, 1),  # v1f: early consumer setmaxnreg.inc  # v1f: attnp, 264 lanes, 128 grouped mergers  # (new-kernel V 7/14/15 trip ptxas 12.9 here)
+        (16, True): (-2, 128, 16, 1 << 30, 32836, 1), (32, True): (-2, 256, 8, 1 << 30, 32836, 1),  # v16s: 16 grouped mergers  # x 32768: early query loads
+        (16, False): (-2, 256, 8, 1 << 30, 131396, 1), (32, False): (-2, 256, 8, 1 << 30, 131396, 1)}  # closed-form ranked split map
 # v51: x39 256 on attnp = lanes balanced over the batch's total keys on all SMs (full layers), 128 = producer converts V
 # var -2: attnp (warp-specialized: producer warpgroup + 2 split lanes x 2 consumer warpgroups per CTA, setmaxnreg 32 / 112),
 # x39 bits there: 4 fast softmax, 64 L2::128B hint
@@ -4599,9 +4653,9 @@ def _ext():
     global _mod
     if _mod is None:
         rb, rb2, rb3, rbf = (8, 6, 20, 5) if _big() else (4, 3, 8, 2)
-        _mod = load_inline("attn_v56_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
-                           cpp_sources="void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,torch::Tensor,int64_t);",
-                           cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
+        _mod = load_inline("attn_v60_%d" % rb + "".join(_DBG).replace("-", "_").replace("=", ""),
+                           cpp_sources="void gt_res(torch::Tensor); void prep_only(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,torch::Tensor); void run_fdec(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t); void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,double,double,double,double,int64_t,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,torch::Tensor,int64_t);",
+                           cuda_sources=CUDA, functions=["run", "run_fdec", "prep_only", "gt_res"], extra_cuda_cflags=["-O3", "-lineinfo", "-DRB=%d" % rb, "-DRB2=%d" % rb2, "-DRB3=%d" % rb3, "-DRBF=%d" % rbf] + _DBG + _gencode(), verbose=False)
     return _mod
 
 
@@ -4693,7 +4747,7 @@ def kernel_fn(data):
     qkv = data["qkv"]
     dev = qkv.device
     dac = (DAOVR if DAOVR is not None else DACFG.get((B, bool(cfg["window"])))) if L == 1 else None
-    if dac and hq == 16 and hkv == 2 and cfg["page_size"] == 1:  # decode on wgmma (attnd): keys as M, both kv heads
+    if dac and _hopper() and hq == 16 and hkv == 2 and cfg["page_size"] == 1:  # decode on wgmma (attnd, sm_90 only): keys as M
         kps, x39 = dac
         maxkeys = data["page_table"].shape[1]
         span = min(maxkeys, cfg["window"] + 1) if cfg["window"] else maxkeys
