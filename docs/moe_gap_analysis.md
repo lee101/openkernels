@@ -130,3 +130,27 @@ What to build, in order:
 1. A wgmma RS expert GEMM for M >= 8, with gathered x in smem, N per expert up to 128, and dequant warpgroups feeding A registers. Validate the layouts with bench/wgt.py first.
 2. A decode1 path: W2 L2 prefetch during W13, split-K x in registers, and a single last-arriver combine.
 3. A 5-bit scale pack in prepare (lossless check plus fallback), shared by both paths.
+
+## Instructions per weight word (v51 analysis)
+
+v51d: gk consumers issue at ~0.67-0.71 of 4 slots/clk at M8/M16 (0.62 at M32) and 1.5-1.7 GHz; more warps (NW 20) only lowered the clock (1497 MHz), more accumulator chains (ACCN 4) tied, r1 with 16 consumer warps lost. The consumers are near the practical issue ceiling, so time per byte = instructions per byte / (issue rate x clock).
+
+One word = 32 bits of codes = 8 weights (4.5 bytes with scales). sm_90a SASS of the gk piece loop (two pieces per slot, per 32 words): LOP3 200, IMAD.SHL 114, SHF 55, HMUL2 128, HMMA 32, LDS 31, IMAD 29, LEA 22, PRMT 16, IADD3 11, BRA 11, VIADD 9, ISETP 8, uniform/misc 12 = 22.0 per word:
+
+| part | per word | what |
+|---|---|---|
+| bit placement | 11 | 6 LOP3 + 5 shifts (3.6 as IMAD.SHL on the FMA pipe, 1.4 SHF): a0 = q & M (1), a2 = (q << 6) & M (2), a1 / a3 = ((q << s1) & M1) \| ((q >> or << s2) & M2) (4 each) |
+| scale apply | 4 | HMUL2 (bf16x2 fma with -0): applies the block scale and fixes the e2m1 exponent bias, subnormal codes included |
+| mma | 1 | HMMA m16n8k16 |
+| scale prep | 1 | per 64-K chunk and row pair: PRMT (replicate the e4m3 byte) + LEA (<< 4, + bias) for sA and sB = 4 per 4 words |
+| smem loads | 1.0 | codes 0.25, scales 0.03, activation B 0.5 (gk; g1 keeps B in registers), rest addressing |
+| loop / slot / issue / reduction | ~3 | IMAD / LEA / IADD3 / ISETP / BRA addressing, mbarrier wait + TMA issue per slot, group reduction per tile slice |
+
+What a lossless repack could remove:
+- Bit placement: a brute force over every per-half layout (any shift or rotation per sign / magnitude field, bf16 targets {15, 8:6} and fp16 targets {15, 11:9}) gives 11 integer ops per word as the minimum: three single-shift fields fit a 16-bit half ({0, 3, 6}), the fourth then has no 3 contiguous free bits, so two fields need a two-part merge. Storing signs apart from magnitudes costs the same merge. Byte-permute tables (20-24) and LUT GEMV (>= 2 per weight) are worse.
+- HMUL2: needed for every block. Only 14.5% of the generator's block scales are exact powers of two (mantissa 0), and even for those an integer exponent add is wrong for the subnormal codes (0, +-0.5), so the multiply cannot be dropped; the per-row / per-expert global scale is already applied once in the epilogue (0 per word).
+- Scale prep: the e4m3 byte must become a replicated bf16 pair with the scale's exponent moved by 4 bits; byte permutes move whole bytes, so a shift (or LEA) per register remains. Pre-expanded 16-bit scales would remove it (-1 per word) but add 11% of bytes. Pairing two blocks into one A register (K permutation) turns 4 ops per 4 words into ~4 per 8 at best (-0.5), with a permuted activation staging.
+- Loop / slot / issue overhead (~3): halves with two-piece slots (measured: gk PPS 2 at M1 3.03 TB/s at 1305 MHz vs PPS 1 3.12 at 1475 MHz: no gain), 4-piece slots need 2x ring smem (only M <= 2 fits).
+- Activation B loads (0.5, gk): registers instead of smem need a 256-K slice per warp (16-way reductions per tile, the g1 shape), which g1 already is (no faster at M1).
+
+Best layout estimate: 16 (core) + ~0.5 (paired scale prep) + ~0.8 (loads) + ~1.5 (overhead) = ~18.8 per word vs 22.0 now: -14.5%, below the 15% bar, and its largest part (slot overhead) already failed to convert to speed in PPS 2. Not built. The scale entropy is 3.71 bits (31 distinct values, top 16 cover 98.7%), codes are exactly 4.00 bits: a 4-bit scale index saves ~5.5% of bytes but costs ~0.5-1 instruction per word on an issue-bound consumer.
