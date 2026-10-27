@@ -148,3 +148,60 @@ Design: `w4g` in `glue_pf2.py`, used by the pf14 "w4" MoE path.
   - At 16K it removes the 0.52-0.69 ms dequant.
 - **Diagnostics:** pf14diag times each piece in prepare() (gnorm, w4g W13, W2, comb; ring and big for reference) on the scored profiles and
   prints per-tile-class rates.
+
+## 6. In-situ budget (judge profiles, 2026-10-27)
+
+Sources: `muse_prefill_layer/profiles/submission_pf15diag.418dafadc0964972.{json,log}` (best layer so far, ring at T753, hybrid at T3012,
+big at 16K; judge 1.3759) and `submission_pf16diag.9a834dd81c9d4903.*` (w4k2 picked at T753; judge 1.3204). Script: scratch
+`pfx/budget.py`.
+- Components are the profile kernels scaled to the timed median: MoE = ring / w4g / grouped GEMM / deq3 / gnorm / swiglu / comb / rmsg2;
+  attn = FA3 + combine + qkprep + epilogue + gather; dense = nvjet GEMMs (qkv, o, pooler, unpooler); router = route2 + the [hi|lo] split-K
+  GEMM on the side stream (inflated by overlap in the full shapes); resid = resa + resb; other = unlisted.
+- SGLang MoE is our prepare() timing of SGLang's Marlin path on the scored count profiles. SGLang FA3 is our prepare() timing of the paged
+  FA3 call the baseline makes. SGLang's dense GEMMs are the same cuBLAS calls as ours.
+
+pf15diag (µs):
+
+| load / shape | w | SGLang | ours | MoE ours / SGLang | attn ours / SGLang | dense | router | resid | other |
+|---|---|---|---|---|---|---|---|---|---|
+| turn 1: B1 ctx80K sliding L753 | 46 | 1058 | 835 | 514 / 737 | 44 / 35 | 197 | 28 | 45 | 7 |
+| turn 1: B1 ctx80K full L753 | 16 | 1481 | 1244 | 504 / 737 | 409 / 426 | 194 | 86 | 43 | 8 |
+| turn 4: B4 ctx80K sliding L753 | 46 | 3353 | 2401 | 1243 / 2214 | 59 / 66 | 821 | 0 | 160 | 117 |
+| turn 4: B4 ctx80K full L753 | 16 | 4830 | 3892 | 1248 / 2214 | 1522 / 1624 | 806 | 0 | 157 | 160 |
+| first: B1 ctx0 full L16384 | 16 | 19868 | 12049 | 5975 / ? | 853 / ~853 | 4104 | 0 | 831 | 286 |
+| first: B1 ctx32K sliding L16384 | 138 | 16946 | 10507 | 5073 / ? | 285 / 306 | 4088 | 0 | 803 | 258 |
+| first: B1 ctx32K full L16384 | 16 | 21767 | 14951 | 5501 / ? | 4235 / 4467 | 4124 | 0 | 824 | 268 |
+| first: B1 ctx64K full L16384 | 16 | 25298 | 18368 | 5086 / ? | 7858 / ~7858 | 4254 | 0 | 845 | 326 |
+
+Per load (weighted):
+
+| load | SGLang ms | ours ms | speedup | MoE | attn | dense | router | resid | other | cut needed for x1.70 | MoE-only cut per shape |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| turn 1 | 72.3 | 58.3 | 1.240 | 54% | 15% | 21% | 5% | 5% | 1% | -15.8 ms (27%) | -255 µs (MoE 512 -> 257) |
+| turn 4 | 231.5 | 172.7 | 1.340 | 45% | 16% | 29% | 0% | 6% | 5% | -36.5 ms (21%) | -589 µs (1244 -> 655, below the 839 floor at 650 TF) |
+| first turn | 3409.5 | 2175.9 | 1.567 | 44% | 11% | 35% | 0% | 7% | 2% | -170 ms (8%) | -915 µs (5189 -> 4274, below the 4646 floor) |
+
+Where we stand against SGLang per component:
+- **MoE** is the only component we beat by a lot: 1.43x at T753 (514 vs 737) and 1.78x at T3012 (1243 vs 2214).
+- **FA3** is 1.04-1.08x (contiguous KV, splits).
+- **Dense** is equal: the same cuBLAS calls at ~750-830 TFLOP/s.
+- **Glue:** SGLang's remainder (total - MoE - FA3 - dense) is ~90 µs at T753 and ~250 µs at T3012. Ours (router + resid + other) is
+  ~80 and ~280.
+
+What the numbers say:
+- **Turn 1:** x1.70 by MoE alone needs T753 MoE ~257 µs. That is 1.22x the 650-TF floor (210) and ~2x faster than either the ring (514)
+  or the current w4 path in situ (556-610).
+- **Turn 4 and first turn:** cannot reach x1.70 through the MoE alone. Even a floor-speed MoE leaves them at ~1.50 and ~1.62.
+- **Leader at 1.70:** must therefore be ahead on several components at once. At turn sizes that means MoE near the floor, plus dense /
+  router / glue overlap or fusion, plus probably a faster prefill attention.
+- **Realistic ceiling** with what we have in hand: a w4g at ~550-600 TF on the big tiles, plus per-expert N so remainders cost little.
+  That gives T753 MoE ~290 µs and T3012 ~1230 µs, i.e. turn 1 ~1.62, turn 4 ~1.42, first turn 1.57: **gm ~1.53**. A 1.3x prefill
+  attention adds ~3% on turn 1 / turn 4; glue and resid at floor add another ~3%.
+
+Tuner bias (prepare vs layer, ring at T753):
+- Prepare `qa`: 597 (pf14), 553 (pf15), 656 (pf16).
+- In layer `moe_kernel`: 520 (pf12), 521 (pf13), 507 / 523 (pf15).
+- w4 path in pf16: prepare 607, in layer 556-610.
+- So the prepare tune over-reads the ring by 30-130 µs with ±50 µs noise, and it picked w4k2 at T753 where the layer loses ~50-100 µs.
+- `qa` is the first candidate timed at each T (it is also the reference), straight after the LT / compile phase. Clocks are ramping, and
+  inputs are cold from the read-only L2 flush, while in the layer the MoE inputs were just written by pooler / routing.
