@@ -1251,8 +1251,8 @@ template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) 
     const uint64_t db = gdesc(bbase0 + slot * C::BT);                                                                                \
     PT(c_b);                                                                                                                         \
     wg_fence();                                                                                                                      \
-    wgm<NT>(acc, s0[0], db, (K), scr);                                                                                               \
-    wgm<NT>(acc, s0[1], db + 2, 1, scr);                                                                                             \
+    wgm<NW>(acc, s0[0], db, (K), scr);                                                                                               \
+    wgm<NW>(acc, s0[1], db + 2, 1, scr);                                                                                             \
     wg_commit();                                                                                                                     \
     if (K) {                                                                                                                         \
       wg_wait<1>();                                                                                                                  \
@@ -1262,8 +1262,8 @@ template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) 
     dq_half(k2, k3, ky, s1);                                                                                                         \
     PT(c_d);                                                                                                                         \
     wg_fence();                                                                                                                      \
-    wgm<NT>(acc, s1[0], db + 4, 1, scr);                                                                                             \
-    wgm<NT>(acc, s1[1], db + 6, 1, scr);                                                                                             \
+    wgm<NW>(acc, s1[0], db + 4, 1, scr);                                                                                             \
+    wgm<NW>(acc, s1[1], db + 6, 1, scr);                                                                                             \
     wg_commit();                                                                                                                     \
     wg_wait<1>();                                                                                                                    \
     PT(c_e);                                                                                                                         \
@@ -1280,11 +1280,11 @@ template <int NS> __device__ __forceinline__ uint32_t rdy(Sm<NS>* sm, int slot) 
     PADD(pc, 4, 1);                                                                                                                  \
   }
 
-template <int NT, int NCW, int MC>
+template <int NT, int NCW, int MC, int NW = NT>
 __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint32_t bbase0, uint32_t sbase0, int q, const Hdr h, int wi,
                                       int tid, Pc& pc, float* scr) {
   using C = Cfg<NT, NCW>;
-  float acc[NT / 2];
+  float acc[NW / 2];
   uint32_t s0[2][4], s1[2][4];
   const int lt = tid & 127, w = lt >> 5, lane = tid & 31;
   const int woff = (wi * 4 + w) * 768;
@@ -1305,7 +1305,7 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
   if (p.swiglu) {
     __nv_bfloat162* ob = (__nv_bfloat162*)(p.out + ((size_t)h.kh * p.rows + h.row0 + 2 * t4) * p.nout + ((h.rb * C::BM + wi * 64 + 16 * w) >> 1) + (g & 6));
 #pragma unroll
-    for (int j = 0; j < NT / 8; j++)
+    for (int j = 0; j < NW / 8; j++)
 #pragma unroll
       for (int e2 = 0; e2 < 2; e2++) {
         const float gt = acc[4 * j + e2] * gs, up = acc[4 * j + 2 + e2] * gs;
@@ -1318,7 +1318,7 @@ __device__ __forceinline__ void ctile(const P& p, Sm<Cfg<NT, NCW>::NS>* sm, uint
     const int f0 = h.rb * C::BM + wi * 64 + 16 * w + g;
     const float gw0 = p.ss ? p.gw[f0] : 0.f, gw1 = p.ss ? p.gw[f0 + 8] : 0.f;
 #pragma unroll
-    for (int j = 0; j < NT / 8; j++)
+    for (int j = 0; j < NW / 8; j++)
 #pragma unroll
       for (int e2 = 0; e2 < 2; e2++) {
         const float v0 = acc[4 * j + e2] * gs, v1 = acc[4 * j + 2 + e2] * gs;
@@ -1505,7 +1505,14 @@ __global__ void __launch_bounds__(Cfg<NT, NCW>::NTHR, Cfg<NT, NCW>::MINB) w4g_k(
       PWAIT(pc.v[0], rdy<NS>(sm, slot), (q / NS) & 1);
       const Hdr h = sm->hdr[slot];
       if (h.tile < 0 || *(volatile int*)&g_w4err) break;
-      ctile<NT, NCW, MC>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+      // remainder tiles (<= 32 tokens): the narrowest wgmma that covers them (RS n32 costs about as much tensor time as n64)
+      if constexpr (NT == 32) {
+        if (h.ntok <= 8) ctile<NT, NCW, MC, 8>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+        else if (h.ntok <= 16) ctile<NT, NCW, MC, 16>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+        else ctile<NT, NCW, MC>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+      } else {
+        ctile<NT, NCW, MC>(p, sm, bbase0, sbase0, q, h, wi, tid, pc, scr);
+      }
       q += h.nks;
     }
 #ifdef W4PROF
@@ -1620,7 +1627,7 @@ int64_t w4g_smem() { return (int64_t)(smem_need<BNMAX, 4>() * 1000000 + smem_nee
 
 def _w4g_wgm():
     out = []
-    for N in (32, 64, 128, 256):
+    for N in (8, 16, 32, 64, 128, 256):
         n = N // 2
         regs = ",".join(f"%{i}" for i in range(n))
         cons = ", ".join(f'"+f"(d[{i}])' for i in range(n))
@@ -1645,7 +1652,7 @@ def _w4g(prof=False):
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v16" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v17" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, torch::Tensor, torch::Tensor); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl();",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err", "w4g_ncl"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -1889,7 +1896,7 @@ W4 = True  # fused NVFP4 wgmma grouped GEMM (w4g) paths "w4" / "h4", timed in pr
 W4MODES = (0, 1, 2)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster variants: no win, built only with -DW4MC=1)
 MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf26diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf27diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
