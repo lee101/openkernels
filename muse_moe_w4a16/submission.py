@@ -1,5 +1,5 @@
 # okc: problem=muse_moe_w4a16
-"""v43: wx with one ring of 4-chunk group slots (activation tiles loaded 4 chunks at a time, like the weights) and a 16-consumer-warp variant (4 warpgroups x 1 m64 block, 256-row units). v42: v41 with split weight / activation rings (4-chunk weight TMA slots, deeper weight stream) and an RPW 2 candidate (256-row units). v41: v37 + one-pass-per-expert wgmma RS expert GEMM (CUDA_X "wx": 128-row units over all of an expert's tokens, N <= 256, 64-K chunk slots of TMA weights + gathered pre-swizzled activations, CUTLASS-order RS pipeline) as a tuned candidate for M >= 32. v37: v36 + MT2 only for CTAs whose segments all have <= 8 tokens, cost weights 30/45/76 from H200 per-granule data, phase-A issue cursor without per-stage divisions, branch-free B prefetch. v36: v35 + MT2 (two W13 tiles per warp share activation loads) + wait/class diagnostics. v35: v34 + last-arriver combine option (LASTA: no grid barrier). v34: v30 + fused split-K path (fs) for M <= 32: each CTA owns ~1 32-column inter granule per active expert,
+"""v45: v44 + "g1" decode path for M <= 2 (CUDA_G): every warp owns one 256-K slice of every weight row of its CTA (activation slice in registers, one 16-way smem reduction per tile), W13 over a contiguous tile range of all local experts -> inter in global -> grid barrier (the ring keeps streaming W2) -> W2 by output row tiles over all experts with full K (no fp32 atomics) -> per-route sum-of-squares exchange -> norm + combine of the CTA's rows. Tune on 3 judge-generator routings per bucket, f1s3 restored. v44: v43 + wx with N in steps of 8 (N8STEP: less padded tensor work), wx offered from M8, wait-fraction counters (WSTAT) in the diag. v43: wx with one ring of 4-chunk group slots (activation tiles loaded 4 chunks at a time, like the weights) and a 16-consumer-warp variant (4 warpgroups x 1 m64 block, 256-row units). v42: v41 with split weight / activation rings (4-chunk weight TMA slots, deeper weight stream) and an RPW 2 candidate (256-row units). v41: v37 + one-pass-per-expert wgmma RS expert GEMM (CUDA_X "wx": 128-row units over all of an expert's tokens, N <= 256, 64-K chunk slots of TMA weights + gathered pre-swizzled activations, CUTLASS-order RS pipeline) as a tuned candidate for M >= 32. v37: v36 + MT2 only for CTAs whose segments all have <= 8 tokens, cost weights 30/45/76 from H200 per-granule data, phase-A issue cursor without per-stage divisions, branch-free B prefetch. v36: v35 + MT2 (two W13 tiles per warp share activation loads) + wait/class diagnostics. v35: v34 + last-arriver combine option (LASTA: no grid barrier). v34: v30 + fused split-K path (fs) for M <= 32: each CTA owns ~1 32-column inter granule per active expert,
 streams its W13 rows and the matching W2 column slice back to back (no W13->W2 grid dependency, no tile queue), fp32 red into
 a self-cleaning accumulator, one grid barrier, per-token norm + combine. v30: per-M choice (autotuned in prepare on the judge GPU) between v28 and the ring path below with K split 1-8 and
 lookahead-1 queue fetch. v29: M <= MBIG runs v28 (v17 per-warp rings, rotation-free dequant) on the v22 weight layout; M > MBIG runs CUDA_L (v22
@@ -1947,7 +1947,7 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 
 _modF = {}
 FS_MAX = 32  # fused split-K path for M <= FS_MAX (tokens per expert <= 32: one pass, NT <= 4)
-FS_CFG = ((0, 3, "-DMT2 -DLASTA -DSMREQ=196"), (0, 3, "-DMT2 -DSMREQ=196"))  # (forced W13 K split or 0 = auto, ring depth cap, extra defines)
+FS_CFG = ((0, 3, "-DMT2 -DLASTA -DSMREQ=196"), (0, 3, "-DMT2 -DSMREQ=196"), (1, 3, ""))  # (forced W13 K split or 0 = auto, ring depth cap, extra defines)
 DIAGF = False  # prepare(): print the fused path per-CTA phase timeline (PROF build) for a few M
 
 
@@ -1956,7 +1956,7 @@ def _extF(ksf=0, smax=3, extra=""):
     if k not in _modF:
         wpc = 16 if _big() else 8
         fl = ([] if "-DWPC=" in extra else ["-DWPC=%d" % wpc]) + ["-DSMAX=%d" % smax] + (["-DKSF=%d" % ksf] if ksf else []) + extra.replace("+", " ").split() + [d for d in _DBG if not d.startswith("-DCFG=")]
-        _modF[k] = load_inline("moe_w4a16_v43F" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modF[k] = load_inline("moe_w4a16_v45F" + "".join(fl).replace("-", "_").replace("=", ""),
                                cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                cuda_sources=CUDA_F, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
     return _modF[k]
@@ -2001,6 +2001,453 @@ def _fs(data, state, cfg):
     _extF(*cfg[1:]).moe(x, ids, tw, state["w1"], state["w2f"], state["g1"], state["g2"], state["nw"], state["yacc"],
                               state["ctrF"], out, data["config"]["local_start"], state["profF"])
     return out
+
+
+CUDA_G = r"""#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+// v45 "g1": decode GEMV for M <= 2 (<= 2 tokens per expert). Every warp owns one 256-K slice of every weight row the
+// CTA touches, so the activation slice lives in registers and nothing is split per round across warps except a final
+// 16-way smem reduction. W13: the CTA's contiguous range of 16-row tiles over all local experts -> SwiGLU -> inter
+// (global). Grid barrier (the ring keeps streaming W2 meanwhile). W2: the CTA's contiguous range of 16-row tiles of the
+// output, for every local expert, full K (W2 in the same 16-row tile / 256-K half-stage layout as W13) -> y rows in smem, per-route sum of squares -> grid barrier -> norm + combine
+// of the CTA's rows. No atomics on y, no accumulator to clean.
+#define HD 4096
+#define NLOC 32
+#define STG 4608
+#define PC 2304
+#define NW 16
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define SMALLSM 1  // sm_80/86 emulation: 99 KB of smem per block
+#endif
+#ifndef SG
+#ifdef SMALLSM
+#define SG 1
+#else
+#define SG 2   // ring slots per warp (2 x 16 x 4.5 KB = 147 KB in flight per SM)
+#endif
+#endif
+#ifndef RT
+#ifdef SMALLSM
+#define RT 2
+#else
+#define RT 8   // pieces per reduction round
+#endif
+#endif
+#define MAXR 16
+#define MAXRT 4
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TMA 1
+#else
+#define TMA 0
+#endif
+
+struct P {
+  const uint8_t* w1; const uint8_t* w2; const float* g1; const float* g2; const __nv_bfloat16* x; const int* ids;
+  const float* tw; const float* nw; __nv_bfloat16* inter; float* ssp; __nv_bfloat16* out; int* ctr; int M, lo, smem;
+  unsigned long long* prof;
+};
+struct Sm {
+  int act[NLOC], aoff[NLOC + 1];
+  int na, nr, t0, n13, r0, nrt, n2, ns13, ns2, target, stage;
+  int rexp[MAXR], rid[MAXR]; float coef[MAXR];
+};
+
+__device__ __forceinline__ uint4 lds(uint32_t a) { uint4 v; asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(a)); return v; }
+__device__ __forceinline__ uint2 lds64(uint32_t a) { uint2 v; asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "r"(a)); return v; }
+__device__ __forceinline__ uint32_t lds16(uint32_t a) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];\n" : "=h"(v) : "r"(a)); return v; }
+__device__ __forceinline__ void cp16(uint32_t s, const void* g) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(g) : "memory"); }
+__device__ __forceinline__ uint32_t bmul(uint32_t a, uint32_t b) { uint32_t d; asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(0x80008000u)); return d; }
+__device__ __forceinline__ uint32_t sc2(uint32_t w, uint32_t sel) { return __byte_perm(w, 0, sel) * 16u + 0x77007700u; }
+__device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#ifdef NOMMA
+  c[0] += __uint_as_float(a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1);
+#else
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+__device__ __forceinline__ int ldacq(const int* p) { int v; asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory"); return v; }
+__device__ __forceinline__ void mb_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(b), "r"(n)); }
+__device__ __forceinline__ void mb_wait(uint32_t bar, uint32_t ph) {
+#if TMA
+  asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W;\n}\n" :: "r"(bar), "r"(ph) : "memory");
+#else
+  asm volatile("{\n.reg .pred p;\nW: mbarrier.test_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W;\n}\n" :: "r"(bar), "r"(ph) : "memory");
+#endif
+}
+#ifdef PROF
+__device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
+#define PST(k) do { if (threadIdx.x == 0 && p.prof) p.prof[blockIdx.x * 16 + (k)] = gtime(); } while (0)
+#else
+#define PST(k)
+#endif
+#ifdef DQHI
+#define SHR5(q) __umulhi((q), 1u << 27)
+#else
+#define SHR5(q) ((q) >> 5)
+#endif
+// dequant one word of 8 e2m1 codes into an m16n8k16 A fragment (scale pair sA rows g, sB rows g + 8)
+#define DQ(q, sA, sB, a0, a1, a2, a3) \
+  const uint32_t a0 = bmul((q) & 0x81C081C0u, sA); \
+  const uint32_t a1 = bmul((((q) << 3) & 0x01C001C0u) | (((q) << 1) & 0x80008000u), sB); \
+  const uint32_t a2 = bmul(((q) << 6) & 0x81C081C0u, sA); \
+  const uint32_t a3 = bmul(((SHR5(q)) & 0x01C001C0u) | (((q) << 5) & 0x80008000u), sB);
+
+// one 2304 B piece: 16 rows x this warp's 256-K slice (4 x 64-K chunks; lane t holds 16 contiguous K per chunk = one
+// NVFP4 block, so one scale byte pair per chunk). B: the activation slice in mma B-fragment order.
+__device__ __forceinline__ void piece(uint32_t pb, int lane, const uint4 (&B)[4][2], float (&acc)[2][4]) {
+  const uint2 sh = lds64(pb + 2048 + lane * 8);
+#pragma unroll
+  for (int c = 0; c < 4; c++) {
+    const uint4 w = lds(pb + c * 512 + lane * 16);
+    const uint32_t sw = c < 2 ? sh.x : sh.y;
+    const uint32_t sA = sc2(sw, (c & 1) ? 0x4242 : 0x4040), sB = sc2(sw, (c & 1) ? 0x4343 : 0x4141);
+    const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      DQ(ww[j], sA, sB, a0, a1, a2, a3)
+      const uint32_t* bb = (const uint32_t*)&B[c][j >> 1];
+      mma(acc[j & 1], a0, a1, a2, a3, bb[(j & 1) * 2], bb[(j & 1) * 2 + 1]);
+    }
+  }
+}
+
+struct Ring {
+  const P* p; Sm* sm; uint32_t ring, bars; int lane, wid; unsigned long long wns;
+  // piece sequence of this warp: W13 slots (2 tiles' 256-K slices each), then W2 slots (2 (expert, row tile) slices)
+  __device__ __forceinline__ void copy(uint32_t dst, uint32_t bar, const uint8_t* src) {
+#if TMA
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" :: "r"(dst), "l"(src), "n"(PC), "r"(bar) : "memory");
+#else
+    for (int k = lane; k < PC / 16; k += 32) cp16(dst + k * 16, src + k * 16);
+#endif
+  }
+  __device__ __forceinline__ void issue(int q) {
+    const int ns13 = sm->ns13;
+    if (q >= ns13 + sm->ns2) return;
+    const uint32_t slot = q % SG, dst = ring + slot * STG, bar = bars + slot * 8;
+    const uint8_t* s0; const uint8_t* s1 = nullptr;
+    if (q < ns13) {
+      const int tt = sm->t0 + 2 * q, k = wid * PC;
+      s0 = p->w1 + ((size_t)(p->lo + sm->act[tt >> 9]) * 512 + (tt & 511)) * 8 * STG + k;
+      if (2 * q + 1 < sm->n13) s1 = p->w1 + ((size_t)(p->lo + sm->act[(tt + 1) >> 9]) * 512 + ((tt + 1) & 511)) * 8 * STG + k;
+    } else {
+      const int j = 2 * (q - ns13), nrt = sm->nrt;
+      int a = j / nrt, rt = sm->r0 + j - a * nrt;
+      s0 = p->w2 + (((size_t)(p->lo + sm->act[a]) * 256 + rt) * 16 + wid) * PC;
+      if (j + 1 < sm->n2) { if (++rt == sm->r0 + nrt) { rt = sm->r0; a++; } s1 = p->w2 + (((size_t)(p->lo + sm->act[a]) * 256 + rt) * 16 + wid) * PC; }
+    }
+#ifdef NOLOAD  // diag: consumers run on stale ring contents (compute-only rate)
+#if TMA
+    if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(bar) : "memory");
+#else
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(bar) : "memory");
+#endif
+    return;
+#endif
+#if TMA
+    if (lane == 0) {
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(s1 ? 2 * PC : PC) : "memory");
+      copy(dst, bar, s0);
+      if (s1) copy(dst + PC, bar, s1);
+    }
+#else
+    copy(dst, bar, s0);
+    if (s1) copy(dst + PC, bar, s1);
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" :: "r"(bar) : "memory");
+#endif
+  }
+  __device__ __forceinline__ uint32_t acquire(int q) {
+    const int slot = q % SG;
+#ifdef PROF
+    const unsigned long long w0 = gtime();
+#endif
+    mb_wait(bars + slot * 8, (q / SG) & 1);
+    __syncwarp();
+#ifdef PROF
+    wns += gtime() - w0;
+#endif
+    return ring + slot * STG;
+  }
+  __device__ __forceinline__ void release(int q) { __syncwarp(); issue(q + SG); }
+};
+
+__global__ void __launch_bounds__(NW * 32, 1) moe_g(P p) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, g = lane >> 2, t = lane & 3, R = p.M * 8, G = gridDim.x;
+  const uint32_t sb = (uint32_t)__cvta_generic_to_shared(smem);
+  Sm* sm = (Sm*)(smem + NW * SG * 8);
+  const int xo = (NW * SG * 8 + (int)sizeof(Sm) + 127) & ~127;
+  __nv_bfloat16* xs = (__nv_bfloat16*)(smem + xo);
+  float4* red = (float4*)(smem + xo + p.M * HD * 2);
+  float* yb = (float*)(smem + xo + p.M * HD * 2 + RT * NW * 8 * 16);
+  const int ro = (xo + p.M * HD * 2 + RT * NW * 8 * 16 + MAXR * MAXRT * 16 * 4 + 127) & ~127;
+  const int io = ro + NW * SG * STG;
+  PST(0);
+  if (lane < SG) mb_init(sb + (wid * SG + lane) * 8, TMA ? 1 : 32);
+#if TMA
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+#endif
+  if (wid == 0) {  // routing in one warp (R <= 16 routes): experts ascending, routes of an expert in route order
+    int e = -1;
+    if (lane < R) { const unsigned u = p.ids[lane] - p.lo; e = u < NLOC ? (int)u : -1; }
+    const unsigned am = __reduce_or_sync(0xffffffffu, e >= 0 ? 1u << e : 0u);
+    const int na = __popc(am), nr = __popc(__ballot_sync(0xffffffffu, e >= 0));
+    int k = 0;
+    for (int j = 0; j < R; j++) { const int ej = __shfl_sync(0xffffffffu, e, j); k += ej >= 0 && ej < e; }
+    const unsigned peers = __match_any_sync(0xffffffffu, e);
+    const int rank = __popc(peers & ((1u << lane) - 1));
+    if (e >= 0) {
+      const int a = __popc(am & ((1u << e) - 1)), r = k + rank;
+      sm->rid[r] = lane; sm->rexp[r] = a;
+      if (rank == 0) { sm->act[a] = e; sm->aoff[a] = k; }
+    }
+    if (lane == 0) {
+    sm->aoff[na] = nr; sm->na = na; sm->nr = nr;
+    const int T13 = na * 512, b = blockIdx.x;
+    sm->t0 = (int)((long long)b * T13 / G); sm->n13 = (int)((long long)(b + 1) * T13 / G) - sm->t0;
+    sm->r0 = b * 256 / G; sm->nrt = (b + 1) * 256 / G - sm->r0;
+    sm->n2 = na * sm->nrt; sm->ns13 = (sm->n13 + 1) / 2; sm->ns2 = (sm->n2 + 1) / 2;
+    sm->stage = io + nr * HD * 2 <= p.smem;
+    if (sm->nrt > MAXRT || io > p.smem) asm volatile("trap;");
+    }
+  }
+  __syncthreads();
+  Ring C; C.p = &p; C.sm = sm; C.lane = lane; C.wid = wid; C.wns = 0;
+  C.ring = sb + ro + wid * SG * STG; C.bars = sb + wid * SG * 8;
+#pragma unroll
+  for (int i = 0; i < SG; i++) C.issue(i);
+  PST(1);
+  const int na = sm->na, nr = sm->nr, n13 = sm->n13, n2 = sm->n2, ns13 = sm->ns13;
+  for (int i = tid; i < p.M * HD / 8; i += NW * 32) ((uint4*)xs)[i] = ((const uint4*)p.x)[i];
+  __syncthreads();
+  int q = 0;
+  if (na) {
+    // ---- W13: warp slice K [256 wid, +256); B (activation) fragments in registers, reloaded per expert
+    uint4 B[4][2];
+    int curA = -1;
+    for (int rd = 0; rd * RT < n13; rd++) {
+      const int pend = min(n13, (rd + 1) * RT);
+      for (; 2 * q < pend; q++) {
+        const uint32_t sbase = C.acquire(q);
+#pragma unroll
+        for (int pp = 0; pp < 2; pp++) {
+          const int pc = 2 * q + pp;
+          if (pc < n13) {
+            const int a = (sm->t0 + pc) >> 9;
+            if (a != curA) {
+              curA = a;
+              const int T = sm->aoff[a + 1] - sm->aoff[a];
+              const int row = g < T ? (sm->rid[sm->aoff[a] + g] >> 3) : -1;
+#pragma unroll
+              for (int c = 0; c < 4; c++)
+#pragma unroll
+                for (int h = 0; h < 2; h++)
+                  B[c][h] = row >= 0 ? ((const uint4*)(xs + row * HD + wid * 256 + c * 64 + t * 16))[h] : make_uint4(0, 0, 0, 0);
+            }
+            float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+            piece(sbase + pp * PC, lane, B, acc);
+            if (t == 0) red[((pc - rd * RT) * NW + wid) * 8 + g] = make_float4(acc[0][0] + acc[1][0], acc[0][1] + acc[1][1], acc[0][2] + acc[1][2], acc[0][3] + acc[1][3]);
+          }
+        }
+        C.release(q);
+      }
+      __syncthreads();
+      if (tid < (pend - rd * RT) * 8) {
+        const int rp = tid >> 3, gg = tid & 7;
+        float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int w = 0; w < NW; w++) { const float4 v = red[(rp * NW + w) * 8 + gg]; s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w; }
+        const int tt = sm->t0 + rd * RT + rp, a = tt >> 9, col = (tt & 511) * 8 + gg, T = sm->aoff[a + 1] - sm->aoff[a];
+        const float gs = p.g1[p.lo + sm->act[a]];
+#pragma unroll
+        for (int n = 0; n < 2; n++)
+          if (n < T) {
+            const float gt = (n ? s.y : s.x) * gs, up = (n ? s.w : s.z) * gs;
+            p.inter[(size_t)(sm->aoff[a] + n) * HD + col] = __float2bfloat16(gt / (1.f + __expf(-gt)) * up);
+          }
+        __threadfence();
+      }
+      __syncthreads();
+    }
+    PST(2);
+#ifdef PROF
+    if (lane == 0 && p.prof) atomicAdd(p.prof + blockIdx.x * 16 + 8, C.wns);
+    C.wns = 0;
+#endif
+    // ---- grid barrier 1: every tile of inter is written (the ring is already streaming W2)
+    if (tid == 0) {
+      int old;
+      asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;\n" : "=r"(old) : "l"(p.ctr) : "memory");
+      const int target = (old / G + 1) * G;
+      while (ldacq(p.ctr) < target) __nanosleep(20);
+    }
+    __syncthreads();
+    PST(3);
+    const __nv_bfloat16* ib = p.inter;
+    if (sm->stage) {
+      __nv_bfloat16* is = (__nv_bfloat16*)(smem + io);
+      for (int i = tid; i < nr * HD / 8; i += NW * 32) ((uint4*)is)[i] = __ldcg((const uint4*)p.inter + i);
+      __syncthreads();
+      ib = is;
+    }
+    // ---- W2: warp slice K [256 wid, +256) of (expert, 16-row tile) units
+    uint4 B2[4][2];
+    int curB = -1;
+    for (int rd = 0; rd * RT < n2; rd++) {
+      const int pend = min(n2, (rd + 1) * RT);
+      for (; 2 * (q - ns13) < pend; q++) {
+        const uint32_t sbase = C.acquire(q);
+#pragma unroll
+        for (int pp = 0; pp < 2; pp++) {
+          const int j = 2 * (q - ns13) + pp;
+          if (j < n2) {
+            const int a = j / sm->nrt;
+            if (a != curB) {
+              curB = a;
+              const int T = sm->aoff[a + 1] - sm->aoff[a];
+              const uint4* src = (const uint4*)(ib + (size_t)(sm->aoff[a] + (g < T ? g : 0)) * HD + wid * 256 + t * 16);
+#pragma unroll
+              for (int c = 0; c < 4; c++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) B2[c][h] = g < T ? (sm->stage ? src[c * 8 + h] : __ldcg(src + c * 8 + h)) : make_uint4(0, 0, 0, 0);
+            }
+            float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+            piece(sbase + pp * PC, lane, B2, acc);
+            if (t == 0) red[((j - rd * RT) * NW + wid) * 8 + g] = make_float4(acc[0][0] + acc[1][0], acc[0][1] + acc[1][1], acc[0][2] + acc[1][2], acc[0][3] + acc[1][3]);
+          }
+        }
+        C.release(q);
+      }
+      __syncthreads();
+      if (tid < (pend - rd * RT) * 8) {
+        const int rp = tid >> 3, gg = tid & 7, j = rd * RT + rp, a = j / sm->nrt, rtl = j - a * sm->nrt, T = sm->aoff[a + 1] - sm->aoff[a];
+        float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int w = 0; w < NW; w++) { const float4 v = red[(rp * NW + w) * 8 + gg]; s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w; }
+        float* y0 = yb + (sm->aoff[a]) * (MAXRT * 16) + rtl * 16 + gg;
+        y0[0] = s.x; y0[8] = s.z;
+        if (T > 1) { y0[MAXRT * 16] = s.y; y0[MAXRT * 16 + 8] = s.w; }
+      }
+      __syncthreads();
+    }
+    PST(4);
+#ifdef PROF
+    if (lane == 0 && p.prof) atomicAdd(p.prof + blockIdx.x * 16 + 9, C.wns);
+#endif
+    // ---- per-route partial sum of squares over this CTA's rows
+    const int nrows = sm->nrt * 16, row0 = sm->r0 * 16;
+    if (wid < nr) {
+      float ss = 0.f;
+      for (int r = lane; r < nrows; r += 32) { const float v = yb[wid * MAXRT * 16 + r] * p.nw[row0 + r]; ss += v * v; }
+#pragma unroll
+      for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+      if (lane == 0) p.ssp[blockIdx.x * MAXR + wid] = ss;
+      __threadfence();
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int old;
+      asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;\n" : "=r"(old) : "l"(p.ctr) : "memory");
+      const int target = (old / G + 1) * G;
+      while (ldacq(p.ctr) < target) __nanosleep(20);
+    }
+    __syncthreads();
+    PST(5);
+    if (wid < nr) {
+      float s = 0.f;
+      for (int c = lane; c < G; c += 32) s += __ldcg(p.ssp + c * MAXR + wid);
+#pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+      const float gs = p.g2[p.lo + sm->act[sm->rexp[wid]]];
+      if (lane == 0) sm->coef[wid] = p.tw[sm->rid[wid]] * gs * rsqrtf(s * gs * gs * (1.f / HD) + 1e-8f);
+    }
+    __syncthreads();
+  }
+  // ---- combine this CTA's output rows
+  {
+    const int nrows = sm->nrt * 16, row0 = sm->r0 * 16;
+    for (int i = tid; i < p.M * nrows; i += NW * 32) {
+      const int tk = i / nrows, r = i - tk * nrows;
+      float o = 0.f;
+      for (int k = 0; k < nr; k++) if ((sm->rid[k] >> 3) == tk) o += sm->coef[k] * yb[k * MAXRT * 16 + r];
+      p.out[(size_t)tk * HD + row0 + r] = __float2bfloat16(o * p.nw[row0 + r]);
+    }
+  }
+  PST(6);
+}
+
+static int g_gridG = 0, g_smemG = 0;
+void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1, torch::Tensor w2, torch::Tensor g1, torch::Tensor g2,
+         torch::Tensor nw, torch::Tensor inter, torch::Tensor ssp, torch::Tensor ctr, torch::Tensor out, int64_t lo, torch::Tensor prof) {
+  if (!g_gridG) {
+    int dev; cudaGetDevice(&dev); int mx; cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    int sms; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaFuncSetAttribute(moe_g, cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
+    g_smemG = mx; g_gridG = sms;
+  }
+  P p{w1.data_ptr<uint8_t>(), w2.data_ptr<uint8_t>(), g1.data_ptr<float>(), g2.data_ptr<float>(), (const __nv_bfloat16*)x.data_ptr(),
+      ids.data_ptr<int>(), tw.data_ptr<float>(), nw.data_ptr<float>(), (__nv_bfloat16*)inter.data_ptr(), ssp.data_ptr<float>(),
+      (__nv_bfloat16*)out.data_ptr(), ctr.data_ptr<int>(), (int)x.size(0), (int)lo, g_smemG,
+      prof.numel() ? (unsigned long long*)prof.data_ptr() : nullptr};
+  moe_g<<<g_gridG, NW * 32, g_smemG, at::cuda::getCurrentCUDAStream()>>>(p);
+}
+"""
+_modG = {}
+GS_MAX = 2       # g1 for M <= GS_MAX (<= 2 tokens per expert)
+G_CFG = ("", "-DDQHI")  # extra defines per g1 candidate (DQHI: the >> 5 of the dequant as IMAD.HI on the FMA pipe)
+DIAGG = False    # prepare(): g1 per-CTA timeline (PROF build) + bytes-in-flight estimate + per-load timing at M1
+
+
+def _extG(extra=""):
+    if extra not in _modG:
+        fl = extra.replace("+", " ").split() + [d for d in _DBG if not d.startswith("-DCFG=")]
+        _modG[extra] = load_inline("moe_w4a16_v45G" + "".join(fl).replace("-", "_").replace("=", ""),
+                                   cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
+                                   cuda_sources=CUDA_G, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
+    return _modG[extra]
+
+
+def _g1(data, state, cfg, prof=None):
+    x = data["hidden_states"].contiguous()
+    ids = data["topk_ids"].to(torch.int32).contiguous()
+    tw = data["topk_weights"].float().contiguous()
+    out = torch.empty_like(x)
+    ex = cfg[3] if len(cfg) > 3 else ""
+    _extG(ex).moe(x, ids, tw, state["w1"], state["w2"], state["g1"], state["g2"], state["nw"], state["interG"], state["sspG"],
+                  state["ctrG"], out, data["config"]["local_start"], state["prof"][:0] if prof is None else prof)
+    return out
+
+
+def _diagG(state):
+    """g1 at M1/M2 on judge-generator routings: per-CTA timeline (us from the first CTA start), consumer wait fractions,
+    achieved stream rates and the ring's bytes in flight against what the HBM latency needs"""
+    dev = state["w1"].device
+    flush = torch.empty(2 ** 27, device=dev); sink = torch.empty((), device=dev)
+    G = torch.cuda.get_device_properties(dev).multi_processor_count
+    prof = torch.zeros(G * 16, dtype=torch.int64, device=dev)
+    for M in (1, 2):
+        for sd in range(3):
+            data = _synth(M, 900 + 7 * sd + M, dev)
+            ids = data["topk_ids"]; na = int(torch.unique(ids[ids < 32]).numel())
+            ev = []
+            for _ in range(3):
+                e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+                prof.zero_(); sink.copy_(flush.sum()); e0.record(); _g1(data, state, ("g1", 0, 0, "-DPROF"), prof); e1.record()
+                torch.cuda.synchronize(); ev.append(e0.elapsed_time(e1) * 1e3)
+            P = prof.view(-1, 16).cpu().double(); t0 = P[:, 0].min()
+            q = lambda k, f: float((P[:, k] - t0).quantile(f)) / 1e3
+            d13 = (P[:, 2] - P[:, 1]).clamp(min=1); d2 = (P[:, 4] - P[:, 3]).clamp(min=1)
+            wA = float((P[:, 8] / (16 * d13)).median()); wB = float((P[:, 9] / (16 * d2)).median())
+            b13 = na * 512 * 36864 / G; b2 = na * 256 * 36864 / G
+            r13 = b13 / float(d13.median()); r2 = b2 / float(d2.median())  # bytes per ns per SM = GB/s per SM
+            cap = 16 * 2 * 4608 / 1024
+            print(f"GD M{M} na {na} evt {ev[-1]:.1f}: pro {q(1, .5):.1f}/{q(1, 1):.1f} W13 {q(2, .5):.1f}/{q(2, 1):.1f} bar1 {q(3, 1):.1f} W2 {q(4, .5):.1f}/{q(4, 1):.1f} "
+                  f"bar2 {q(5, 1):.1f} end {q(6, 1):.1f} | waitA {wA:.2f} waitB {wB:.2f} | W13 {r13 * G / 1e3:.2f} TB/s W2 {r2 * G / 1e3:.2f} TB/s | "
+                  f"ring {cap:.0f} KB/SM in flight, need {3.9e3 / G * 1.5:.0f} KB/SM at 3.9 TB/s x 1.5 us; Little latency at W13 rate {cap * 1024 / r13 / 1e3:.1f} us", flush=True)
 
 
 CUDA_X = r"""#include <torch/extension.h>
@@ -2172,6 +2619,24 @@ template <> __device__ __forceinline__ void fence_acc<256>(float* d) {
   for (int i = 0; i < 128; i++) asm volatile("" : "+f"(d[i]) :: "memory");
 }
 
+template <> __device__ __forceinline__ void wg_rs<24>(float* d, const uint32_t* a, uint64_t db, int sd) {
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %17, 0;\nwgmma.mma_async.sync.aligned.m64n24k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, {%12,%13,%14,%15}, %16, p, 1, 1, 0;\n}\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(sd));
+}
+template <> __device__ __forceinline__ void fence_acc<24>(float* d) {
+#pragma unroll
+  for (int i = 0; i < 12; i++) asm volatile("" : "+f"(d[i]) :: "memory");
+}
+template <> __device__ __forceinline__ void wg_rs<48>(float* d, const uint32_t* a, uint64_t db, int sd) {
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %29, 0;\nwgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23}, {%24,%25,%26,%27}, %28, p, 1, 1, 0;\n}\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(sd));
+}
+template <> __device__ __forceinline__ void fence_acc<48>(float* d) {
+#pragma unroll
+  for (int i = 0; i < 24; i++) asm volatile("" : "+f"(d[i]) :: "memory");
+}
 #else
 // sm_80/86 emulation: each warp runs mma.sync for its 16 rows on the same swizzled B tile
 __device__ __forceinline__ uint64_t gdesc(uint32_t saddr) { return saddr; }
@@ -2267,9 +2732,15 @@ __device__ __forceinline__ void epilogue(const P& p, const Sm* sm, const uint16_
 // FG: the unit's first slot (scale-d 0 on its first step, nothing to release).
 template <int N, bool FG>
 __device__ __forceinline__ void group(float (&acc)[RPW][N / 2], uint32_t (&A)[RPW][4][4], uint64_t (&db)[4], int& qs, int& ps_,
-                                      uint32_t sbase, uint32_t full, uint32_t empty, int wid, int lane) {
+                                      uint32_t sbase, uint32_t full, uint32_t empty, int wid, int lane, long long& wcy) {
   const int s = qs % NSL;
+#ifdef WSTAT
+  const long long w0 = clock64();
+#endif
   mbwait(full + s * 8, (qs / NSL) & 1);
+#ifdef WSTAT
+  wcy += clock64() - w0;
+#endif
   qs++;
   const uint32_t sb = sbase + s * GSB;
 #pragma unroll
@@ -2319,7 +2790,7 @@ __device__ __forceinline__ void group(float (&acc)[RPW][N / 2], uint32_t (&A)[RP
 
 template <int N>
 __device__ __forceinline__ void unit(const P& p, const Sm* sm, const uint16_t* list, uint32_t sbase, uint32_t full, uint32_t empty,
-                                     int& qs, int wid, int lane, const Hdr& h0) {
+                                     int& qs, int wid, int lane, const Hdr& h0, long long& wcy) {
   float acc[RPW][N / 2];
   uint32_t A[RPW][4][4];
   uint64_t db[4] = {0, 0, 0, 0};
@@ -2330,9 +2801,9 @@ __device__ __forceinline__ void unit(const P& p, const Sm* sm, const uint16_t* l
 #pragma unroll
     for (int i = 0; i < N / 2; i++) acc[r][i] = 0.f;
 #endif
-  group<N, true>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane);
+  group<N, true>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane, wcy);
 #pragma unroll 1
-  for (int c4 = 1; c4 < NCH / WCH; c4++) group<N, false>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane);
+  for (int c4 = 1; c4 < NCH / WCH; c4++) group<N, false>(acc, A, db, qs, ps_, sbase, full, empty, wid, lane, wcy);
   wg_wait<0>();
 #pragma unroll
   for (int r = 0; r < RPW; r++) fence_acc<N>(acc[r]);
@@ -2433,10 +2904,18 @@ __global__ void __launch_bounds__(NTH, 1) moe_x(P p) {
   PSET(1, gtime());
 #endif
   const int ntot = sm->ntot;
+  long long wcy = 0;  // consumer slot-wait cycles (WSTAT)
+#ifdef WSTAT
+  const long long ct0 = clock64();
+#endif
   if (wid == NCW) {  // producer warp
     u = __shfl_sync(0xffffffffu, u, 0);
     unsigned depok = 0;
     int sq = 0;
+#ifdef WSTAT
+    long long pw = 0;
+    const long long pt0 = clock64();
+#endif
     for (; u < ntot;) {
       int g, e, rb, ps; decode(sm, u, g, e, rb, ps);
       const int ntok = min(TPX, sm->cnt[e] - ps * TPX), rows = (ntok + 7) & ~7;
@@ -2454,7 +2933,13 @@ __global__ void __launch_bounds__(NTH, 1) moe_x(P p) {
       if (lane == 0) nx = atomicAdd(p.ctr + C_Q, 1);
       for (int c = 0; c < NCH; c += WCH, sq++) {
         const int s = sq % NSL;
+#ifdef WSTAT
+        const long long w0 = clock64();
+#endif
         if (sq >= NSL) mbwait(empty + s * 8, ((sq / NSL) - 1) & 1);
+#ifdef WSTAT
+        pw += clock64() - w0;
+#endif
         if (lane == 0) { sm->hdr[s] = Hdr{g, e, rb, ps, c, ntok, (c == 0 ? 1 : 0) | ((!g && rb == 0) ? 4 : 0), 0}; __threadfence_block(); }
         const uint32_t dst = sbase + s * GSB, fb = full + s * 8;
 #if TMA
@@ -2486,6 +2971,9 @@ __global__ void __launch_bounds__(NTH, 1) moe_x(P p) {
       }
       u = __shfl_sync(0xffffffffu, nx, 0);
     }
+#ifdef WSTAT
+    if (lane == 0 && p.prof) { atomicAdd(p.prof + 2, (unsigned long long)pw); atomicAdd(p.prof + 3, (unsigned long long)(clock64() - pt0)); }
+#endif
     const int s = sq % NSL;
     if (sq >= NSL) mbwait(empty + s * 8, ((sq / NSL) - 1) & 1);
     if (lane == 0) sm->hdr[s].g = -1;
@@ -2506,17 +2994,27 @@ __global__ void __launch_bounds__(NTH, 1) moe_x(P p) {
       if (h.g < 0) break;
       if ((h.flags & 4) && wid == 0) for (int i = lane; i < h.ntok; i += 32) p.ss[list[sm->off[h.e] + h.ps * TPX + i]] = 0.f;
       const int n8 = (h.ntok + 7) >> 3;
-      if (n8 <= 1) unit<8>(p, sm, list, sbase, full, empty, qs, wid, lane, h);
-      else if (n8 <= 2) unit<16>(p, sm, list, sbase, full, empty, qs, wid, lane, h);
-      else if (n8 <= 4) unit<32>(p, sm, list, sbase, full, empty, qs, wid, lane, h);
-      else if (n8 <= 8) { if constexpr (TPX >= 64) unit<64>(p, sm, list, sbase, full, empty, qs, wid, lane, h); }
-      else if (n8 <= 16) { if constexpr (TPX >= 128) unit<128>(p, sm, list, sbase, full, empty, qs, wid, lane, h); }
-      else { if constexpr (TPX >= 256) unit<256>(p, sm, list, sbase, full, empty, qs, wid, lane, h); }
+#define U_(n) unit<n>(p, sm, list, sbase, full, empty, qs, wid, lane, h, wcy)
+      if (n8 <= 1) U_(8);
+      else if (n8 <= 2) U_(16);
+#ifdef N8STEP
+      else if (n8 <= 3) U_(24);
+      else if (n8 <= 4) U_(32);
+      else if (n8 <= 6) { if constexpr (TPX >= 64) U_(48); }
+#else
+      else if (n8 <= 4) U_(32);
+#endif
+      else if (n8 <= 8) { if constexpr (TPX >= 64) U_(64); }
+      else if (n8 <= 16) { if constexpr (TPX >= 128) U_(128); }
+      else { if constexpr (TPX >= 256) U_(256); }
     }
 #ifdef PROF
     PSET(2, gtime());
 #endif
   }
+#ifdef WSTAT
+  if (wid < NCW && lane == 0 && p.prof) { atomicAdd(p.prof + 0, (unsigned long long)wcy); atomicAdd(p.prof + 1, (unsigned long long)(clock64() - ct0)); }
+#endif
   const int nw2 = sm->nw2;
   if (lane == 0) while (ldacq(p.ctr + C_W2) < nw2) __nanosleep(32);
   __syncwarp();
@@ -2582,9 +3080,9 @@ void moe(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Tensor w1,
 
 # ---- v41: one-pass-per-expert wgmma RS expert GEMM (CUDA_X) --------------------------------------------------------
 _modX = {}
-WX_CFG = (("-DRPW=2",), ("-DNCW=16",))  # 256-row units, N <= 64: 2 warpgroups x 2 m64 blocks, or 4 warpgroups x 1 (4 warps / scheduler)
-WX_ABL = ("-DNOCOMP", "-DNOMMA")  # diag (NCW 16): stream only / dequant without mma
-WX_MIN = 16     # smallest M bucket that tries it (hot experts need >= 16 tokens for the one-pass dequant to pay)
+WX_CFG = (("-DRPW=2",), ("-DNCW=16",), ("-DNCW=16", "-DN8STEP"))  # 256-row units, N <= 64: 2 warpgroups x 2 m64 blocks, or 4 warpgroups x 1 (4 warps / scheduler)
+WX_ABL = ("-DNOCOMP", "-DNOMMA", "-DWSTAT")  # diag (NCW 16): stream only / dequant without mma / wait-cycle counters
+WX_MIN = 8      # smallest M bucket that tries it (hot experts need >= 16 tokens for the one-pass dequant to pay)
 DIAGW = False   # prepare(): per-load timing of the wx path against the best other candidate + M256 ablations
 
 
@@ -2597,7 +3095,7 @@ def _extX(extra=()):
     if key not in _modX:
         dfl = [] if _big() else ["-DTPX=16", "-DNSL=2"]
         fl = dfl + list(_DBG) + list(extra)
-        _modX[key] = load_inline("moe_w4a16_v43X" + "".join(fl).replace("-", "_").replace("=", ""),
+        _modX[key] = load_inline("moe_w4a16_v45X" + "".join(fl).replace("-", "_").replace("=", ""),
                                  cpp_sources="void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);",
                                  cuda_sources=CUDA_X, functions=["moe"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + _sm90a() + fl, verbose=False)
     return _modX[key]
@@ -2624,7 +3122,7 @@ def _wx(data, state, extra=()):
     ss = torch.empty((M * 8,), dtype=torch.float32, device=x.device)
     out = torch.empty_like(x)
     _extX(extra).moe(x, ids, tw, state["w1x"], state["w2x"], state["g1"], state["g2"], state["nw"], xg, ig, y, ss, state["ctrX"],
-                     out, data["config"]["local_start"], state["prof"])
+                     out, data["config"]["local_start"], state.get("profW", state["prof"]))
     return out
 
 
@@ -2652,14 +3150,25 @@ def _diagW(state):
         b = next((m for m in TUNE_M if m >= M), TUNE_M[-1])
         base = alt.get(b, tb.get(b, _default(M)))
         vs = [("wx", 0, 0, " ".join(c)) if c else ("wx", 0, 0) for c in WX_CFG]
-        if M in (32, 128, 256): vs += [("wx", 0, 0, " ".join(("-DNCW=16",) + tuple(x.split()))) for x in WX_ABL]
+        if M in (32, 128, 256): vs += [("wx", 0, 0, " ".join(("-DNCW=16",) + tuple(x.split()))) for x in WX_ABL if x != "-DWSTAT"]
         acc = {c: [] for c in [base] + vs}
         for sd in range(3):
             data = _synth(M, 5000 + 31 * sd + M, dev)
             for c in acc:
                 try: acc[c].append(tm(c, data))
                 except Exception as ex: print("WD", name, _nm(c), "failed", str(ex)[:100], flush=True); acc[c].append(float("inf"))
-        print(f"WD {name} M{M}: " + "  ".join(f"{_nm(c)} {sum(v) / len(v):.1f}" for c, v in acc.items()), flush=True)
+        line = f"WD {name} M{M}: " + "  ".join(f"{_nm(c)} {sum(v) / len(v):.1f}" for c, v in acc.items() if "-DWSTAT" not in _nm(c))
+        if M in (32, 128, 256):  # wait fractions of the NCW 16 path (clock64 around the slot waits)
+            try:
+                st2 = dict(state, profW=torch.zeros(8, dtype=torch.int64, device=dev))
+                dw = _synth(M, 5000 + M, dev)
+                sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWSTAT")); torch.cuda.synchronize()
+                st2["profW"].zero_(); sink.copy_(flush.sum()); _wx(dw, st2, ("-DNCW=16", "-DWSTAT")); torch.cuda.synchronize()
+                v = st2["profW"].double().cpu().tolist()
+                line += f"  | NCW16 consumer waitFull {v[0] / max(v[1], 1):.2f} producer waitEmpty {v[2] / max(v[3], 1):.2f}"
+            except Exception as ex:
+                line += f"  | wstat failed {str(ex)[:60]}"
+        print(line, flush=True)
 
 
 def prepare(weights):
@@ -2676,7 +3185,7 @@ def prepare(weights):
         w1[e] = _repack(weights["w13"][e], weights["w13_sf"][e], perm1)
         w2[e] = _repack(weights["w2"][e], weights["w2_sf"][e], perm2)
     w2f = torch.stack([_repack2(weights["w2"][e], weights["w2_sf"][e]) for e in range(min(E, 32))])
-    with ThreadPoolExecutor(8) as ex: list(ex.map(lambda f: f(), [lambda: _extL(0), lambda: _extL(1)] + [lambda k=k: _extS(k) for k in V17_KSF] + [lambda c=c: _extF(*c) for c in FS_CFG] + [lambda c=c: _extX(c) for c in WX_CFG]
+    with ThreadPoolExecutor(8) as ex: list(ex.map(lambda f: f(), [lambda: _extL(0), lambda: _extL(1)] + [lambda k=k: _extS(k) for k in V17_KSF] + [lambda c=c: _extF(*c) for c in FS_CFG] + [lambda c=c: _extX(c) for c in WX_CFG] + [lambda x=x: _extG(x) for x in G_CFG] + ([lambda: _extG("-DPROF")] if DIAGG else [])
                                                 + ([lambda x=x: _extX(("-DNCW=16",) + tuple(x.split())) for x in WX_ABL] if DIAGW else [])
                                                 + ([lambda c=c: _extF(c[0], c[1], (c[2] + " -DPROF").strip()) for c in FS_CFG] if DIAGF else [])))
     torch.cuda.synchronize()
@@ -2689,17 +3198,21 @@ def prepare(weights):
             "ctrL": torch.zeros(64 + 2 * 32 * 64 * 8, dtype=torch.int32, device=dev), "w2f": w2f,
             "w1x": _repackX(w1[:32]), "w2x": _repackX(w2[:32]), "ctrX": torch.zeros(64, dtype=torch.int32, device=dev),
             "yacc": torch.zeros((FS_MAX * 8, 4096), dtype=torch.float32, device=dev), "ctrF": torch.zeros(9280 + 64, dtype=torch.int32, device=dev),
-            "profF": torch.zeros((4096 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev), "wsL": torch.zeros((KSL_MAX * 8 * 12288,), dtype=torch.float32, device=dev)}
+            "profF": torch.zeros((4096 if "-DPROF" in _DBG else 0,), dtype=torch.int64, device=dev), "wsL": torch.zeros((KSL_MAX * 8 * 12288,), dtype=torch.float32, device=dev),
+          "interG": torch.empty((16, 4096), dtype=torch.bfloat16, device=dev),
+          "sspG": torch.zeros((1024 * 16,), dtype=torch.float32, device=dev), "ctrG": torch.zeros(64, dtype=torch.int32, device=dev)}
     if DIAG:
         _diag(st, weights)
     el = time.time() - _T0
-    print("v43 prepare %.0fs before tuning" % el, flush=True)
+    print("v45 prepare %.0fs before tuning" % el, flush=True)
     if TUNE and FORCE is None and el < 200:
         st["tune"], st["tune_alt"] = _tune(st)
     if DIAGW and time.time() - _T0 < 250:
         _diagW(st)
     if DIAGF and time.time() - _T0 < 250:
         _diagF(st)
+    if DIAGG and time.time() - _T0 < 280:
+        _diagG(st)
     return st
 
 
@@ -2791,6 +3304,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 _modL = {}
 TUNE_M = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+JUDGE_M = (1, 8, 16, 32, 128, 256)  # the timed loads' M
 KSL_MAX = 64  # ring K-split workspace covers M <= 64
 TUNE = True
 V17_KSF = (0,)  # v17 path: 0 = its own K-split rule (4/2/1 by tiles per warp group), else forced
@@ -2853,6 +3367,8 @@ def _run(cfg, data, state):
         return _wx(data, state, tuple(cfg[3].replace("+", " ").split()) if len(cfg) > 3 else ())
     if cfg[0] == "fs":
         return _fs(data, state, cfg)
+    if cfg[0] == "g1":
+        return _g1(data, state, cfg)
     return _small(data, state, cfg[1]) if cfg[0] == "v17" else _ring(data, state, cfg[1], cfg[2])
 
 
@@ -2863,6 +3379,7 @@ def _default(M):
 def _cands(M):
     c = [("v17", k, 0) for k in V17_KSF] if M <= 64 else []
     if M <= FS_MAX: c += [("fs",) + f for f in FS_CFG]
+    if M <= GS_MAX: c += [("g1", 0, 0, x) for x in G_CFG]
     for nx in (0, 1):
         for ks in ((1, 2, 4, 8) if M <= KSL_MAX else (1,)):
             c.append(("ring", ks, nx))
@@ -2884,6 +3401,7 @@ def _synth(M, seed, dev):
 
 
 def _nm(c):
+    if c[0] == "g1": return "g1" + ("".join(c[3].split()) if len(c) > 3 else "")
     if c[0] == "wx": return "wx" + ("".join(c[3].split()) if len(c) > 3 else "")
     if c[0] == "fs":
         x = c[3] if len(c) > 3 else ""
@@ -2897,7 +3415,10 @@ def _tune(state):
     table, alt, lines = {}, {}, []
     for M in TUNE_M:
         res = {}
-        for seed in (11, 12):
+        if time.time() - _T0 > 270:  # stay inside the 300 s prepare budget: untuned buckets keep the default
+            lines.append(f"M{M}:skipped"); continue
+        seeds = (11, 12, 13) if M in JUDGE_M and time.time() - _T0 < 200 else (11, 12)  # judge-generator routings per bucket
+        for seed in seeds:
             data = _synth(M, seed + M, dev)
             for cfg in _cands(M):
                 try:
@@ -2922,18 +3443,19 @@ def _tune(state):
         table[M] = best
         ra = {c: v for c, v in res.items() if c[0] != "wx"}
         alt[M] = min(ra, key=ra.get) if ra else d
-        lines.append(f"M{M}:" + ",".join(f"{_nm(c)}={res[c] / 2:.0f}" for c in res) + f"->{_nm(best)}")
-    print("v43 tune " + " | ".join(lines), flush=True)
+        lines.append(f"M{M}:" + ",".join(f"{_nm(c)}={res[c] / len(seeds):.0f}" for c in res) + f"->{_nm(best)}")
+    print("v45 tune " + " | ".join(lines), flush=True)
     torch.cuda.empty_cache()
     return table, alt
 
 
 def kernel_fn(data, state):
     M = data["hidden_states"].shape[0]
-    if FORCE is not None and (FORCE[0] != "fs" or (M <= FS_MAX and data["config"]["local_start"] == 0)): return _run(FORCE, data, state)
+    if FORCE is not None and (FORCE[0] not in ("fs", "g1") or (M <= (FS_MAX if FORCE[0] == "fs" else GS_MAX) and data["config"]["local_start"] == 0)): return _run(FORCE, data, state)
     tb = state.get("tune") or {}
     b = next((m for m in TUNE_M if m >= M), TUNE_M[-1])
     cfg = tb.get(b, _default(M))
     if cfg[0] == "fs" and (M > FS_MAX or data["config"]["local_start"] != 0): cfg = _default(M)
     if cfg[0] == "wx" and data["config"]["local_start"] != 0: cfg = _default(M)
+    if cfg[0] == "g1" and (M > GS_MAX or data["config"]["local_start"] != 0): cfg = _default(M)
     return _run(cfg, data, state)
