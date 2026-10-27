@@ -2068,7 +2068,7 @@ def _w4gemm(A, offs, Wp, g, ctr, ksplit=1, cls=3, prof=None, ext=None, wide=0, s
         prof = torch.empty(0, dtype=torch.int64, device=A.device)
     e0 = torch.empty(0, dtype=torch.float32, device=A.device)
     (ext or _w4g()).w4g(A, offs, Wp, g, out, ctr, prof, ksplit, cls, wide, swiglu, e0 if ss is None else ss, e0 if gw is None else gw,
-                        int(W4PDL if pdl is None else pdl))
+                        int((W4PDL and A.shape[0] >= W4PDL_MINR) if pdl is None else pdl))
     return out
 
 
@@ -2267,11 +2267,13 @@ W4MODES = (0, 1, 2)  # w4g tilings: n128, wide, mixed (3 / 4 = the 2-CTA cluster
 def _w4c():
     return [("w4", 0, "a", k2 | (wd << 2)) for k2 in (1, 2) for wd in W4MODES if wd != 5 or k2 == 1]
 MOE_PIN = {16384: (("w4", 0, "a", 1 | (2 << 2)),)}
-W4PDL = True  # w4g launches chained with programmatic dependent launch (the 2nd / 3rd kernel of a GEMM overlaps the 1st's tail)
+# w4g launches chained with programmatic dependent launch (the 2nd / 3rd kernel of a GEMM overlaps the 1st's tail), from 8192 tokens
+# (A rows = 8 x tokens) only: pf31diag 16K mixed 5342 vs 5523 us without; T753 510 vs 479, T3012 1213 vs 1204 (worse)
+W4PDL, W4PDL_MINR = True, 8 * 8192
 W2SS = False  # pf26 W2-epilogue sums of squares + comb_ss for split-1 (judge: ~+110 us on W2 vs -80 comb at 16K; off)
 W4DIAG_MODES, W4DIAG_PROF = (1, 2), False  # diag: tilings timed standalone; W4PROF wait fractions of the w4g tilings (w4p always)
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf31diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf32diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks
