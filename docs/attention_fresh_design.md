@@ -34,7 +34,7 @@ fragments per thread under the 128-register cap of 512 threads (ptxas report bel
 hint so DRAM sees 128 B gathers.
 Next if it wins: v16s / v32s on this skeleton (64 rows per kv head: wgmma tile per warpgroup), d1f with per-warp prefetch streams +
 last-16-arrivers parallel merge (~1.2 + 5.3 / 0.85 + 0.4 + 1.5 = 9.3 us kernel vs 15.5).
-v84 judge: correct, small win (raw d16s 14.27 vs 14.82, d32s 17.18 vs 17.60). Post-issue phases hit budget (kv-issued -> end 3.2 / 4.0);
-the KV issue itself took 3.7 / 5.6 us: per-SM rate ~17.5 GB/s on both (scales with bytes, not pt latency) with 64 B half-row
-requests. v85: swk reordered (raw rows by cp.async, KV issued right after pt) + swf: cluster per request, whole 128 B rows per
-request (lane pairs split heads; head 1 keys permuted k ^ 2), shared CTA prologue; sm_86 192 checks + stress clean, 220 B spill.
+Results (raw us; all stress-clean): v84 SW1.3 d16s 14.27 vs DEF 14.82, SW1.2 d32s 17.18 vs 17.60 (-2-4 %, the only win; SW2.6 15.23,
+SW2.4 28.13 = 2 waves). Post-issue phases met budget (kv-issued -> end 3.2 / 4.0) but the issue took 3.7 / 5.6 us (~17.5 GB/s per SM).
+v85 lost: SW reordered 21.41 / 23.30 (cp.async raw rows delayed pt-issued to 3.9), swf full rows SF6 17.95, SF4 18.11, SF3 21.57,
+SF4 d32s 30.37 (shared prologue + CTA barrier ~4.9 us before the stream; full rows did not raise the per-SM rate enough). Parked.
