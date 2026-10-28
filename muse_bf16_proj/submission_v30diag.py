@@ -2263,16 +2263,18 @@ WVB = {k: [(g if len(g) == 6 else g + (0, 1)) + (0, 2) for g in v] for k, v in W
 # v29 (judge v28diag WP: consumer-bound ring, ~880 cyc/chunk, ~2000 cyc exposed escape-list load at start, reduction 4-8K cyc):
 # DA 4 = deep decode-ahead (4 A register sets, wait_group 3) and 2-CTA/SM geometries (ring 4, S doubled)
 for _k, _v in {("qkv_gate", 32): [(32, 8, 7, 2, 0, 1, 0, 4), (32, 4, 14, 2, 0, 1, 0, 2), (32, 4, 14, 2, 0, 1, 0, 4), (32, 8, 3, 1, 0, 1, 0, 4)],
-               ("qkv_gate", 128): [(128, 6, 7, 2, 0, 1, 0, 4)],
+               ("qkv_gate", 128): [(128, 6, 7, 2, 0, 1, 0, 4), (128, 6, 3, 1, 0, 1, 0, 4)],
                ("o", 128): [(128, 6, 1, 1, 0, 1, 0, 4), (128, 6, 2, 2, 0, 1, 0, 4)],
                ("o", 32): [(32, 8, 1, 1, 0, 1, 0, 4)], ("o", 16): [(16, 8, 1, 1, 0, 1, 0, 4)],
                ("pooler", 32): [(32, 8, 4, 2, 0, 1, 0, 4)], ("unpooler", 32): [(32, 8, 2, 2, 0, 1, 0, 4)],
-               ("router", 16): [(16, 4, 32, 1, 1, 1, 0, 4)], ("router", 128): [(128, 4, 32, 1, 1, 1, 0, 4)]}.items():
+               ("router", 16): [(16, 4, 32, 1, 1, 1, 0, 4)], ("router", 128): [(128, 4, 32, 1, 1, 1, 0, 4)],
+               ("pooler", 128): [(128, 6, 4, 2, 0, 1, 0, 4), (128, 6, 2, 1, 0, 1, 0, 4)],
+               ("unpooler", 128): [(128, 6, 2, 2, 0, 1, 0, 4), (128, 6, 1, 1, 0, 1, 0, 4)]}.items():
     WVB[_k] = WVB.get(_k, []) + _v
 # v28 diag: clock64 phase profiles (PF 1 twins, run after selection; not candidates)
 WVP = [("qkv_gate", 32, (32, 8, 7, 2, 0, 1, 1, 2)), ("qkv_gate", 32, (32, 8, 7, 2, 0, 1, 1, 4)), ("qkv_gate", 32, (32, 4, 14, 2, 0, 1, 1, 4)),
        ("qkv_gate", 128, (128, 6, 7, 2, 0, 1, 1, 4)), ("o", 128, (128, 6, 1, 1, 0, 1, 1, 2)), ("o", 128, (128, 6, 1, 1, 0, 1, 1, 4)),
-       ("o", 16, (16, 8, 1, 1, 0, 1, 1, 4))] if DIAG else []
+       ("o", 16, (16, 8, 1, 1, 0, 1, 1, 4)), ("pooler", 128, (128, 6, 4, 2, 0, 1, 1, 4)), ("unpooler", 128, (128, 6, 1, 1, 0, 1, 1, 4))] if DIAG else []
 WVI = sorted({c for v in WVB.values() for c in v} | {g for _, _, g in WVP})
 _WV = {w: i for i, w in enumerate(WVI)}
 _WS = {w: i for i, w in enumerate(WSI)}
