@@ -190,3 +190,43 @@ Bench scripts/artifacts: /vfast/data/imgopt (zbench.sh, zq4.sh, lqv.sh, qrun.sh,
   remaining MMQ levers are fewer joules per output (fewer MACs, i.e. lower-bit weights or fewer DiT tokens), not scheduling.
   test-backend-ops GGML_PERF_DIT_TOKENS now also covers Q4_K/Q6_K weights. A bit-exact checker (hash of the CUDA mul_mat output) is in the
   agent scratchpad only.
+
+### omniserve-native LLM sampling (2026-10-28, local 3090 Ti) — branch perf/llm-sampling @ origin (not deployed)
+- Commit: one commit cherry-picked onto origin/main (the local wip base carried an unpushed commit that the gitleaks hook flags; the local copy is perf/llm-sampling-local). Model: prod gemma-roleplay-v2-q8_0 + E4B MTP head, prod batching env, MTP draft 2. Libs: llama.cpp-latest (omni) and llama.cpp-opt (prod lineage).
+- Finding: with the existing exact cut active, local `sample=` is already 0.33-0.45 ms/step (gather 190-250 us/row, chain 15-35 us/row). Prod's 3.75 ms (gather 0.70 + chain 1.95 ms/row) matches the full-vocab path: with LLM_PREFILTER=0 it is gather 201 + chain 439 us/row, 1.17 ms/step here, and the 5090 host's CPU is about 4x slower under load. max_new is clamped to the 4096 ctx, so the old k > 8192 bail never fires. Prod requests are therefore probably skipping the cut: min_probability > 0, repetition_penalty < 1, or negative frequency/presence penalties. Check the request params arriving at :8791 before expecting the plan's +20%.
+- Change: (1) The cut window is top_k + distinct history tokens and grows as tokens are accepted. It no longer includes + max_new, and the 8192 cap is gone. (2) The chain is applied one sampler at a time. If the post-penalty top (k+1) contains a tied logit, the row is redone on the old request-wide set. That makes the tokens bit-identical to the old path by construction. Ties occur on about 0.3% of rows. (3) Opt-in LLM_GPU_CUT=K (current llama.cpp API only, needs n_outputs_max_per_seq): a per-sequence backend sampler keeps the full row and adds a ggml_top_k of each vocab half. The host reads 2K (id, logit) pairs and keeps the ones above the larger half-minimum; it falls back to the host cut if fewer than k remain. (4) Fixed a latent overflow: a capped verify-row gather was being redone into the 32K vcand buffer.
+- Parity (fresh servers, unique prompts, SHARE_PREFIX=0): 24 prompts x {greedy, temp 0.9 seed 7+i} x {DRY 0.8, rep 1.1, both}, 192 tokens. 144/144 md5-identical to base for the new CPU path (latest and prod-lineage libs), for GPU_CUT=1024, and with PAR_GATHER=1. Long generations (max_tokens 8192, 4 x 3 configs, ~27K tokens): 12/12 identical with GPU_CUT. Caveat: with prefix sharing on, back-to-back runs land in different prefix-cache states (slot release timing), so outputs vary even base vs base. Parity needs unique prompts or SHARE_PREFIX=0.
+- Sampling per step (engine trace): batch 1, 192 tokens: base 0.33-0.45 ms, new CPU 0.33-0.42, GPU_CUT 0.04-0.09 (gather 4-6 us/row). Long generations: base 0.53-1.78 ms (the k bound with max_new inflates the set), GPU_CUT 0.05-0.09. Batch 4-8: base 0.74-0.85, GPU_CUT 0.10-0.12. Chain 20-37 us/row in all variants. Decode time with GPU_CUT is unchanged within noise (steady 9.8-9.9 ms vs 9.8-10.0). The host gather is DRAM-bound: reading the DMA'd 1 MB row costs ~120 us cold even when quiet, and prefetching or the thread pool did not help (PAR_GATHER under load: 1.2-2.5 ms/step, worse).
+- Tokens/s: wall clock is unusable here. Another job held the GPU at 98% SM, and the same config ranged 14-131 tok/s. Trace-derived numbers from the quietest windows, batch 1, s/g_dry: base d2 11.02 ms/step -> 149 tok/s; GPU_CUT d2 10.86 ms -> 149; base d1 10.15 ms -> 143; GPU_CUT d1 9.96 ms -> 146. The GPU_CUT step-time saving (~0.35 ms/step, ~3%) is real but hidden in dec noise. Batch 4/8 wall: base 208-212 / 308-325, GPU_CUT 177-260 / 237-343 (noise).
+- MTP draft A/B (same tokens, md5-identical d1 vs d2): position-1 acceptance 45%; position 2 is accepted 37-41% of the time position 1 was, 17-19% overall (plan: 11% on prod). Tokens/step: 1.45 (d1) vs 1.64 (d2). Step cost: +0.9 ms for d2 (draft decode +0.55 ms, verify row and sampling). Net here: d2 ~ +2-4%, within noise. On prod, each extra verify row costs ~2.6 ms of CPU sampling on the full-vocab path, and position-2 acceptance is lower, so set MTP_DRAFT=1 there unless GPU_CUT is on (or the full-vocab fallback cause is fixed). With cheap sampling, d1 and d2 are a wash; keep d2 only if the 5090 shows the same position-2 acceptance as here.
+
+## Z-Image runtime-LoRA fusion (2026-10-28, local 3090 Ti sm_86) — sdcpp-opt perf/zimage-lora-fusion @bb9255c, ggml perf/zimage-lora-fusion @4b347416 (pushed to lee; not deployed)
+Worktree /vfast/data/code/sdcpp-lora (base perf/dit-fusion 8406ede / ggml 18f1c867). LoRA = prod `the_look` (rank 32, bf16, 240 linears incl. adaLN; copied to /vfast/data/imgopt/lora/the_look.safetensors).
+- Metric (Q4_K DiT + Flux ae, 1024^2, 8 steps, --vae-tiling, kernel min-est over 3 interleaved rounds, LoRA minus no-LoRA per step):
+  old runtime path **98.1 ms/step** -> fused **57.4 ms/step** (-41%). Sampling wall with LoRA 9.11 -> 8.77 s (no-LoRA 8.2 s). No-LoRA graph/time unchanged.
+  Target <= 25 ms/step not reached on the 3090 Ti. Remaining: MMQ epilogue +33 ms, downs 18 ms (my exact kernel 9.0 for qkv + w1/w3, cuBLAS 9.3 for out + w2), w2 f32 dual write 6.3 ms.
+  Projection for the 5090 (TF32 tensor 2.6x, bandwidth 1.8x of the 3090 Ti): roughly 20-25 ms/step vs ~70 now; not measured.
+- Where the old 98 ms went: cuBLAS TF32 up-GEMMs with beta=1 onto the base output (read+write of every output, ~50 ms), downs 18 ms, and lost
+  pass-2 fusions (w2 1/128 scale passes 17, swiglu materialized 17, norm->q8_1 lost 13). Per-step concat/pad/scale of weights was only ~2 ms.
+- What changed:
+  - sd.cpp: LoRA weights prepared once per multiplier (stacked q/k/v downs, scaled block-diagonal ups, same ops as before) into a backend buffer
+    (+~360 MB VRAM); the graph emits ADD(diff, base) with the LoRA GEMMs before the base GEMM; w2 keeps the 1/128 scaled output with the diff
+    taken from the scaled activation (exact, pow2); w1/w3 share one R=64 down; Q8_0 pow2 activation-scale skip as in the direct path.
+  - ggml-cuda: (1) MMQ LoRA epilogue: dst = mmq + U·lx computed with m16n8k8 TF32 MMA, k ascending, RNA operands, one add — bit-equal to cuBLAS TF32
+    SGEMM beta=1; all-zero U chunks skipped (q/k/v block diagonal) via a chunk mask; noinline call after write_back (inline versions push the MMQ
+    main loop to 255 regs and slow it). (2) RMS_NORM->MUL and SWIGLU->SCALE producers feeding MMQs + LoRA downs: one kernel writes the shared
+    q8_1; for the norms the downs read raw rows + per-row norm scale (no f32 normed rows). (3) lora_down_tf32: exact non-split TF32 down GEMM.
+- Parity: md5-identical to the previous runtime path at 1024^2 for 6 prompts (4 scenes + 2 portrait/anime) x scales 0.6/0.8, at 1344x768,
+  Q8_0 DiT, LoRA rescale 0.6->0.8->0.6 and LoRA off/on in one sd ctx (library harness), and no-LoRA. **Not** identical at 768x1024 (and so
+  1024x768): there cuBLAS itself picks FP32 SIMT SGEMM for the out/w2 ups and split-K=3 for the qkv down, so the old bits are a cuBLAS-heuristic
+  artifact; PSNR 24.9 dB, same composition. Sensitivity reference: changing only the TF32 operand rounding of the LoRA up (truncate vs RNA)
+  gives 31 dB at 1024^2, i.e. nothing short of bit-exact can meet a 45 dB bar at 8 steps.
+- Off switches: SD_NO_LORA_FUSE=1 (exact previous graph), SD_NO_LORA_GROUP=1 (w1/w3 separate downs), GGML_CUDA_NO_LORA_FUSE=1,
+  GGML_CUDA_NO_LORA_EPI=1, GGML_CUDA_NO_LORA_DOWN=1. With only the ggml switch the grouped w1/w3 down goes to cuBLAS (M=64, different kernel): valid
+  TF32 but not md5-equal to the old path; use SD_NO_LORA_FUSE=1 for the exact old behaviour.
+- Tests/bench: test-backend-ops `-o LORA_LINEAR` (eval vs CPU, need_check and 2-chunk cases), GGML_PERF_LORA_TOKENS=4128 perf mode;
+  /vfast/data/imgopt/{zl.sh,zagg.py,zgrid.py,parity.sh,lorab3.sh}.
+- Deploy notes (for the deploy agent): port both commits onto the live Z-Image recipe (needs the pass-2 fusions it builds on, i.e. task 2 first),
+  build sm_120, then on the 5090 compare old vs new lib md5 at each prod size with LoRA 0.6/0.8. cuBLAS heuristics on sm_120 differ, so expect
+  identity only where cuBLAS used non-split TF32 GEMMs; where it differs, decide on visual A/B (the fused path is deterministic and shape-independent).
+  VRAM +~360 MB per loaded LoRA. Daisy could not be used for timing (19 GB resident, 1024^2 OOMs).
