@@ -34,5 +34,7 @@ fragments per thread under the 128-register cap of 512 threads (ptxas report bel
 hint so DRAM sees 128 B gathers.
 Next if it wins: v16s / v32s on this skeleton (64 rows per kv head: wgmma tile per warpgroup), d1f with per-warp prefetch streams +
 last-16-arrivers parallel merge (~1.2 + 5.3 / 0.85 + 0.4 + 1.5 = 9.3 us kernel vs 15.5).
-Status: off by default (SW = False). sm_90a 116 regs, 0 spills, all K / V loads before the first HMMA. sm_86 (cluster exchange via
-global memory): 140 reference checks + 300-replay stress d16s / d32s clean; the DSMEM path is first exercised by the v84diag ST lines.
+v84 judge: correct, small win (raw d16s 14.27 vs 14.82, d32s 17.18 vs 17.60). Post-issue phases hit budget (kv-issued -> end 3.2 / 4.0);
+the KV issue itself took 3.7 / 5.6 us: per-SM rate ~17.5 GB/s on both (scales with bytes, not pt latency) with 64 B half-row
+requests. v85: swk reordered (raw rows by cp.async, KV issued right after pt) + swf: cluster per request, whole 128 B rows per
+request (lane pairs split heads; head 1 keys permuted k ^ 2), shared CTA prologue; sm_86 192 checks + stress clean, 220 B spill.
