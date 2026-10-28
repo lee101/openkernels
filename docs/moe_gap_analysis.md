@@ -178,3 +178,55 @@ Candidates for < ~17 per word:
 - 2 CTAs/SM: same instruction count, more warps; equivalent to the NW 20 / c16 experiments (no gain).
 - No lossless re-encoding, LUT (PRMT) or accumulator-scale formulation found below 15 integer + multiply ops per word (see the sections above).
 So the remaining gap is issue efficiency (scheduling / dependency stalls at ~22 per word), not instruction count or bytes; closing it needs per-instruction stall data (ncu) we do not have on the judge GPU.
+
+## Closing summary (MoE parked at v56, judge 1.9749)
+
+**Final per-load numbers (v56d), µs.** The floor is the 4.35 TB/s 1D-bulk stream rate on each load's bytes.
+
+| load | v56d | floor | % of floor | path |
+|---|---|---|---|---|
+| d1 | 28.8 | 17 | 59% | gk KS2 1 MAXM 8 |
+| d16 | 108.5 | 79 | 73% | gk KS2 2 |
+| d32 | 155.0 | 124 | 80% | r1 (gk51 M32 / wx NCW16 tie at about 156) |
+| v1 | 73.9 | 54 | 73% | gk KS2 1 MAXM 8 |
+| v16 | 218.0 | 179 | 82% | wx NCW16 UDESC |
+| v32 | 258.1 | 161 (bench) / 200 (wx NOCOMP) | 62% / 78% | wx NCW16 (N8STEP) |
+
+v56 contributed the 8-op e2m1 placement: about 3 fewer instructions per word on every path, +4.9% on the judge.
+
+None of v57–v60 beat it:
+
+| version | judge | change |
+|---|---|---|
+| v57 | 1.969 | gk producer warp: 22.6 -> 16.7 instructions per word, but slower in the tune |
+| v58 | 1.954 | v51 gk incl. M32 shapes: ties r1 / wx at d32 |
+| v59 | 1.969 | WB load variants |
+| v60 | 1.973 | bf16 / bf16x2 scale copies: lose at M1 / M8 (36.0 / 39.6 and 69.3 / 79.2 vs 35.0 / 67.2) |
+
+**Evidence that the consumer loop is issue-bound (WB, H100, no TMA / mbarrier, ns per wgmma per SM; r1w4 = 16 warps, r2w2 = RPW 2 on 8 warps).**
+- A wgmma alone costs 7.5-8.7 ns at N 8-16, 9.2-10.5 at N 32 and 18.2-19.2 at N 64. At N 64 the tensor pipe alone runs at 4.0-4.2 TB/s equivalent, which is the stream rate: hot experts are tensor-bound at BF16 peak. Padding is not the cause; N8 rounding falls almost entirely on experts with N <= 32, where wgmma cost is flat.
+- Register dequant + wgmma (D, after fixing the v57 / v58 bug where ptxas computed one dequant per 4 chunks) against the same loop with the wx shared-memory loads + sc2 (L):
+
+| N | D r1w4 / r2w2 | L r1w4 / r2w2 |
+|---|---|---|
+| 16 | - / 13.8 | 15.6 / 16.2 |
+| 32 | 16.2 / 16.8 | 17.4 / 17.7 |
+| 64 | 21.9 / 21.0 | 22.4 / 24.0 |
+
+  Loads add only 1-2 ns over D.
+- One-stage prefetch (P, Q) and per-group hoisting (H) gain at most 0.6 ns. bf16x2 scale pairs (S) gain about 1.2 ns at N 16 and nothing at N 64, and as separate copies (+11% / +33% bytes) they lose in the real gk.
+- L runs about 18 instructions per word at about 0.68 IPC per scheduler. The real wx loop is 19.9 instructions per word, so the consumers sit at the dequant + mma issue bound plus about 30% dependency stalls.
+- Instruction cuts that left the critical path untouched did not pay: the gk producer warp removed 26% of the loop instructions and lost to its polling cost.
+
+**Levers left for a future attempt.**
+1. **Free registers so a load prefetch survives in the real wx.**
+   - What fails now: every register prefetch (next chunk at chunk start, after the commit, or the whole slot at its top) makes ptxas serialize the wgmmas (C7512) or spill. NCW16 is at 96 of 120 registers with a 16 B spill; RPW2 is at 167.
+   - Fold the producer warp into a consumer lane: 512 threads raises the cap to 128.
+   - Or shrink the A double buffer to k32 groups.
+   - WB says the payoff is small (<= 0.6 ns per wgmma); it matters only together with lever 2.
+2. **RPW2 at 3 warps per scheduler.**
+   - The shape: 3 consumer warpgroups x RPW2 = 384-row units, plus a 4-warp producer warpgroup that gives registers to the consumers with setmaxnreg (consumers up to 160).
+   - Needs: RPW2 trimmed from 167 to 160 registers, and ragged unit tails (W13 64 = 21 x 3 + 1 blocks, W2 32 = 10 x 3 + 2).
+   - Why: RPW2's per-wgmma descriptor amortization (16.9 vs 19.9 instructions per word) currently loses to NCW16's latency hiding (2 vs 4 warps per scheduler).
+3. **Per-instruction stall data (ncu source view) on a host that allows GPU performance counters.** RunPod H100 pods return ERR_NVGPUCTRPERM even as root. scratchpad/podprof (pro.py + run.sh) builds only the picked modules and profiles wx M128 / M256 / M32, gk M16 / M1, g1 M1 and r1 M32 in about 10 minutes.
+4. **d1 (59% of floor), the weakest load relative to its floor.** gk / g1 at M1 are tail- and barrier-bound (8 experts, 2 grid barriers, clock-capped at 1.1-1.5 GHz), not dequant-bound; a single-pass, latency-hidden GEMV (section 4b) remains the structural option.
