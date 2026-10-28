@@ -180,3 +180,13 @@ Nothing needs FP8 or an exploit.
    - Risk: higher. It needs 75% of tensor peak from RS wgmma with decode in the same warps (decode for 508K values per SM is about 3.4 µs of issue), and three previous GEMM attempts lost to nvjet.
 
 Together that is about +6-7% (to about 1.55-1.56). The router to its floor (+2.6%) is the next lever after these. The c12 hi + lo router lost on the H200 in v14 (6-8 vs 4.7 µs) as a mma.sync GEMV; the same wgmma-RS path would be the retry.
+
+## 7. RS-wgmma 12-bit GEMM (v26-v30diag): parked at v22
+
+Judge diag runs: v26/v27 (after the sm_90 build fix), v28diag, v29diag and v30diag all scored 1.443-1.458, which is noise against v22's 1.459-1.463. `wv` (12-bit weights decoded straight into RS-wgmma A registers, x tile shared by the CTA, split-K via workspace + counter) is correct but slower than the paths it competes with:
+- **m128** (v30diag span, µs): qkv 25.4 vs 15.35 (cuBLAS), pooler 31.9 vs 19.6, unpooler 32.0 vs 18.7, o 10.5 vs 6.65. That is 1.6-1.7x off cuBLAS and about 2.5-3x off the 12-bit floors (8.4 / 13.6 / 13.6 / 4.7).
+- **m32 / router:** at best marginal. qkv m32 11.2 vs 11.5. Router m32 4.70 and m256 7.14 were picked.
+- **Consumer cycles:** spread over stage wait, decode, wgmma issue (warpgroup convergence), wgmma wait and the split-K reduction. Deep decode-ahead (4 A sets, wait_group 3) did not change the picture, and no single phase dominates.
+- **Stragglers:** CTA start spread is under 0.15 µs. Shapes with split-K end with an 8-9.5 µs end spread that sits in the counter + reduction tail; the same kernel without split-K ends within 1.5-2.2 µs. Any further attempt must avoid the global split-K reduction at these sizes (cluster DSMEM push, or a schedule with no split).
+
+Status: bf16_proj parked at v22. The analysis in section 6 stands: 1.637 implies about 50% of each shape's slack recovered, mostly at m128 (memory-bound, arithmetic intensity 112-122 flop/B, below H200's 206 ridge) and m32. Our hand-written GEMMs do not reach cuBLAS-level streaming at m128. The tools stay for a future attempt: bench/wb_compile_chk.py (sm_90 build gate + stub prepare), bench/wv_esc_chk.py, and the WP/WC profiles in submission_v30diag.py.
