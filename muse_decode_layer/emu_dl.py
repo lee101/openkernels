@@ -37,7 +37,14 @@ def prepare(w):
         for it in os.environ["DL_PICKS"].split(";"):
             b, c = it.split("=", 1)
             kind, x = c.split(":", 1)
-            st["moe"]["tune"][int(b)] = (kind, 0, 0, x)
+            if kind == "fs":  # "32=fs:1,3," -> ("fs", 1, 3, "")
+                k, sm, ex = x.split(",", 2)
+                st["moe"]["tune"][int(b)] = ("fs", int(k), int(sm), ex)
+            elif kind in ("ring", "v17"):  # "32=ring:1,0"
+                a, c = x.split(",")
+                st["moe"]["tune"][int(b)] = (kind, int(a), int(c))
+            else:
+                st["moe"]["tune"][int(b)] = (kind, 0, 0, x)
         print("DL_PICKS", st["moe"]["tune"], flush=True)
     print("DLPREP %.1fs state %.2f GB peak %.2f GB (above the %.2f GB before)" % (time.time() - t0, (torch.cuda.memory_allocated() - m0) / 2**30,
           (torch.cuda.max_memory_allocated() - m0) / 2**30, m0 / 2**30), flush=True)
