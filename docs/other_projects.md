@@ -163,3 +163,30 @@ Bench scripts/artifacts: /vfast/data/imgopt (zbench.sh, zq4.sh, lqv.sh, qrun.sh,
   - L1::no_allocate loads.
   What remains is per-kernel fixed cost on small GEMVs (O, QKV, inp_gate: ~1.5 us each). Only fusion, or PDL on sm_90+/sm_120, removes it.
 - Deploy notes: port 7f327f636 onto the live tree after the decode-kernels commits. It adds q8r.cu/.cuh, a new MMQ instance file and llama loader/adapter hooks. Build for sm_120 and validate with the md5 recipe (expect identical, flag on and off). The gain on the 5090 is unmeasured and probably similar or smaller. GGML_CUDA_Q8_REPACK=0 is the rollback switch with no rebuild. Risk areas: tensor-parallel/2-D set_tensor paths assert on repacked tensors (not used by omniserve), and the MTP Q8_0 draft model will also be repacked.
+
+### Z-Image MMQ pipelining (2026-10-28, local 3090 Ti) — sdcpp-opt perf/mmq-pipe @e1a5797, ggml perf/mmq-pipe @03c485ec (pushed to `lee`, not deployed)
+- Result: no speedup. The pipelined kernel is committed opt-in only (GGML_CUDA_MMQ_PIPE=1, default off). The default path is unchanged.
+  Images are md5-identical with the flag unset and set: Q4_K prod 8-step 5c46c96b, Q8_0 3-step 262480b0.
+  e2e nsys min-est per DiT step (GPU shared, ±1-2%): Q4_K base 625/625, branch default 633/622, pipe 638/641 (MMQ 361 -> 373 ms).
+  Q8_0: base 607, pipe 646 (MMQ 325-347 -> 402).
+- Limiter (no ncu: RmProfilingAdminOnly=1). Ablation of the stock kernel at 10240x4128x3840, Q8_0/Q4_K:
+  full 2.67/2.96 ms; tile loads skipped 1.90/2.36; vec_dot skipped 1.58/1.37. So load and math do not overlap.
+  But the board is power-capped. The full kernel holds 450 W at ~1.9 GHz (throttle reason SW power cap), and the compute-only
+  variant already draws 446 W. Overlapping the loads only moves energy around, so the time stays the same.
+  Microbench (pure mma.m16n8k32 s8): 330 TOPS at ~370 W. With the Q8_0 epilogue (I2FP+FMUL+FFMA per element): 214 TOPS at 404 W.
+  MMQ runs at ~113-125 TOPS.
+- Tried; all bit-identical (hash of the full output vs base across many shapes, incl. need_check, stream-k and batched),
+  none faster in interleaved sustained A/B:
+  - cp.async 2-stage staging of raw Q8_0 rows plus unpack, 8 warps: Q8_0 +12-20%, Q4_K +5%.
+  - Q4_K: 3-stage, nibbles read with ldmatrix straight from the staged rows (no qs unpack): ~0-2%.
+  - 16 warps/CTA (128 regs): compute-only got slower (Q8_0 1.91 -> 2.25 ms).
+  - 256-row Q4_K tiles (-33% L2->SM bytes): -8..+7% burst, +7% sustained.
+  - y tile only, cp.async double-buffered inside the stock kernel: neutral.
+  - Q4_K y (d,s) pre-converted to float2 (drops 2 HADD2 per IMMA): +2%.
+  - Grouped tile raster (L2 locality, G=4..80): neutral/worse.
+  - 2 CTAs/SM at mmq_x=64: about neutral.
+  - Not bit-identical, timing only: dropping the Q4_K min-term FFMA gave only -2%. The epilogue math is not the lever either.
+- Takeaways for the 5090 (575 W, sm_120): the opt-in kernel might behave differently there, but this is unmeasured. On GA102 the
+  remaining MMQ levers are fewer joules per output (fewer MACs, i.e. lower-bit weights or fewer DiT tokens), not scheduling.
+  test-backend-ops GGML_PERF_DIT_TOKENS now also covers Q4_K/Q6_K weights. A bit-exact checker (hash of the CUDA mul_mat output) is in the
+  agent scratchpad only.
