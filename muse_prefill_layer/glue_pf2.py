@@ -976,6 +976,26 @@ if Q_CUDA.count(_QX0) == 1 and Q_CUDA.count(_QX1) == 1:
 #endif""")
 else:
     print("pf2 XBULK patch did not apply", flush=True)
+# 8-op e2m1 -> bf16 placement (docs/fp4_dequant_survey.md section 2, MoE v56): a0 = q & M, a1 = rotl(q, 10) & M, a2 = rotl(q, 13) & M,
+# a3 = ((q & 0x001B001B) * 0x1084) & M, M = 0x81C081C0 (8 integer ops per word instead of 11); the ring's and w4g's repacks place the
+# nibbles to match (Q__place below), the bf16 bits and block-scale multiplies are unchanged
+_QD = ("""          const uint32_t a1 = bmul(((q << 3) & 0x01C001C0u) | ((q << 1) & 0x80008000u), sB[r]);
+          const uint32_t a2 = bmul((q << 6) & 0x81C081C0u, sA[r]);
+          const uint32_t a3 = bmul(((q >> 5) & 0x01C001C0u) | ((q << 5) & 0x80008000u), sB[r]);""",
+       """          const uint32_t a1 = bmul(__funnelshift_l(q, q, 10) & 0x81C081C0u, sB[r]);
+          const uint32_t a2 = bmul(__funnelshift_l(q, q, 13) & 0x81C081C0u, sA[r]);
+          const uint32_t a3 = bmul(((q & 0x001B001Bu) * 0x1084u) & 0x81C081C0u, sB[r]);""")
+DQ8 = Q_CUDA.count(_QD[0]) == 1
+if DQ8:
+    Q_CUDA = Q_CUDA.replace(*_QD)
+    Q__ROT = ((0, 0, 0, 0), (10, 10, 10, 10), (13, 13, 13, 13), (2, 7, 7, 12))  # per code bit (m, e0, e1, s)
+
+    def Q__place(word, code, pair, hi):
+        for bit, tgt, d in zip(range(4), (6, 7, 8, 15), Q__ROT[pair]):
+            word |= ((code >> bit) & 1) << ((tgt + 16 * hi - d) % 32)
+        return word
+else:
+    print("pf2 8-op dequant patch did not apply to the ring", flush=True)
 Q_DECL = "void moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int64_t,torch::Tensor);"
 
 
@@ -1217,10 +1237,17 @@ __device__ __forceinline__ void dq_half(uint32_t q0, uint32_t q1, uint32_t sw, u
   for (int i = 0; i < 2; i++) {
     const uint32_t qv = i ? q1 : q0;
     const uint32_t sA = sc2(sw, i ? 0x4242u : 0x4040u), sB = sc2(sw, i ? 0x4343u : 0x4141u);
+#if DQ8
+    a[i][0] = bmul(qv & 0x81C081C0u, sA);
+    a[i][1] = bmul(__funnelshift_l(qv, qv, 10) & 0x81C081C0u, sB);
+    a[i][2] = bmul(__funnelshift_l(qv, qv, 13) & 0x81C081C0u, sA);
+    a[i][3] = bmul(((qv & 0x001B001Bu) * 0x1084u) & 0x81C081C0u, sB);
+#else
     a[i][0] = bmul(qv & 0x81C081C0u, sA);
     a[i][1] = bmul(((qv << 3) & 0x01C001C0u) | ((qv << 1) & 0x80008000u), sB);
     a[i][2] = bmul((qv << 6) & 0x81C081C0u, sA);
     a[i][3] = bmul(((qv >> 5) & 0x01C001C0u) | ((qv << 5) & 0x80008000u), sB);
+#endif
   }
 }
 #if TMA
@@ -1951,8 +1978,9 @@ def _w4g(prof=False):
         hop = torch.cuda.get_device_capability() == (9, 0)
         fl = (["-gencode=arch=compute_90a,code=sm_90a", "-DHAS_WG_HOST=1"] if hop else ["-DBNMAX=64", "-DEMU_NS=2", "-DHAS_WG_HOST=0"])
         fl += ["-DW4PROF"] if prof else []
+        fl += ["-DDQ8=%d" % int(DQ8)]
         try:
-            _w4gmod[prof] = load_inline("pf2_w4g_v20" + ("h" if hop else "e") + ("p" if prof else ""),
+            _w4gmod[prof] = load_inline("pf2_w4g_v21" + ("h" if hop else "e") + ("p" if prof else ""),
                                         cpp_sources="void w4g(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, torch::Tensor, torch::Tensor, int64_t); int64_t w4g_smem(); int64_t w4g_err(int64_t); int64_t w4g_ncl(); void w4p(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);",
                                         cuda_sources=W4G_CUDA, functions=["w4g", "w4g_smem", "w4g_err", "w4g_ncl", "w4p"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"] + fl, verbose=False)
         except Exception as e:
@@ -2273,7 +2301,7 @@ W4PDL, W4PDL_MINR = True, 8 * 8192
 W2SS = False  # pf26 W2-epilogue sums of squares + comb_ss for split-1 (judge: ~+110 us on W2 vs -80 comb at 16K; off)
 W4DIAG_MODES, W4DIAG_PROF = (1, 2), False  # diag: tilings timed standalone; W4PROF wait fractions of the w4g tilings (w4p always)
 W4FORCE = {}  # T -> MoE path forced after the tune (diag builds: measure a path in the judge's layer)
-W4DIAG = False  # pf32diag: per-component w4 timings + W4PROF wait fractions in prepare()
+W4DIAG = False  # pf33diag: per-component w4 timings + W4PROF wait fractions in prepare()
 W4THR = (32, 96, 192)  # h4: experts with more routes than this on w4g, the rest on the ring
 DEQ3 = True  # coalesced-store dequant (deq3) for the big path
 MOE_DFLT = {753: ("q", 0, "a", 0), 3012: ("q", 0, "a", 0), 16384: ("big", 0, "a", 0)}  # pf11's judge picks

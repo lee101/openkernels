@@ -13,8 +13,9 @@ import torch
 from torch.utils.cpp_extension import load_inline
 
 '''
-parts = [head, compose.rename(R / "muse_attention_decode/submission.py", "A_"), "\n",
-         compose.rename(R / "muse_moe_w4a16/submission.py", "M_"), "\n",
+# attention / MoE modules pinned to the versions prefill was tuned on (pf32: attention v69f, MoE v48); master moved on for decode
+parts = [head, compose.rename(R / "muse_attention_decode/submission_v69f.py", "A_"), "\n",
+         compose.rename(R / "muse_moe_w4a16/submission_v48.py", "M_"), "\n",
          compose.rename(R / "muse_bf16_proj/submission.py", "P_"), "\n", compose.rename(R / "muse_moe_w4a16/submission_v23.py", "Q_"), "\n", cls, "\n", (R / "muse_decode_layer/glue.py").read_text(), "\n",
          (R / "muse_prefill_layer/glue_pf.py").read_text(), "\n", (R / "muse_prefill_layer/glue_pf2.py").read_text()]
 src = "".join(parts)
